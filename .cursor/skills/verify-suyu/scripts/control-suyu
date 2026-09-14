@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Drive a disposable suyu Qt instance over its local MCP JSON-RPC port."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+MCP_HOST = os.environ.get("SUYU_MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.environ.get("SUYU_MCP_PORT", "9742"))
+DEFAULT_BIN_CANDIDATES = (
+    Path("build-verify/bin/suyu"),
+    Path("build/bin/suyu"),
+)
+
+
+def die(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run_id() -> str:
+    return os.environ.get("SUYU_VERIFY_RUN_ID") or os.environ.get("RUN_ID") or "default"
+
+
+def verify_root(rid: str | None = None) -> Path:
+    rid = rid or run_id()
+    override = os.environ.get("SUYU_VERIFY_ROOT")
+    if override:
+        return Path(override)
+    return Path(f"/tmp/suyu-verify-{rid}")
+
+
+def instance_path(rid: str | None = None) -> Path:
+    return verify_root(rid) / "instance.json"
+
+
+def evidence_dir(rid: str | None = None) -> Path:
+    override = os.environ.get("SUYU_VERIFY_EVIDENCE_DIR")
+    if override:
+        path = Path(override)
+    else:
+        path = verify_root(rid) / "evidence"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def load_instance(rid: str | None = None) -> dict[str, Any]:
+    path = instance_path(rid)
+    if not path.is_file():
+        die(f"No instance file at {path}. Run `control-suyu launch` first.")
+    return json.loads(path.read_text())
+
+
+def save_instance(data: dict[str, Any], rid: str | None = None) -> None:
+    path = instance_path(rid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _hex_port(port: int) -> str:
+    return f"{port:04X}"
+
+
+def _proc_net_inodes(port: int) -> set[str]:
+    needle = _hex_port(port)
+    inodes: set[str] = set()
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        if not table.is_file():
+            continue
+        for line in table.read_text().splitlines()[1:]:
+            cols = line.split()
+            if len(cols) < 10:
+                continue
+            local = cols[1]
+            if not local.upper().endswith(":" + needle):
+                continue
+            # 0A = TCP_LISTEN
+            if cols[3] != "0A":
+                continue
+            inodes.add(cols[9])
+    return inodes
+
+
+def _pids_for_socket_inodes(inodes: set[str]) -> list[int]:
+    if not inodes:
+        return []
+    pids: set[int] = set()
+    proc = Path("/proc")
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        fd_dir = entry / "fd"
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target[8:-1] in inodes:
+                    pids.add(int(entry.name))
+                    break
+        except OSError:
+            continue
+    return sorted(pids)
+
+
+def listeners_on_port(port: int) -> list[int]:
+    try:
+        out = subprocess.check_output(
+            ["ss", "-ltnp", f"sport = :{port}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        pids: list[int] = []
+        for line in out.splitlines():
+            if "pid=" not in line:
+                continue
+            for chunk in line.split("pid="):
+                if chunk is line:
+                    continue
+                digits = "".join(ch for ch in chunk if ch.isdigit())
+                if digits:
+                    pids.append(int(digits))
+        if pids:
+            return sorted(set(pids))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return _pids_for_socket_inodes(_proc_net_inodes(port))
+
+
+def tcp_ready(host: str, port: int, timeout: float = 0.4) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def mcp_request(method: str, params: dict[str, Any] | None = None, req_id: int = 1) -> dict[str, Any]:
+    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    body = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+    with socket.create_connection((MCP_HOST, MCP_PORT), timeout=20) as sock:
+        sock.sendall(body)
+        sock.shutdown(socket.SHUT_WR)
+        chunks: list[bytes] = []
+        sock.settimeout(20)
+        while True:
+            try:
+                data = sock.recv(65536)
+            except socket.timeout:
+                break
+            if not data:
+                break
+            chunks.append(data)
+            if b"\n" in data:
+                break
+    raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+    if not raw:
+        die("MCP returned an empty response")
+    line = raw.splitlines()[0]
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        die(f"MCP response is not JSON: {line!r} ({exc})")
+
+
+def tool_text(response: dict[str, Any]) -> str:
+    if "error" in response:
+        die(f"MCP error: {json.dumps(response['error'])}")
+    result = response.get("result") or {}
+    content = result.get("content") or []
+    if not content:
+        return json.dumps(result)
+    return content[0].get("text") or json.dumps(result)
+
+
+def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    response = mcp_request(
+        "tools/call",
+        {"name": name, "arguments": arguments or {}},
+        req_id=3,
+    )
+    text = tool_text(response)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"raw": text}
+
+
+def write_qt_ini(path: Path, groups: dict[str, dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for group, values in groups.items():
+        lines.append(f"[{group}]")
+        for key, value in values.items():
+            lines.append(f"{key}={value}")
+        lines.append("")
+    path.write_text("\n".join(lines))
+
+
+def resolve_bin(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            die(f"suyu binary not found: {path}")
+        return path
+    env = os.environ.get("SUYU_VERIFY_BIN")
+    if env:
+        path = Path(env).expanduser().resolve()
+        if not path.is_file():
+            die(f"SUYU_VERIFY_BIN is not a file: {path}")
+        return path
+    repo = Path.cwd()
+    for rel in DEFAULT_BIN_CANDIDATES:
+        path = (repo / rel).resolve()
+        if path.is_file():
+            return path
+    die(
+        "No suyu binary found. Build with the Launch cmake command, "
+        "or pass --bin / set SUYU_VERIFY_BIN."
+    )
+
+
+def cmd_launch(args: argparse.Namespace) -> None:
+    rid = args.run_id or run_id()
+    os.environ["SUYU_VERIFY_RUN_ID"] = rid
+    root = verify_root(rid)
+    binary = resolve_bin(args.bin)
+    owners = listeners_on_port(MCP_PORT)
+    if owners:
+        existing = instance_path(rid)
+        if existing.is_file():
+            inst = json.loads(existing.read_text())
+            if inst.get("pid") in owners and pid_alive(int(inst["pid"])):
+                print(json.dumps({"status": "already_running", **inst}, indent=2))
+                return
+        die(
+            f"Port {MCP_PORT} is already owned by pid(s) {owners}. "
+            "Refuse to drive a shared suyu instance. Stop that process or pick another machine."
+        )
+
+    data_home = root / "xdg-data"
+    config_home = root / "xdg-config"
+    cache_home = root / "xdg-cache"
+    workdir = root / "cwd"
+    log_file = root / "suyu.stdout.log"
+    evid = evidence_dir(rid)
+    for path in (data_home, config_home, cache_home, workdir, evid):
+        path.mkdir(parents=True, exist_ok=True)
+
+    # Organization "suyu" / application "suyu" — first-run welcome dialog.
+    write_qt_ini(
+        config_home / "suyu" / "suyu.conf",
+        {"General": {"first_run_done": "true"}},
+    )
+    # Organization "suyu team" / application "suyu" — mode selector.
+    write_qt_ini(
+        config_home / "suyu team" / "suyu.conf",
+        {"General": {"AppMode": "gamer", "RememberMode": "true"}},
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "DISPLAY": env.get("DISPLAY") or ":1",
+            "XDG_DATA_HOME": str(data_home),
+            "XDG_CONFIG_HOME": str(config_home),
+            "XDG_CACHE_HOME": str(cache_home),
+            "QT_QPA_PLATFORM": env.get("QT_QPA_PLATFORM") or "xcb",
+            "SUYU_VERIFY_RUN_ID": rid,
+            "SUYU_VERIFY_ROOT": str(root),
+            "SUYU_VERIFY_EVIDENCE_DIR": str(evid),
+        }
+    )
+    stdout = log_file.open("w")
+    proc = subprocess.Popen(
+        [str(binary), "-gamer"],
+        cwd=str(workdir),
+        env=env,
+        stdout=stdout,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    instance = {
+        "pid": proc.pid,
+        "bin": str(binary),
+        "run_id": rid,
+        "root": str(root),
+        "workdir": str(workdir),
+        "xdg_data_home": str(data_home),
+        "xdg_config_home": str(config_home),
+        "xdg_cache_home": str(cache_home),
+        "log_file": str(log_file),
+        "evidence_dir": str(evid),
+        "mcp_host": MCP_HOST,
+        "mcp_port": MCP_PORT,
+        "mode_flag": "-gamer",
+    }
+    save_instance(instance, rid)
+
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            die(
+                f"suyu exited during launch with code {proc.returncode}. "
+                f"See {log_file}"
+            )
+        if tcp_ready(MCP_HOST, MCP_PORT):
+            try:
+                ping = mcp_request("ping", req_id=1)
+            except SystemExit:
+                ping = {}
+            if "result" in ping or ping.get("jsonrpc") == "2.0":
+                instance["ready"] = True
+                save_instance(instance, rid)
+                print(json.dumps(instance, indent=2))
+                return
+        time.sleep(0.4)
+
+    cmd_cleanup(argparse.Namespace(run_id=rid, keep_xdg=False))
+    die(f"Timed out waiting for MCP on {MCP_HOST}:{MCP_PORT}. See {log_file}")
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    inst = load_instance(args.run_id)
+    pid = int(inst["pid"])
+    report: dict[str, Any] = {
+        "ok": True,
+        "pid": pid,
+        "pid_alive": pid_alive(pid),
+        "mcp_host": inst.get("mcp_host", MCP_HOST),
+        "mcp_port": inst.get("mcp_port", MCP_PORT),
+        "xdg_data_home": inst.get("xdg_data_home"),
+        "xdg_config_home": inst.get("xdg_config_home"),
+        "bin": inst.get("bin"),
+        "log_file": inst.get("log_file"),
+    }
+    owners = listeners_on_port(int(report["mcp_port"]))
+    report["port_owners"] = owners
+    report["port_owned_by_us"] = pid in owners
+
+    if not report["pid_alive"]:
+        report["ok"] = False
+        report["error"] = f"pid {pid} is not running"
+    elif owners and pid not in owners:
+        report["ok"] = False
+        report["error"] = (
+            f"Port {report['mcp_port']} is owned by {owners}, not pid {pid}. "
+            "Do not drive this instance."
+        )
+    else:
+        try:
+            ping = mcp_request("ping", req_id=1)
+            report["ping"] = ping.get("result", ping)
+            info = call_tool("get_system_info")
+            state = call_tool("get_ui_state")
+            report["system"] = info
+            report["ui_state"] = state
+            if info.get("emulator") != "suyu":
+                report["ok"] = False
+                report["error"] = f"unexpected emulator identity: {info.get('emulator')!r}"
+            elif state.get("mode") not in {"gamer", "programmer", "hacker"}:
+                report["ok"] = False
+                report["error"] = f"unexpected UI mode: {state.get('mode')!r}"
+            app_dir = Path(str(info.get("app_dir") or ""))
+            expected = Path(str(inst.get("bin") or "")).resolve().parent
+            if app_dir and expected and app_dir.resolve() != expected:
+                report["ok"] = False
+                report["error"] = (
+                    f"MCP app_dir {app_dir} is not the launched binary dir {expected}"
+                )
+        except SystemExit as exc:
+            report["ok"] = False
+            report["error"] = str(exc)
+        except OSError as exc:
+            report["ok"] = False
+            report["error"] = f"MCP unreachable: {exc}"
+
+    print(json.dumps(report, indent=2))
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
+def parse_json_arg(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"arguments must be JSON object: {exc}")
+    if not isinstance(value, dict):
+        die("arguments must be a JSON object")
+    return value
+
+
+def cmd_call(args: argparse.Namespace) -> None:
+    load_instance(args.run_id)
+    result = call_tool(args.tool, parse_json_arg(args.arguments))
+    print(json.dumps(result, indent=2))
+
+
+def cmd_screenshot(args: argparse.Namespace) -> None:
+    inst = load_instance(args.run_id)
+    dest = Path(args.path) if args.path else evidence_dir(args.run_id) / "ui.png"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    result = call_tool(
+        "capture_ui_screenshot",
+        {"path": str(dest.resolve()), "target": args.target},
+    )
+    print(json.dumps(result, indent=2))
+    if not result.get("success"):
+        raise SystemExit(1)
+
+
+def cmd_cleanup(args: argparse.Namespace) -> None:
+    path = instance_path(args.run_id)
+    if not path.is_file():
+        print(json.dumps({"status": "no_instance", "path": str(path)}))
+        return
+    inst = json.loads(path.read_text())
+    pid = int(inst.get("pid") or 0)
+    if pid and pid_alive(pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.time() + 8
+        while time.time() < deadline and pid_alive(pid):
+            time.sleep(0.2)
+        if pid_alive(pid):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    evid = inst.get("evidence_dir")
+    if not args.keep_xdg:
+        for key in ("xdg_data_home", "xdg_config_home", "xdg_cache_home", "workdir"):
+            value = inst.get(key)
+            if value:
+                subprocess.run(["rm", "-rf", value], check=False)
+        log_file = inst.get("log_file")
+        if log_file and evid and Path(log_file).resolve() != Path(str(evid)).resolve():
+            Path(log_file).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    print(
+        json.dumps(
+            {
+                "status": "cleaned",
+                "pid": pid,
+                "evidence_dir": evid,
+                "evidence_kept": True,
+            },
+            indent=2,
+        )
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-id", help="Isolation key. Defaults to SUYU_VERIFY_RUN_ID or 'default'.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    launch = sub.add_parser("launch", help="Start an isolated suyu -gamer instance")
+    launch.add_argument("--bin", help="Path to the suyu Qt binary")
+    launch.add_argument("--timeout", type=int, default=60, help="Seconds to wait for MCP")
+    launch.set_defaults(func=cmd_launch)
+
+    doctor = sub.add_parser("doctor", help="Read-only health check of the launched instance")
+    doctor.set_defaults(func=cmd_doctor)
+
+    call = sub.add_parser("call", help="Call an MCP tool by name")
+    call.add_argument("tool")
+    call.add_argument("arguments", nargs="?", help='JSON object, e.g. {"mode":"gamer"}')
+    call.set_defaults(func=cmd_call)
+
+    shot = sub.add_parser("screenshot", help="Capture the Qt window via capture_ui_screenshot")
+    shot.add_argument("--path", help="Destination PNG. Defaults to $SUYU_VERIFY_EVIDENCE_DIR/ui.png")
+    shot.add_argument(
+        "--target",
+        default="main_window",
+        choices=("main_window", "active_modal", "active_window", "central_widget"),
+    )
+    shot.set_defaults(func=cmd_screenshot)
+
+    cleanup = sub.add_parser("cleanup", help="Stop the PID from instance.json; keep evidence")
+    cleanup.add_argument(
+        "--keep-xdg",
+        action="store_true",
+        help="Leave isolated XDG dirs in place (still keeps evidence)",
+    )
+    cleanup.set_defaults(func=cmd_cleanup)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.run_id:
+        os.environ["SUYU_VERIFY_RUN_ID"] = args.run_id
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
