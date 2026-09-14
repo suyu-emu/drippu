@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Standalone (and optionally nested) exporter smoke: EmitProject compile plus
+# RET/BLR branch probes against the active arm64_to_c.h header. Does not use
+# tools/static_recompiler.
+
+cmake_minimum_required(VERSION 3.13)
+
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(suyu_exporter_smoke LANGUAGES C CXX)
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_C_STANDARD 11)
+    enable_testing()
+endif()
+
+enable_language(C)
+
+add_executable(exporter_smoke exporter_smoke.cpp)
+target_compile_features(exporter_smoke PRIVATE cxx_std_20)
+target_include_directories(exporter_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+file(TO_CMAKE_PATH "${CMAKE_COMMAND}" SUYU_SMOKE_CMAKE)
+file(TO_CMAKE_PATH "${CMAKE_C_COMPILER}" SUYU_SMOKE_C_COMPILER)
+set(SUYU_SMOKE_GENERATOR "${CMAKE_GENERATOR}")
+set(SUYU_SMOKE_GENERATOR_PLATFORM "${CMAKE_GENERATOR_PLATFORM}")
+configure_file(smoke_config.h.in smoke_config.h @ONLY)
+
+add_test(NAME exporter_smoke COMMAND exporter_smoke)
+set_tests_properties(exporter_smoke PROPERTIES
+    TIMEOUT 180
+)

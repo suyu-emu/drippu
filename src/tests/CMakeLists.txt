@@ -29,6 +29,10 @@ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain
 
 add_test(NAME tests COMMAND tests)
 
+# Header-only exporter smoke; also configurable as a standalone CMake project
+# from src/tests/recompiler (PR CI does that so it needs no emulator deps).
+add_subdirectory(recompiler)
+
 # needed for vma
 if (NOT MSVC)
     target_compile_options(tests PRIVATE
