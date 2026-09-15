@@ -60,10 +60,15 @@ jobs:
           Copy-Item build/bin/suyu-cmd.exe _pkg/
           windeployqt --release --no-translations _pkg/suyu.exe
           Compress-Archive -Path _pkg/* -DestinationPath suyu-windows-x64.zip
+      - name: Record toolchain
+        shell: bash
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: suyu-windows-x64.zip
+          path: |
+            suyu-windows-x64.zip
+            toolchain.txt
 
   build-linux:
     name: Linux
@@ -113,10 +118,14 @@ jobs:
           cp build/bin/suyu _pkg/
           cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
           tar -czf suyu-linux-x64.tar.gz -C _pkg .
+      - name: Record toolchain
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: suyu-linux-x64.tar.gz
+          path: |
+            suyu-linux-x64.tar.gz
+            toolchain.txt
 
   build-macos:
     name: macOS
@@ -156,10 +165,14 @@ jobs:
           cp -r build/bin/suyu.app _pkg/ 2>/dev/null || cp build/bin/suyu _pkg/
           cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
           tar -czf suyu-macos-arm64.tar.gz -C _pkg .
+      - name: Record toolchain
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: suyu-macos-arm64.tar.gz
+          path: |
+            suyu-macos-arm64.tar.gz
+            toolchain.txt
 
   build-freebsd:
     name: FreeBSD
@@ -186,10 +199,14 @@ jobs:
             cp build/bin/suyu _pkg/
             cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
             tar -czf suyu-freebsd-x64.tar.gz -C _pkg .
+      - name: Record toolchain
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: freebsd
-          path: suyu-freebsd-x64.tar.gz
+          path: |
+            suyu-freebsd-x64.tar.gz
+            toolchain.txt
 
   build-android:
     name: Android
@@ -222,10 +239,14 @@ jobs:
         run: |
           rm -rf _pkg && mkdir _pkg
           find src/android -name '*.apk' -exec cp {} _pkg/ \;
+      - name: Record toolchain
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: android
-          path: _pkg/*.apk
+          path: |
+            _pkg/*.apk
+            toolchain.txt
 
   build-libretro:
     name: Libretro
@@ -270,10 +291,14 @@ jobs:
           rm -rf _pkg && mkdir _pkg
           find build -name 'suyu_libretro.so' -exec cp {} _pkg/ \;
           tar -czf suyu-libretro-core-linux-x64.tar.gz -C _pkg .
+      - name: Record toolchain
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libretro
-          path: suyu-libretro-core-linux-x64.tar.gz
+          path: |
+            suyu-libretro-core-linux-x64.tar.gz
+            toolchain.txt
 
   build-libretro-windows:
     name: Libretro Windows
@@ -318,10 +343,15 @@ jobs:
           New-Item -ItemType Directory _pkg | Out-Null
           Get-ChildItem build -Recurse -Filter suyu_libretro.dll | ForEach-Object { Copy-Item $_.FullName _pkg/ }
           Compress-Archive -Path _pkg/* -DestinationPath suyu-libretro-core-windows-x64.zip
+      - name: Record toolchain
+        shell: bash
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libretro-windows
-          path: suyu-libretro-core-windows-x64.zip
+          path: |
+            suyu-libretro-core-windows-x64.zip
+            toolchain.txt
 
   build-libretro-android:
     name: Libretro Android
@@ -368,15 +398,25 @@ jobs:
           rm -rf _pkg && mkdir _pkg
           find build -name '*suyu_libretro*.so' -exec cp {} _pkg/suyu_libretro_android_arm64-v8a.so \;
           tar -czf suyu-libretro-core-android-arm64.tar.gz -C _pkg .
+      - name: Record toolchain
+        run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libretro-android
-          path: suyu-libretro-core-android-arm64.tar.gz
+          path: |
+            suyu-libretro-core-android-arm64.tar.gz
+            toolchain.txt
+
+  exporter-smoke:
+    uses: ./.github/workflows/exporter-smoke.yml
+
+  tests:
+    uses: ./.github/workflows/tests.yml
 
   release:
     name: Publish Release
-    if: always()
-    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android]
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' }}
+    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android, exporter-smoke, tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -385,25 +425,7 @@ jobs:
           path: artifacts
       - name: List artifacts
         run: find artifacts -type f || echo "No artifacts found"
-      - name: Delete existing release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release delete "v0.04-latest" --repo ${{ github.repository }} --yes 2>/dev/null || true
-          git push --delete origin "v0.04-latest" 2>/dev/null || true
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          FILES=$(find artifacts -type f -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk')
-          if [ -z "$FILES" ]; then
-            echo "No artifacts to release"
-            exit 1
-          fi
-          echo "Releasing: $FILES"
-          gh release create "v0.04-latest" \
-            --repo ${{ github.repository }} \
-            --title "suyu v0.04 latest" \
-            --notes "Automated build. Built by GitHub Actions." \
-            --prerelease \
-            $FILES
+        run: bash .github/scripts/publish_release.sh
