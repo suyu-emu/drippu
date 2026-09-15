@@ -60,6 +60,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
+#include "core/arm/recomp/recomp_aot_cache.h"
 #include "core/recompiler/arm64_to_c.h"
 
 // ---------------------------------------------------------------------------
@@ -924,6 +925,67 @@ static std::vector<u64> CollectExportedSymbolAddresses(const NsoAnalysisResult& 
     return out;
 }
 
+/// Header-only identity for cache reuse / image binding. Avoids decompressing
+/// segments just to decide whether an existing AOT cache is still valid.
+static std::optional<suyu::recomp::AotCacheModuleIdentity> ReadNsoIdentity(
+    const FileSys::VirtualFile& nso_file) {
+    if (!nso_file || nso_file->GetSize() < sizeof(Loader::NSOHeader)) {
+        return std::nullopt;
+    }
+    Loader::NSOHeader header{};
+    if (nso_file->ReadObject(&header) != sizeof(Loader::NSOHeader)) {
+        return std::nullopt;
+    }
+    if (header.magic != Common::MakeMagic('N', 'S', 'O', '0')) {
+        return std::nullopt;
+    }
+    suyu::recomp::AotCacheModuleIdentity id;
+    id.name = nso_file->GetName();
+    id.build_id_hex = BuildIdToHex(header.build_id).toStdString();
+    return id;
+}
+
+static std::vector<suyu::recomp::AotCacheModuleIdentity> CollectExeFsIdentities(
+    const FileSys::VirtualDir& exefs) {
+    std::vector<suyu::recomp::AotCacheModuleIdentity> out;
+    if (!exefs) {
+        return out;
+    }
+    for (const auto& nso_file : exefs->GetFiles()) {
+        if (auto id = ReadNsoIdentity(nso_file)) {
+            out.push_back(std::move(*id));
+        }
+    }
+    return out;
+}
+
+static std::vector<suyu::recomp::AotCacheModuleIdentity> CollectExeFsIdentitiesFromDir(
+    const QString& exefs_dir) {
+    std::vector<suyu::recomp::AotCacheModuleIdentity> out;
+    QDir dir(exefs_dir);
+    if (!dir.exists()) {
+        return out;
+    }
+    const QFileInfoList files = dir.entryInfoList(QDir::Files | QDir::Readable);
+    for (const QFileInfo& info : files) {
+        QFile f(info.absoluteFilePath());
+        if (!f.open(QIODevice::ReadOnly)) {
+            continue;
+        }
+        const QByteArray bytes = f.read(static_cast<int>(sizeof(Loader::NSOHeader)));
+        uint8_t build_id[suyu::recomp::kRecompBuildIdSize]{};
+        if (!suyu::recomp::ReadNsoBuildId(bytes.constData(), static_cast<size_t>(bytes.size()),
+                                         build_id)) {
+            continue;
+        }
+        suyu::recomp::AotCacheModuleIdentity id;
+        id.name = info.fileName().toStdString();
+        id.build_id_hex = suyu::recomp::BuildIdToHexLower(build_id);
+        out.push_back(std::move(id));
+    }
+    return out;
+}
+
 /// Parse and analyze a single NSO file using the VFS.
 static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFile& nso_file,
                                                         bool full_scan) {
@@ -1503,30 +1565,53 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         ballistic_requested ? QStringLiteral("ballistic") : QStringLiteral("dynarmic");
     const QString effective_backend_name = QStringLiteral("dynarmic");
 
-    // A completed export is immutable for a given game/output directory and
-    // scan mode. Reusing it makes re-opening the export dialog or packaging
-    // the same title again effectively instant instead of decompressing every
-    // NSO and regenerating gigabytes of C.
-    if (QFile::exists(manifest_path)) {
-        QFile manifest(manifest_path);
-        if (manifest.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            const QString contents = QString::fromUtf8(manifest.readAll());
-            const bool same_scan = contents.contains(
-                QStringLiteral("\"full_scan\": ") + (full_scan ? QStringLiteral("true")
-                                                                  : QStringLiteral("false")));
-            const bool same_backend = contents.contains(
-                QStringLiteral("\"effective_backend\": \"") + effective_backend_name +
-                QStringLiteral("\""));
-            const bool has_recompiled_project =
-                QDir(cache_dir + QDir::separator() + QStringLiteral("exefs")).exists();
-            const bool has_required_launcher =
-                !WantsCompiledOutput() ||
-                QFile::exists(cache_dir + QDir::separator() + QStringLiteral("launcher") +
-                              QDir::separator() + QStringLiteral("static_launcher.exe"));
-            if (same_scan && same_backend && has_recompiled_project && has_required_launcher) {
-                LOG_INFO(Frontend, "Reusing completed AOT cache at {}", cache_dir.toStdString());
-                return cache_dir;
+    // A completed export is reusable only when the *current* title modules,
+    // emitter/ABI revision, scan mode and backend still match the manifest.
+    // Matching full_scan/backend alone previously reused stale game code after
+    // an update or recompiler bump.
+    {
+        std::vector<suyu::recomp::AotCacheModuleIdentity> current_modules;
+        const QString rom_path = rom_path_edit->text();
+        if (!rom_path.isEmpty() && QFile::exists(rom_path) && QFileInfo(rom_path).isFile()) {
+            if (auto exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString())) {
+                current_modules = CollectExeFsIdentities(exefs_vdir);
             }
+        }
+        if (current_modules.empty() && !exefs_dir.isEmpty()) {
+            current_modules = CollectExeFsIdentitiesFromDir(exefs_dir);
+        }
+
+        QString manifest_contents;
+        if (QFile::exists(manifest_path)) {
+            QFile manifest(manifest_path);
+            if (manifest.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                manifest_contents = QString::fromUtf8(manifest.readAll());
+            }
+        }
+
+        suyu::recomp::AotCacheReuseRequest reuse_req;
+        reuse_req.full_scan = full_scan;
+        const std::string backend_owned = effective_backend_name.toStdString();
+        reuse_req.effective_backend = backend_owned;
+        reuse_req.emitter_revision = suyu::recomp::kRecompEmitterRevision;
+        reuse_req.abi_version = suyu::recomp::kRecompImageAbiVersion;
+        reuse_req.wants_compiled = WantsCompiledOutput();
+        reuse_req.has_recompiled_project =
+            QDir(cache_dir + QDir::separator() + QStringLiteral("recompiled")).exists();
+        reuse_req.has_required_launcher =
+            QFile::exists(cache_dir + QDir::separator() + QStringLiteral("launcher") +
+                          QDir::separator() + QStringLiteral("static_launcher.exe"));
+        reuse_req.current_modules = current_modules;
+
+        const auto reuse = suyu::recomp::EvaluateAotCacheReuse(manifest_contents.toStdString(),
+                                                               reuse_req);
+        if (reuse.ok()) {
+            LOG_INFO(Frontend, "Reusing completed AOT cache at {}", cache_dir.toStdString());
+            return cache_dir;
+        }
+        if (QFile::exists(manifest_path)) {
+            LOG_INFO(Frontend, "AOT cache at {} not reused: {} ({})", cache_dir.toStdString(),
+                     suyu::recomp::AotCacheRejectName(reuse.reason), reuse.detail);
         }
     }
 
@@ -2221,10 +2306,12 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     if (manifest.open(QIODevice::WriteOnly | QIODevice::Text)) {
         QTextStream out(&manifest);
         out << "{\n";
-        out << "  \"version\": 2,\n";
+        out << "  \"version\": " << suyu::recomp::kRecompAotManifestVersion << ",\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
         out << "  \"effective_backend\": \"" << effective_backend_name << "\",\n";
         out << "  \"full_scan\": " << (full_scan ? "true" : "false") << ",\n";
+        out << "  \"emitter_revision\": " << suyu::recomp::kRecompEmitterRevision << ",\n";
+        out << "  \"abi_version\": " << suyu::recomp::kRecompImageAbiVersion << ",\n";
         out << "  \"total_modules\": " << module_results.size() << ",\n";
         out << "  \"total_blocks_analyzed\": " << total_blocks << ",\n";
         out << "  \"total_instructions\": " << total_instructions << ",\n";

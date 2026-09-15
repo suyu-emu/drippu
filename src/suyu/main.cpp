@@ -140,6 +140,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_aot_cache.h"
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core_timing.h"
 #include "core/crypto/key_manager.h"
@@ -733,7 +734,7 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
             recomp_dir = FindRecompiledImageDirFor(game_path);
         }
         if (!recomp_dir.isEmpty()) {
-            const int loaded = LoadRecompiledImagesFrom(recomp_dir);
+            const int loaded = LoadRecompiledImagesFrom(recomp_dir, game_path);
             if (loaded == 0) {
                 LOG_WARNING(Frontend, "No recompiled images under {}, booting on the JIT",
                             recomp_dir.toStdString());
@@ -6472,39 +6473,60 @@ void RebuildOwnerTable() {
 using ExpectedBuildIds =
     std::unordered_map<std::string, std::array<uint8_t, suyu::recomp::kRecompBuildIdSize>>;
 
-ExpectedBuildIds LoadExpectedBuildIds(const QString& image_dir) {
+/// Prefer identities from real NSO bytes (live guest / ExeFS content). Never
+/// use an adjacent aot_manifest.json alone — that file is written beside the
+/// images and can agree with a stale export.
+ExpectedBuildIds LoadExpectedBuildIdsFromNsoDir(const QString& exefs_dir) {
     ExpectedBuildIds out;
-    const QStringList candidates = {
-        QDir(image_dir).absoluteFilePath(QStringLiteral("aot_manifest.json")),
-        QDir(image_dir).absoluteFilePath(QStringLiteral("../aot_manifest.json")),
-    };
-    QByteArray json;
-    for (const QString& path : candidates) {
-        QFile f(path);
-        if (f.open(QIODevice::ReadOnly)) {
-            json = f.readAll();
-            break;
-        }
-    }
-    if (json.isEmpty()) {
+    QDir dir(exefs_dir);
+    if (!dir.exists()) {
         return out;
     }
-    const QJsonDocument doc = QJsonDocument::fromJson(json);
-    if (!doc.isObject()) {
-        return out;
-    }
-    const QJsonArray modules = doc.object().value(QStringLiteral("modules")).toArray();
-    for (const QJsonValue& value : modules) {
-        const QJsonObject mod = value.toObject();
-        const std::string name = mod.value(QStringLiteral("name")).toString().toStdString();
-        const std::string hex = mod.value(QStringLiteral("build_id")).toString().toStdString();
-        std::array<uint8_t, suyu::recomp::kRecompBuildIdSize> id{};
-        if (name.empty() || !suyu::recomp::ParseBuildIdHex(hex, id.data())) {
+    const QFileInfoList files = dir.entryInfoList(QDir::Files | QDir::Readable);
+    for (const QFileInfo& info : files) {
+        QFile f(info.absoluteFilePath());
+        if (!f.open(QIODevice::ReadOnly)) {
             continue;
         }
-        out.emplace(name, id);
+        const QByteArray bytes = f.read(0x60);
+        std::array<uint8_t, suyu::recomp::kRecompBuildIdSize> id{};
+        if (!suyu::recomp::ReadNsoBuildId(bytes.constData(), static_cast<size_t>(bytes.size()),
+                                         id.data())) {
+            continue;
+        }
+        out.emplace(info.fileName().toStdString(), id);
     }
     return out;
+}
+
+ExpectedBuildIds LoadExpectedBuildIds(const QString& image_dir, const QString& game_path = {}) {
+    // 1) ExeFS next to the ROM being launched (package layout: <rom_dir>/aot_cache/exefs).
+    if (!game_path.isEmpty()) {
+        const QString rom_dir = QFileInfo(game_path).absolutePath();
+        const QStringList live_candidates = {
+            rom_dir + QStringLiteral("/aot_cache/exefs"),
+            rom_dir + QStringLiteral("/exefs"),
+        };
+        for (const QString& candidate : live_candidates) {
+            ExpectedBuildIds live = LoadExpectedBuildIdsFromNsoDir(candidate);
+            if (!live.empty()) {
+                return live;
+            }
+        }
+    }
+    // 2) ExeFS content shipped with the recompiled tree (NSO files, not JSON).
+    const QStringList nso_candidates = {
+        QDir(image_dir).absoluteFilePath(QStringLiteral("../exefs")),
+        QDir(image_dir).absoluteFilePath(QStringLiteral("../../exefs")),
+        QDir(image_dir).absoluteFilePath(QStringLiteral("exefs")),
+    };
+    for (const QString& candidate : nso_candidates) {
+        ExpectedBuildIds from_nso = LoadExpectedBuildIdsFromNsoDir(candidate);
+        if (!from_nso.empty()) {
+            return from_nso;
+        }
+    }
+    return {};
 }
 
 QDir SkipCmakeBuildFolders(QDir dir) {
@@ -6585,7 +6607,7 @@ void GMainWindow::EnterSingleGameMode() {
 // dispatcher. Returns the number of images loaded, 0 on failure - the caller
 // decides whether that deserves a dialog, because the single-game launcher
 // path runs unattended and must not stop on a modal.
-int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
+int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, const QString& game_path) {
 #ifdef _WIN32
     const QString pattern = QStringLiteral("*.dll");
 #elif defined(__APPLE__)
@@ -6598,7 +6620,9 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     std::vector<QLibrary*> found;
     std::vector<RecompImage> records;
     suyu::recomp::RecompModuleMap pending;
-    const ExpectedBuildIds expected = LoadExpectedBuildIds(dir);
+    // Identities must come from ExeFS/NSO content for the title being launched,
+    // not from an adjacent JSON manifest that can agree with stale images.
+    const ExpectedBuildIds expected = LoadExpectedBuildIds(dir, game_path);
     bool rejected = false;
     while (it.hasNext()) {
         auto* lib = new QLibrary(it.next(), this);
@@ -6619,6 +6643,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
         ex.abi = reinterpret_cast<suyu::recomp::RecompImageAbiFn>(lib->resolve("recomp_image_abi"));
 
         suyu::recomp::ImageExpect expect{};
+        expect.require_build_id = true;
         if (ex.abi) {
             if (const suyu::recomp::RecompImageAbi* abi = ex.abi()) {
                 const auto hit = expected.find(abi->module_name);
@@ -6671,23 +6696,32 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
 
     Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
         const std::string name = module ? module : "";
+        // Identity (name) first — dense load-order index is not an ABI ordinal.
         suyu::recomp::ApplyModuleBase(loaded_map, index, name.c_str(), base);
         RecompImage* record = nullptr;
-        if (index < suyu::recomp::kRecompMaxModules && loaded_map.slots[index].abi) {
-            const auto* abi = loaded_map.slots[index].abi;
+        if (const auto* slot = suyu::recomp::SlotByIdentity(loaded_map, name.c_str())) {
             for (auto& rec : loaded_records) {
-                if (rec.abi == abi) {
-                    rec.base = loaded_map.slots[index].base;
+                if (rec.abi == slot->abi) {
+                    rec.base = slot->base;
                     record = &rec;
                     break;
                 }
             }
         }
-        if (!record) {
-            if (const auto* slot = suyu::recomp::SlotByName(loaded_map, name.c_str())) {
+        if (!record && index < suyu::recomp::kRecompMaxModules && loaded_map.slots[index].abi) {
+            const auto* abi = loaded_map.slots[index].abi;
+            // Only trust the dense index when the slot already matches this name
+            // (or the guest supplied no name).
+            if (!name.empty() && abi->module_name[0] != '\0' &&
+                !suyu::recomp::ModuleNameEqual(abi->module_name, name.c_str()) &&
+                !suyu::recomp::ModuleNameEqual(abi->module_name,
+                                               suyu::recomp::WithoutNnPrefix(name.c_str()))) {
+                abi = nullptr;
+            }
+            if (abi) {
                 for (auto& rec : loaded_records) {
-                    if (rec.abi == slot->abi) {
-                        rec.base = slot->base;
+                    if (rec.abi == abi) {
+                        rec.base = loaded_map.slots[index].base;
                         record = &rec;
                         break;
                     }

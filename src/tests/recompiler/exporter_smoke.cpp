@@ -8,6 +8,7 @@
 // Deliberately does not invoke tools/static_recompiler.
 
 #include "core/recompiler/arm64_to_c.h"
+#include "core/arm/recomp/recomp_aot_cache.h"
 #include "core/arm/recomp/recomp_icache.h"
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/arm/recomp/recomp_session.h"
@@ -863,6 +864,7 @@ void TestSharedImageAbi(const fs::path& root) {
     using suyu::recomp::ImageReject;
     using suyu::recomp::PlaceLoadedModule;
     using suyu::recomp::RecompImageAbi;
+    using suyu::recomp::RecompImageAbiFn;
     using suyu::recomp::RecompImageExports;
     using suyu::recomp::RecompModuleMap;
     using suyu::recomp::SlotByName;
@@ -946,6 +948,14 @@ void TestSharedImageAbi(const fs::path& root) {
         pass("title/update content hash mismatch rejected");
     }
 
+    ImageExpect require_missing{};
+    require_missing.require_build_id = true;
+    if (ValidateImageExports(hashed, require_missing) != ImageReject::MissingExpectBuildId) {
+        fail("require_build_id accepted a null expect.build_id");
+    } else {
+        pass("missing required live build_id rejected");
+    }
+
     static RecompImageAbi sdk_abi{};
     sdk_abi.abi_version = kRecompImageAbiVersion;
     sdk_abi.abi_size = static_cast<uint32_t>(sizeof(RecompImageAbi));
@@ -984,6 +994,80 @@ void TestSharedImageAbi(const fs::path& root) {
         fail("sdk base is not 0x7101000000");
     } else {
         pass("sdk kept its own base when rtld was omitted");
+    }
+
+    // Sparse load order rtld, main, subsdk1, sdk — runtime indices 0..3 must not
+    // be treated as ABI ordinals (subsdk1=3, sdk=12). Reproduce the review case.
+    {
+        using suyu::recomp::ModuleIndexForName;
+        using suyu::recomp::SlotByIdentity;
+
+        static RecompImageAbi sparse_rtld{};
+        static RecompImageAbi sparse_main{};
+        static RecompImageAbi sparse_subsdk1{};
+        static RecompImageAbi sparse_sdk{};
+        auto fill = [](RecompImageAbi& abi, const char* name, uint8_t fill_byte) {
+            abi = {};
+            abi.abi_version = kRecompImageAbiVersion;
+            abi.abi_size = static_cast<uint32_t>(sizeof(RecompImageAbi));
+            abi.context_size = 2048;
+            abi.regs_prefix_size = kRecompRegsPrefixSize;
+            abi.module_index = static_cast<uint32_t>(ModuleIndexForName(name));
+            std::memset(abi.build_id, fill_byte, kRecompBuildIdSize);
+            std::strncpy(abi.module_name, name, sizeof(abi.module_name) - 1);
+        };
+        fill(sparse_rtld, "rtld", 0xA0);
+        fill(sparse_main, "main", 0xA1);
+        fill(sparse_subsdk1, "subsdk1", 0xA2);
+        fill(sparse_sdk, "sdk", 0xA3);
+
+        RecompModuleMap sparse{};
+        auto place_ok = [&](RecompImageAbiFn abi_fn) {
+            RecompImageExports ex{};
+            ex.lookup = DummyLookup;
+            ex.set_base = +[](u64) {};
+            ex.abi = abi_fn;
+            return PlaceLoadedModule(sparse, ex) == ImageReject::Ok;
+        };
+        if (!place_ok([]() -> const RecompImageAbi* { return &sparse_rtld; }) ||
+            !place_ok([]() -> const RecompImageAbi* { return &sparse_main; }) ||
+            !place_ok([]() -> const RecompImageAbi* { return &sparse_subsdk1; }) ||
+            !place_ok([]() -> const RecompImageAbi* { return &sparse_sdk; })) {
+            fail("sparse rtld/main/subsdk1/sdk images failed to place on ABI slots");
+        } else {
+            pass("sparse modules placed on canonical ABI slots");
+        }
+
+        // Dense runtime indices as FindModules would number them.
+        ApplyModuleBase(sparse, 0, "rtld", 0x100000ULL);
+        ApplyModuleBase(sparse, 1, "main", 0x200000ULL);
+        ApplyModuleBase(sparse, 2, "subsdk1", 0x400000ULL);
+        ApplyModuleBase(sparse, 3, "sdk", 0x800000ULL);
+
+        const auto* s_subsdk1 = SlotByIdentity(sparse, "subsdk1");
+        const auto* s_sdk = SlotByIdentity(sparse, "sdk");
+        if (!s_subsdk1 || !s_sdk) {
+            fail("sparse layout lost subsdk1 or sdk slot");
+        } else if (s_sdk->base != 0x800000ULL) {
+            fail("rtld/main/subsdk1/sdk: sdk base overwritten by dense index 3");
+        } else if (s_subsdk1->base != 0x400000ULL) {
+            fail("rtld/main/subsdk1/sdk: subsdk1 base is not 0x400000");
+        } else if (s_subsdk1->base == 0x800000ULL) {
+            fail("rtld/main/subsdk1/sdk: sdk base=0 expected=800000; "
+                 "subsdk1 base=800000 expected=0");
+        } else {
+            pass("sparse rtld/main/subsdk1/sdk bases follow ABI identity");
+        }
+
+        // Build-id match when the guest name does not equal the export filename.
+        uint8_t sdk_id[kRecompBuildIdSize];
+        std::memset(sdk_id, 0xA3, kRecompBuildIdSize);
+        ApplyModuleBase(sparse, 99, "nnUnexpected", 0x900000ULL, sdk_id);
+        if (SlotByIdentity(sparse, "sdk")->base != 0x900000ULL) {
+            fail("build-id identity did not rebind sdk base");
+        } else {
+            pass("build-id identity rebinds module base");
+        }
     }
 
     const auto* nn_main = SlotByName(map, "nnmain");
@@ -1033,6 +1117,108 @@ void TestSharedImageAbi(const fs::path& root) {
     }
 }
 
+std::string MakeManifest(uint32_t version, bool full_scan, uint32_t emitter, uint32_t abi,
+                         std::string_view backend, std::string_view modules_json) {
+    std::ostringstream out;
+    out << "{\n"
+        << "  \"version\": " << version << ",\n"
+        << "  \"effective_backend\": \"" << backend << "\",\n"
+        << "  \"full_scan\": " << (full_scan ? "true" : "false") << ",\n"
+        << "  \"emitter_revision\": " << emitter << ",\n"
+        << "  \"abi_version\": " << abi << ",\n"
+        << "  \"modules\": [\n"
+        << modules_json << "\n"
+        << "  ]\n"
+        << "}\n";
+    return out.str();
+}
+
+void TestAotCacheReuse() {
+    using suyu::recomp::AotCacheModuleIdentity;
+    using suyu::recomp::AotCacheReject;
+    using suyu::recomp::AotCacheReuseRequest;
+    using suyu::recomp::EvaluateAotCacheReuse;
+    using suyu::recomp::ReadNsoBuildId;
+    using suyu::recomp::BuildIdToHexLower;
+    using suyu::recomp::kRecompAotManifestVersion;
+    using suyu::recomp::kRecompBuildIdSize;
+    using suyu::recomp::kRecompEmitterRevision;
+    using suyu::recomp::kRecompImageAbiVersion;
+
+    const std::string main_id(64, '1');
+    const std::string sdk_id(64, '2');
+    const std::string modules = std::string("    {\"name\": \"main\", \"build_id\": \"") + main_id +
+                                "\"},\n"
+                                "    {\"name\": \"sdk\", \"build_id\": \"" +
+                                sdk_id + "\"}";
+    const std::string manifest =
+        MakeManifest(kRecompAotManifestVersion, false, kRecompEmitterRevision,
+                     kRecompImageAbiVersion, "dynarmic", modules);
+
+    AotCacheReuseRequest req;
+    req.full_scan = false;
+    req.effective_backend = "dynarmic";
+    req.has_recompiled_project = true;
+    req.current_modules = {
+        AotCacheModuleIdentity{"main", main_id},
+        AotCacheModuleIdentity{"sdk", sdk_id},
+    };
+    if (!EvaluateAotCacheReuse(manifest, req).ok()) {
+        fail("identical current modules should reuse AOT cache");
+    } else {
+        pass("AOT cache reused when module identities match");
+    }
+
+    AotCacheReuseRequest no_ids = req;
+    no_ids.current_modules.clear();
+    if (EvaluateAotCacheReuse(manifest, no_ids).reason != AotCacheReject::MissingRequiredIdentity) {
+        fail("empty current module list was allowed to reuse cache");
+    } else {
+        pass("missing current identities invalidate AOT cache");
+    }
+
+    AotCacheReuseRequest updated = req;
+    updated.current_modules[0].build_id_hex = std::string(64, 'a');
+    const auto id_miss = EvaluateAotCacheReuse(manifest, updated);
+    if (id_miss.reason != AotCacheReject::ModuleIdentity || id_miss.detail != "main") {
+        fail("update build_id change did not invalidate as ModuleIdentity/main");
+    } else {
+        pass("title/update build_id change invalidates AOT cache");
+    }
+
+    AotCacheReuseRequest emitter = req;
+    emitter.emitter_revision = kRecompEmitterRevision + 1;
+    if (EvaluateAotCacheReuse(manifest, emitter).reason != AotCacheReject::EmitterRevision) {
+        fail("emitter_revision bump did not invalidate cache");
+    } else {
+        pass("emitter revision change invalidates AOT cache");
+    }
+
+    const std::string old_manifest =
+        MakeManifest(2, false, kRecompEmitterRevision, kRecompImageAbiVersion, "dynarmic", modules);
+    if (EvaluateAotCacheReuse(old_manifest, req).reason != AotCacheReject::ManifestVersion) {
+        fail("v2 manifest without identity schema was reused");
+    } else {
+        pass("legacy manifest version refused for reuse");
+    }
+
+    // NSO0 magic + build_id at 0x40
+    std::vector<uint8_t> nso(0x60, 0);
+    nso[0] = 'N';
+    nso[1] = 'S';
+    nso[2] = 'O';
+    nso[3] = '0';
+    std::memset(nso.data() + 0x40, 0x5a, kRecompBuildIdSize);
+    uint8_t got[kRecompBuildIdSize]{};
+    if (!ReadNsoBuildId(nso.data(), nso.size(), got) || got[0] != 0x5a) {
+        fail("ReadNsoBuildId failed on synthetic NSO0 header");
+    } else if (BuildIdToHexLower(got).substr(0, 2) != "5a") {
+        fail("BuildIdToHexLower mismatch");
+    } else {
+        pass("NSO build_id read from module content");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1054,6 +1240,7 @@ int main() {
     TestModuleRegistrationSession();
     TestCacheInvalidation();
     TestSharedImageAbi(root);
+    TestAotCacheReuse();
 
     if (const char* ev = std::getenv("SUYU_SMOKE_EVIDENCE_DIR")) {
         const fs::path dest(ev);

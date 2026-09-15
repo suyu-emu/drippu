@@ -51,6 +51,10 @@ struct RecompImageExports {
 
 struct ImageExpect {
     const uint8_t* build_id = nullptr;
+    /// When true, a missing expect.build_id is itself a reject — callers must
+    /// supply live guest/ExeFS identities rather than silently skipping the
+    /// check because an adjacent JSON manifest omitted the entry.
+    bool require_build_id = false;
 };
 
 enum class ImageReject {
@@ -63,6 +67,7 @@ enum class ImageReject {
     RegsPrefix,
     EmptyName,
     BuildId,
+    MissingExpectBuildId,
     DuplicateIndex,
     IndexRange,
 };
@@ -164,6 +169,8 @@ inline const char* ImageRejectName(ImageReject r) {
         return "empty module name";
     case ImageReject::BuildId:
         return "content hash mismatch";
+    case ImageReject::MissingExpectBuildId:
+        return "required live module build_id missing";
     case ImageReject::DuplicateIndex:
         return "duplicate module index";
     case ImageReject::IndexRange:
@@ -198,6 +205,9 @@ inline ImageReject ValidateImageExports(const RecompImageExports& ex,
     }
     if (abi->module_name[0] == '\0') {
         return ImageReject::EmptyName;
+    }
+    if (expect.require_build_id && !expect.build_id) {
+        return ImageReject::MissingExpectBuildId;
     }
     if (expect.build_id &&
         std::memcmp(abi->build_id, expect.build_id, kRecompBuildIdSize) != 0) {
@@ -246,19 +256,86 @@ inline const RecompModuleSlot* SlotByName(const RecompModuleMap& map, const char
     return nullptr;
 }
 
-inline void ApplyModuleBase(RecompModuleMap& map, size_t index, const char* name, uint64_t base) {
-    if (index < kRecompMaxModules && map.slots[index].set_base) {
-        map.slots[index].base = base;
-        map.slots[index].set_base(base);
-        return;
+inline const RecompModuleSlot* SlotByBuildId(const RecompModuleMap& map,
+                                            const uint8_t build_id[kRecompBuildIdSize]) {
+    if (!build_id) {
+        return nullptr;
     }
-    if (const RecompModuleSlot* found = SlotByName(map, name)) {
+    bool any = false;
+    for (uint32_t i = 0; i < kRecompBuildIdSize; ++i) {
+        if (build_id[i] != 0) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < kRecompMaxModules; ++i) {
+        const RecompImageAbi* abi = map.slots[i].abi;
+        if (!abi) {
+            continue;
+        }
+        if (std::memcmp(abi->build_id, build_id, kRecompBuildIdSize) == 0) {
+            return &map.slots[i];
+        }
+    }
+    return nullptr;
+}
+
+/// Resolve a loaded image by verified identity. Build ID wins when provided and
+/// unique; otherwise the guest/export module name (with optional nn- prefix).
+/// Dense runtime indices are never consulted here — those are load-order
+/// counters and need not match canonical ABI ordinals (rtld=0 … sdk=12).
+inline const RecompModuleSlot* SlotByIdentity(const RecompModuleMap& map, const char* name,
+                                             const uint8_t* build_id = nullptr) {
+    if (build_id) {
+        if (const RecompModuleSlot* by_id = SlotByBuildId(map, build_id)) {
+            return by_id;
+        }
+    }
+    return SlotByName(map, name);
+}
+
+inline bool SlotNameMatches(const RecompModuleSlot& slot, const char* name) {
+    if (!name || !name[0] || !slot.abi) {
+        return false;
+    }
+    const char* stripped = WithoutNnPrefix(name);
+    return ModuleNameEqual(slot.abi->module_name, name) ||
+           ModuleNameEqual(slot.abi->module_name, stripped);
+}
+
+/// Assign a guest module base to the matching exported image.
+///
+/// Match by name / build ID first. Only fall back to the dense runtime index
+/// when that slot is empty or already belongs to the same identity — never
+/// overwrite a differently named image that happens to occupy the same
+/// ordinal (e.g. sparse rtld,main,subsdk1,sdk must not put SDK's base on
+/// ABI slot 3 / subsdk1).
+inline void ApplyModuleBase(RecompModuleMap& map, size_t index, const char* name, uint64_t base,
+                            const uint8_t* build_id = nullptr) {
+    if (const RecompModuleSlot* found = SlotByIdentity(map, name, build_id)) {
         auto& slot = map.slots[static_cast<size_t>(found - map.slots)];
         if (slot.set_base) {
             slot.base = base;
             slot.set_base(base);
         }
+        return;
     }
+    if (index >= kRecompMaxModules || !map.slots[index].set_base) {
+        return;
+    }
+    const RecompModuleSlot& slot = map.slots[index];
+    // Index fallback: only when the slot has no recorded identity yet, or the
+    // provided name is empty / already matches. A named guest module must not
+    // claim a differently named ABI slot via dense position alone.
+    if (slot.abi && slot.abi->module_name[0] != '\0' && name && name[0] &&
+        !SlotNameMatches(slot, name)) {
+        return;
+    }
+    map.slots[index].base = base;
+    map.slots[index].set_base(base);
 }
 
 }

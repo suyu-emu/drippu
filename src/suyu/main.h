@@ -449,7 +449,7 @@ private slots:
     /// Loads every module image under `dir` and installs the dispatcher.
     /// Returns how many were loaded (0 = none found). Never shows a dialog, so
     /// the single-game launcher can call it before booting, unattended.
-    int LoadRecompiledImagesFrom(const QString& dir);
+    int LoadRecompiledImagesFrom(const QString& dir, const QString& game_path = {});
     void UnloadRecompiledImages();
     bool RecompiledImagesLoaded() const;
     /// Finds the built recompiled images that belong to a game file, if the
