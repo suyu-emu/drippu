@@ -959,6 +959,38 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
     return hr;
 }
 
+HaltReason ArmRecomp::StepFallback(Kernel::KThread* thread) {
+    impl->ctx.pending_svc = kNoPendingSvc;
+    impl->ctx.halted = 0;
+    impl->interrupted.store(false, std::memory_order_relaxed);
+
+    Kernel::Svc::ThreadContext tctx{};
+    this->GetContext(tctx);
+    impl->fallback->SetContext(tctx);
+    impl->fallback->SetTpidrroEl0(impl->ctx.tpidrro_el0);
+
+    const HaltReason hr = impl->fallback->StepThread(thread);
+
+    impl->fallback->GetContext(tctx);
+    this->SetContext(tctx);
+    if (impl->ConsumeUnresolvedImportTrap()) {
+        return HaltReason::PrefetchAbort;
+    }
+    if (True(hr & HaltReason::CacheInvalidation)) {
+        impl->icache.Clear();
+        impl->ctx.chain_budget = 0;
+    }
+    if (True(hr & HaltReason::SupervisorCall)) {
+        impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
+        g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (impl->LookupAot(impl->ctx.pc)) {
+        impl->in_fallback = false;
+        g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
+    }
+    return hr;
+}
+
 HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     // Logged once so it is obvious from a log whether the backend was ever
     // entered at all. A run with no errors is otherwise indistinguishable from
@@ -1211,20 +1243,51 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
 }
 
 HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
-    // Block granularity is the finest this backend can step: recompiled blocks
-    // are straight-line C with no per-instruction re-entry point.
+    // AOT blocks are straight-line C with no per-instruction re-entry, so a
+    // covered PC still steps at block granularity. Misses and unhandled
+    // encodings must take the same JIT fallback entry as RunThread: returning
+    // PrefetchAbort here used to suspend the thread for a debugger that then
+    // could not advance, while RunThread would have continued on Dynarmic.
     if (!impl->lookup) {
         return HaltReason::BreakLoop;
     }
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
+    if (impl->in_fallback) {
+        return StepFallback(thread);
+    }
+
     const RecompBlockFn block = impl->LookupAot(impl->ctx.pc);
     if (!block) {
-        return HaltReason::PrefetchAbort;
+        g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
+        g_counters.RecordMiss(impl->ctx.pc);
+        if (!EnterFallback()) {
+            g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
+            return HaltReason::PrefetchAbort;
+        }
+        return StepFallback(thread);
     }
+
+    // Do not honour a leftover chain budget from RunThread: a debugger step
+    // must not race through a direct-call chain.
+    impl->ctx.chain_budget = 0;
     block(&impl->ctx);
+
+    if (impl->ctx.halted == kHaltUnhandled) {
+        impl->ctx.halted = 0;
+        g_counters.fallback_from_unhandled.fetch_add(1, std::memory_order_relaxed);
+        g_counters.RecordUnhandled(
+            static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)));
+        if (!EnterFallback()) {
+            g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
+            return HaltReason::PrefetchAbort;
+        }
+        return StepFallback(thread);
+    }
     if (impl->ctx.pending_svc != kNoPendingSvc) {
+        g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
+        g_counters.RecordSvc(static_cast<u32>(impl->ctx.pending_svc));
         return HaltReason::SupervisorCall;
     }
     return HaltReason::StepThread;

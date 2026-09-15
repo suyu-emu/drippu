@@ -126,6 +126,10 @@ private:
     /// and back out, and returns to recompiled execution once the PC is covered
     /// again.
     HaltReason RunFallback(Kernel::KThread* thread);
+    /// Same state sync as RunFallback, but steps a single guest instruction on
+    /// the JIT. Used by StepThread so debugger single-step does not bypass the
+    /// miss/unhandled fallback path that RunThread already uses.
+    HaltReason StepFallback(Kernel::KThread* thread);
 
     struct Impl;
     std::unique_ptr<Impl> impl;
