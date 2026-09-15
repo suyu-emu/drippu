@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-FileCopyrightText: 2024 suyu Emulator Project
+# SPDX-FileCopyrightText: 2026 SourCreamCulture / drippu
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=suyu
+Name=drippu
 GenericName=Switch Emulator
 Comment=Nintendo Switch video game console emulator
-Icon=dev.suyu_emu.suyu
+Icon=drippu
 TryExec=suyu
 Exec=suyu %f
 Categories=Game;Emulator;Qt;

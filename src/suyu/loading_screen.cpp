@@ -159,7 +159,7 @@ LoadingScreen::LoadingScreen(QWidget* parent)
     ui->value->setMaximumWidth(980);
     ui->log->setMaximumWidth(980);
 
-    spinner_pixmap_ = QPixmap(QStringLiteral(":/img/suyu.svg")).scaled(120, 120,
+    spinner_pixmap_ = QPixmap(QStringLiteral(":/img/drippu.svg")).scaled(120, 120,
                              Qt::KeepAspectRatio, Qt::SmoothTransformation);
     spinner_timer_ = new QTimer(this);
     spinner_timer_->setInterval(33);

@@ -35,7 +35,7 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
         return std::filesystem::path(exe_w).stem().string();
     }();
 #else
-    const std::string window_title = fmt::format("suyu {} | {}-{} (Vulkan)", Common::g_build_name,
+    const std::string window_title = fmt::format("drippu {} | {}-{} (Vulkan)", Common::g_build_name,
                                                  Common::g_scm_branch, Common::g_scm_desc);
 #endif
     render_window =
@@ -102,7 +102,7 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     OnResize();
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     SDL_PumpEvents();
-    LOG_INFO(Frontend, "suyu Version: {} | {}-{} (Vulkan)", Common::g_build_name,
+    LOG_INFO(Frontend, "drippu Version: {} | {}-{} (Vulkan)", Common::g_build_name,
              Common::g_scm_branch, Common::g_scm_desc);
 }
 

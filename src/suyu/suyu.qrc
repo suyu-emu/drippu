@@ -6,7 +6,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
 <RCC>
     <qresource prefix="/img">
         <file alias="suyu.ico">../../dist/suyu.ico</file>
-        <file alias="suyu.svg">../../dist/suyu.svg</file>
+        <file alias="drippu.svg">../../dist/drippu.svg</file>
+        <!-- Prefer drippu.svg; keep legacy alias for any remaining :/img/suyu.svg lookups -->
+        <file alias="suyu.svg">../../dist/drippu.svg</file>
         <file alias="suyu_logo.svg">../../dist/readme/suyu__Logo-Pill.svg</file>
         <file alias="suyu_tile_mask.png">../../dist/suyu_tile_mask.png</file>
     </qresource>

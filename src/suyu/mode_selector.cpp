@@ -41,7 +41,7 @@ QPixmap LoadBrandLogo(int target_width, int target_height) {
         QDir(app_dir).filePath(QStringLiteral("branding/suyu_logo_variant_primary.png")),
         QDir(app_dir).filePath(QStringLiteral("branding/suyu_logo_variant_alt.png")),
         QStringLiteral(":/img/suyu_logo.svg"),
-        QStringLiteral(":/img/suyu.svg"),
+        QStringLiteral(":/img/drippu.svg"),
     };
 
     for (const QString& path : candidates) {
@@ -60,7 +60,7 @@ QPixmap LoadBrandLogo(int target_width, int target_height) {
 } // anonymous namespace
 
 ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
-    setWindowTitle(QStringLiteral("suyu | Setup Profile"));
+    setWindowTitle(QStringLiteral("drippu | Setup Profile"));
     setMinimumSize(980, 640);
     setStyleSheet(QStringLiteral(
         "ModeSelector {"
@@ -134,14 +134,14 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
     if (!logo_px.isNull()) {
         brand_logo->setPixmap(logo_px);
     } else {
-        brand_logo->setText(QStringLiteral("suyu"));
+        brand_logo->setText(QStringLiteral("drippu"));
         brand_logo->setStyleSheet(QStringLiteral("font-size:42pt; font-weight:800; color:#ffffff;"));
     }
     brand_layout->addWidget(brand_logo);
 
     auto* title = new QLabel(
         QStringLiteral("<div style='text-align:center;'>"
-                       "<span style='font-size:12pt; color:#dcdbde;'>Welcome to suyu</span><br>"
+                       "<span style='font-size:12pt; color:#dcdbde;'>Welcome to drippu</span><br>"
                        "<span style='font-size:18pt; font-weight:600; color:#ffffff;'>Choose Your Layout Profile</span>"
                        "</div>"),
         this);
@@ -267,7 +267,7 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
 
     footer_layout->addWidget(makeFooterButton(QStringLiteral("⚙"), QStringLiteral("Settings")));
     footer_layout->addWidget(makeFooterButton(QStringLiteral("❓"), QStringLiteral("Help")));
-    footer_layout->addWidget(makeFooterButton(QStringLiteral("ℹ"), QStringLiteral("About suyu")));
+    footer_layout->addWidget(makeFooterButton(QStringLiteral("ℹ"), QStringLiteral("About drippu")));
 
     frame_layout->addLayout(footer_layout);
 

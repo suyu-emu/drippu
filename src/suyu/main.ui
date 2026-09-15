@@ -310,7 +310,7 @@
   </action>
   <action name="action_About">
    <property name="text">
-    <string>&amp;About suyu</string>
+    <string>&amp;About drippu</string>
    </property>
   </action>
   <action name="action_Single_Window_Mode">

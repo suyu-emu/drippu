@@ -202,5 +202,5 @@ private:
     GameList*    game_list_{};
     GMainWindow* main_window_{};
     QString      filter_text_;
-    QString      version_string_{QStringLiteral("suyu")};
+    QString      version_string_{QStringLiteral("drippu")};
 };
