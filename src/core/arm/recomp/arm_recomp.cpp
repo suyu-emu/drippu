@@ -16,6 +16,7 @@
 #include "common/string_util.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/unresolved_import.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_thread.h"
@@ -150,22 +151,6 @@ constexpr u64 kNoPendingSvc = ~0ULL;
 // with this parked its PC on an instruction the decoder cannot translate and
 // is asking for that address to be executed by the interpreter fallback.
 constexpr int kHaltUnhandled = 2;
-
-// An unresolved GOT/JUMP_SLOT relocation used to be left untouched, which
-// means a call through it branches to whatever the raw NSO file already had
-// sitting in that GOT slot - typically a small placeholder/addend value the
-// static linker left for a symbol it expected the *dynamic* linker to fill
-// in later (lazy-binding stub offset, or just zero-adjacent garbage), not a
-// real address. The guest's BLR then lands on that small value directly -
-// e.g. 0xe7ff0 - which is unmapped, and the JIT fallback that "No recompiled
-// block" hands off to can't execute there either, so the whole thread dies.
-// Every unresolved slot is patched to this fixed, recognizable sentinel
-// instead: the dispatch loop below special-cases it as an immediate "return
-// to caller" (PC = LR) rather than a real guest address, so a genuinely
-// call-but-never-actually-invoked unresolved import (the common case - most
-// entries in a large import table exist for code paths a given boot never
-// takes) fails soft instead of crashing the thread outright.
-constexpr u64 kUnresolvedImportTrap = 0xFFFF'FFFF'0000'0000ULL;
 } // namespace
 
 namespace {
@@ -560,40 +545,17 @@ struct ArmRecomp::Impl {
         u64 rela_va = 0, rela_sz = 0, rela_ent = 24, rela_sz_va = 0;
         u64 jmprel_va = 0, jmprel_sz = 0, jmprel_ent = 24, jmprel_sz_va = 0;
         u64 symtab_va = 0, strtab_va = 0;
-        // Address of a harmless "return 0" stub inside this module's own text,
-        // used as the target for every import that could not be resolved.
-        u64 trap_va = 0;
     };
 
-    // Find an existing `mov x0, #0; ret` (or failing that, a bare `ret`) in a
-    // module's text and hand back its address.
-    //
-    // Unresolved imports have to point somewhere, and the address has to be one
-    // BOTH execution engines can survive: the recompiled dispatcher can
-    // special-case a magic sentinel, but the dynarmic fallback cannot - it just
-    // tries to translate the address and dies with "cannot execute instruction
-    // at unmapped address". Reusing a real instruction pair the module already
-    // contains sidesteps that entirely: it is mapped, executable, and returns to
-    // the caller under any engine, with no per-engine handling and nothing
-    // written into guest memory. Most entries in a large import table exist for
-    // code paths a given boot never takes, so failing soft here is what keeps a
-    // partially-resolvable module bootable at all.
-    u64 FindReturnStub(u64 mod_base) {
-        auto& mem = system.ApplicationMemory();
-        constexpr u32 kMovX0Zero = 0xD2800000, kRet = 0xD65F03C0;
-        // Text sits at the front of every NSO; a module without a matching pair
-        // in its first megabyte does not have one worth scanning further for.
-        constexpr u64 kScanLimit = 0x100000;
-        u64 bare_ret = 0;
-        for (u64 off = 0; off < kScanLimit; off += 4) {
-            const u32 insn = mem.Read32(mod_base + off);
-            if (insn == kRet) {
-                if (!bare_ret) bare_ret = mod_base + off;
-            } else if (insn == kMovX0Zero && mem.Read32(mod_base + off + 4) == kRet) {
-                return mod_base + off;
-            }
+    bool ConsumeUnresolvedImportTrap() {
+        if (!suyu::recomp::IsUnresolvedImportTrap(ctx.pc)) {
+            return false;
         }
-        return bare_ret;
+        const auto hit =
+            suyu::recomp::TakeUnresolvedImportTrap(ctx.x[0], ctx.x[30], unresolved_imports);
+        g_counters.unresolved_import_traps.fetch_add(1, std::memory_order_relaxed);
+        LOG_CRITICAL(Core_ARM, "{}", hit.diagnostic);
+        return true;
     }
 
     // Locate a module's MOD0 header and parse its .dynamic section. Returns
@@ -724,23 +686,13 @@ struct ArmRecomp::Impl {
                 mem.Write64(d.mod_base + r_offset, d.mod_base + r_addend);
                 ++applied;
             } else if (r_type == R_AARCH64_IRELATIVE) {
-                // IRELATIVE (ifunc): r_addend is a RESOLVER function's address,
-                // not the final target - the correct behaviour is to call it
-                // (no args, AAPCS64) and store whatever it returns. Actually
-                // invoking guest code from inside relocation application would
-                // need a full nested-call machinery this backend doesn't have,
-                // so - same as a genuinely-unresolved import - patch to the
-                // trap sentinel instead of leaving the GOT slot as raw
-                // pre-relocation file content. Previously this relocation type
-                // matched none of the branches below and was silently skipped
-                // entirely, which is exactly how a BLR through this slot ended
-                // up jumping to a small leftover file value (e.g. 0xe7ff0)
-                // instead of either a real function or a diagnosable trap.
                 LOG_ERROR(Core_ARM,
                           "recomp: IRELATIVE relocation at module base={:#x} offset={:#x} not "
-                          "invoked (resolver call unsupported); trapped instead",
+                          "invoked (resolver call unsupported)",
                           d.mod_base, r_offset);
-                mem.Write64(d.mod_base + r_offset, d.trap_va ? d.trap_va : kUnresolvedImportTrap);
+                unresolved_imports.push_back(
+                    {"", d.mod_base, r_offset, suyu::recomp::UnresolvedReloc::Irelative});
+                mem.Write64(d.mod_base + r_offset, suyu::recomp::UnresolvedSlotTarget());
             } else if (r_type == R_AARCH64_GLOB_DAT || r_type == R_AARCH64_JUMP_SLOT ||
                        r_type == R_AARCH64_ABS64) {
                 const auto sym = ReadSymbol(d, r_sym);
@@ -804,9 +756,12 @@ struct ArmRecomp::Impl {
                         LOG_ERROR(Core_ARM, "recomp: unresolved GOT/PLT symbol '{}' for module base={:#x}",
                                   sym.name.empty() ? "<no name>" : sym.name, d.mod_base);
                     }
-                    // Patch to the trap sentinel rather than leaving the slot
-                    // as whatever the raw file had - see kUnresolvedImportTrap.
-                    mem.Write64(d.mod_base + r_offset, d.trap_va ? d.trap_va : kUnresolvedImportTrap);
+                    const auto kind = (r_type == R_AARCH64_ABS64) ? suyu::recomp::UnresolvedReloc::Abs64
+                                    : (r_type == R_AARCH64_GLOB_DAT)
+                                          ? suyu::recomp::UnresolvedReloc::GlobDat
+                                          : suyu::recomp::UnresolvedReloc::JumpSlot;
+                    unresolved_imports.push_back({sym.name, d.mod_base, r_offset, kind});
+                    mem.Write64(d.mod_base + r_offset, suyu::recomp::UnresolvedSlotTarget());
                 }
             }
         }
@@ -829,7 +784,6 @@ struct ArmRecomp::Impl {
         for (const auto& [module_base, name] : all_modules) {
             DynInfo d;
             if (ParseDynamic(module_base, d)) {
-                d.trap_va = FindReturnStub(module_base);
                 IndexExports(d, exports);
                 dyns.push_back(d);
             }
@@ -867,6 +821,7 @@ struct ArmRecomp::Impl {
     Loader::AppLoader::Modules modules{};
     bool modules_read{false};
     bool rela_applied{false};
+    std::vector<suyu::recomp::UnresolvedImport> unresolved_imports;
     static constexpr size_t kTrail = 32;
     u64 trail[kTrail]{};
     size_t trail_pos{0};
@@ -943,6 +898,9 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
 
     impl->fallback->GetContext(tctx);
     this->SetContext(tctx);
+    if (impl->ConsumeUnresolvedImportTrap()) {
+        return HaltReason::PrefetchAbort;
+    }
     if (True(hr & HaltReason::SupervisorCall)) {
         impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
     }
@@ -996,10 +954,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     // caught before that hand-off as well as inside the dispatch loop below -
     // a thread already in the JIT that calls an unresolved import would
     // otherwise be handed the sentinel address to execute, which is unmapped.
-    if (impl->ctx.pc == kUnresolvedImportTrap) {
-        impl->ctx.x[0] = 0;
-        impl->ctx.pc = impl->ctx.x[30];
-        impl->in_fallback = false;
+    if (impl->ConsumeUnresolvedImportTrap()) {
+        return HaltReason::PrefetchAbort;
     }
     if (impl->in_fallback) {
         return RunFallback(thread);
@@ -1037,23 +993,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // GOT read from a bad emitted branch.
         impl->trail[impl->trail_pos++ & (Impl::kTrail - 1)] = impl->ctx.pc;
 
-        if (impl->ctx.pc == kUnresolvedImportTrap) {
-            // Landed here via a BLR through a GOT/JUMP_SLOT slot patched by
-            // ApplyRelocTable because no definition was found anywhere - most
-            // such imports exist for code paths this particular boot never
-            // takes, so treat the call as a no-op: return to the caller with
-            // a zeroed result register rather than crash the thread. x30 is
-            // the guest's own return address (BLR sets it before the branch),
-            // exactly as if this were a real function that did nothing.
-            static std::atomic<int> trap_count{0};
-            if (trap_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-                g_counters.unresolved_import_traps.fetch_add(1, std::memory_order_relaxed);
-                LOG_ERROR(Core_ARM, "recomp: called through unresolved import (returning to caller {:#x})",
-                          impl->ctx.x[30]);
-            }
-            impl->ctx.x[0] = 0;
-            impl->ctx.pc = impl->ctx.x[30];
-            continue;
+        if (impl->ConsumeUnresolvedImportTrap()) {
+            return HaltReason::PrefetchAbort;
         }
 
         RecompBlockFn block = impl->lookup(impl->ctx.pc);
@@ -1237,6 +1178,9 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     // are straight-line C with no per-instruction re-entry point.
     if (!impl->lookup) {
         return HaltReason::BreakLoop;
+    }
+    if (impl->ConsumeUnresolvedImportTrap()) {
+        return HaltReason::PrefetchAbort;
     }
     const RecompBlockFn block = impl->lookup(impl->ctx.pc);
     if (!block) {
