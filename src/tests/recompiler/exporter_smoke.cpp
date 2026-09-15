@@ -183,6 +183,11 @@ constexpr u32 kFaddpD0V1 = 0x7E70D820u;
 constexpr u32 kFaddV0V1V2_2d = 0x4E62D420u;
 constexpr u32 kFmlaV0V1V2_2d = 0x4E62CC20u;
 constexpr u32 kFabsD0D1 = 0x1E60C020u;
+constexpr u32 kSdivX0X1X2 = 0x9AC20C20u;
+constexpr u32 kSdivW0W1W2 = 0x1AC20C20u;
+constexpr u32 kSdivX0X0X1 = 0x9AC10C00u;   // Rd == Rn
+constexpr u32 kSdivX0XzrX1 = 0x9AC10FE0u;  // Rn = XZR
+constexpr u32 kSdivX0X1Xzr = 0x9ADF0C20u;  // Rm = XZR
 
 bool AesHelpersAtFileScope(const std::string& runtime_c) {
     const auto save = runtime_c.find("int recomp_save_write(");
@@ -576,6 +581,134 @@ int main(void) {
         return;
     }
     pass("page-edge load/store (discontig/tracked/unmapped) via RuntimeC");
+}
+
+void TestSdivProbes(const fs::path& root) {
+    const std::string sdiv_x = TranslateInsn(kSdivX0X1X2, 0x1000);
+    const std::string sdiv_w = TranslateInsn(kSdivW0W1W2, 0x1000);
+    const std::string sdiv_alias = TranslateInsn(kSdivX0X0X1, 0x1000);
+    const std::string sdiv_xzr_n = TranslateInsn(kSdivX0XzrX1, 0x1000);
+    const std::string sdiv_xzr_m = TranslateInsn(kSdivX0X1Xzr, 0x1000);
+
+    if (sdiv_x.find("INT64_MIN") == std::string::npos ||
+        sdiv_x.find("_a/_b") == std::string::npos) {
+        fail("SDIV X missing INT64_MIN guard: " + sdiv_x);
+    } else {
+        pass("SDIV X translated C guards INT64_MIN / -1");
+    }
+    if (sdiv_w.find("INT32_MIN") == std::string::npos ||
+        sdiv_w.find("_a/_b") == std::string::npos) {
+        fail("SDIV W missing INT32_MIN guard: " + sdiv_w);
+    } else {
+        pass("SDIV W translated C guards INT32_MIN / -1");
+    }
+
+    std::ostringstream src;
+    src << "#include <stdint.h>\n#include <stdio.h>\n#include <limits.h>\n"
+           "typedef struct { uint64_t x[32]; } GuestContext;\n"
+           "static void sdiv_x(GuestContext* c) {\n"
+        << sdiv_x
+        << "}\nstatic void sdiv_w(GuestContext* c) {\n"
+        << sdiv_w
+        << "}\nstatic void sdiv_alias(GuestContext* c) {\n"
+        << sdiv_alias
+        << "}\nstatic void sdiv_xzr_n(GuestContext* c) {\n"
+        << sdiv_xzr_n
+        << "}\nstatic void sdiv_xzr_m(GuestContext* c) {\n"
+        << sdiv_xzr_m
+        << "}\n"
+           "static void clear(GuestContext* c) {\n"
+           "  int i; for (i = 0; i < 32; i++) c->x[i] = 0;\n"
+           "}\n"
+           "static int expect_u64(const char* name, uint64_t got, uint64_t want) {\n"
+           "  printf(\"%s: got=%llx want=%llx\\n\", name,\n"
+           "         (unsigned long long)got, (unsigned long long)want);\n"
+           "  return got != want;\n"
+           "}\n"
+           "int main(void) {\n"
+           "  GuestContext c;\n"
+           "  int fail = 0;\n"
+           "  clear(&c); c.x[1] = (uint64_t)INT64_MIN; c.x[2] = (uint64_t)(int64_t)-1;\n"
+           "  sdiv_x(&c);\n"
+           "  fail |= expect_u64(\"SDIV X INT64_MIN/-1\", c.x[0], (uint64_t)INT64_MIN);\n"
+           "  clear(&c); c.x[1] = (uint64_t)(uint32_t)INT32_MIN; c.x[2] = (uint64_t)(uint32_t)-1;\n"
+           "  sdiv_w(&c);\n"
+           "  fail |= expect_u64(\"SDIV W INT32_MIN/-1\", c.x[0], (uint64_t)(uint32_t)INT32_MIN);\n"
+           "  clear(&c); c.x[1] = 42; c.x[2] = 0;\n"
+           "  sdiv_x(&c);\n"
+           "  fail |= expect_u64(\"SDIV X /0\", c.x[0], 0);\n"
+           "  clear(&c); c.x[1] = 42; c.x[2] = 0;\n"
+           "  sdiv_w(&c);\n"
+           "  fail |= expect_u64(\"SDIV W /0\", c.x[0], 0);\n"
+           "  clear(&c); c.x[1] = (uint64_t)(int64_t)-15; c.x[2] = (uint64_t)(int64_t)-3;\n"
+           "  sdiv_x(&c);\n"
+           "  fail |= expect_u64(\"SDIV X -15/-3\", c.x[0], 5);\n"
+           "  clear(&c); c.x[1] = (uint64_t)(uint32_t)(int32_t)-15;\n"
+           "  c.x[2] = (uint64_t)(uint32_t)(int32_t)-3;\n"
+           "  sdiv_w(&c);\n"
+           "  fail |= expect_u64(\"SDIV W -15/-3\", c.x[0], 5);\n"
+           "  clear(&c); c.x[0] = (uint64_t)INT64_MIN; c.x[1] = (uint64_t)(int64_t)-1;\n"
+           "  sdiv_alias(&c);\n"
+           "  fail |= expect_u64(\"SDIV X0,X0,X1 overflow alias\", c.x[0], (uint64_t)INT64_MIN);\n"
+           "  clear(&c); c.x[0] = 0xdead; c.x[1] = 7;\n"
+           "  sdiv_xzr_n(&c);\n"
+           "  fail |= expect_u64(\"SDIV X0,XZR,X1\", c.x[0], 0);\n"
+           "  clear(&c); c.x[1] = 99;\n"
+           "  sdiv_xzr_m(&c);\n"
+           "  fail |= expect_u64(\"SDIV X0,X1,XZR\", c.x[0], 0);\n"
+           "  return fail;\n"
+           "}\n";
+
+    const fs::path probe_src = root / "sdiv_probe";
+    fs::create_directories(probe_src);
+    if (!WriteFile(probe_src / "probe.c", src.str())) {
+        return;
+    }
+    // Prefer UBSan when the toolchain provides it (GCC libubsan on this Linux VM).
+    const char* cmake_txt =
+        "cmake_minimum_required(VERSION 3.13)\n"
+        "project(suyu_sdiv_probe C)\n"
+        "set(CMAKE_C_STANDARD 11)\n"
+        "set(CMAKE_C_EXTENSIONS OFF)\n"
+        "add_executable(sdiv_probe probe.c)\n"
+        "include(CheckCCompilerFlag)\n"
+        "set(_suyu_ubsan_flag \"-fsanitize=undefined\")\n"
+        "check_c_compiler_flag(\"${_suyu_ubsan_flag}\" SUYU_HAS_UBSAN)\n"
+        "if (SUYU_HAS_UBSAN)\n"
+        "  target_compile_options(sdiv_probe PRIVATE ${_suyu_ubsan_flag} -fno-sanitize-recover=undefined)\n"
+        "  target_link_options(sdiv_probe PRIVATE ${_suyu_ubsan_flag})\n"
+        "endif()\n";
+    if (!WriteFile(probe_src / "CMakeLists.txt", cmake_txt)) {
+        return;
+    }
+
+    const fs::path probe_build = probe_src / "build";
+    if (CmakeBuild(probe_src, probe_build, "sdiv_probe", true) != 0) {
+        return;
+    }
+
+    fs::path exe = probe_build / "sdiv_probe";
+#ifdef _WIN32
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Release" / "sdiv_probe.exe";
+    }
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Debug" / "sdiv_probe.exe";
+    }
+#else
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Release" / "sdiv_probe";
+    }
+#endif
+    if (!fs::exists(exe)) {
+        fail("sdiv_probe executable not found under " + probe_build.string());
+        return;
+    }
+    if (RunArgs({exe.string()}) != 0) {
+        fail("sdiv_probe execution (UBSan or result mismatch)");
+        return;
+    }
+    pass("SDIV overflow/zero/neg/alias/XZR executed");
 }
 
 void TestBranchProbes(const fs::path& root) {
@@ -1287,6 +1420,7 @@ int main() {
     TestTranslatedShape();
     TestEmitProjectCompile(root);
     TestMemoryBoundaries(root);
+    TestSdivProbes(root);
     TestBranchProbes(root);
     TestFpControl(root);
     TestUnresolvedImportPolicy();
@@ -1299,6 +1433,7 @@ int main() {
         fs::create_directories(dest);
         const fs::path runtime = root / "emit_project" / "recomp_runtime.c";
         const fs::path mem_probe = root / "memory_probe" / "probe.c";
+        const fs::path sdiv_probe = root / "sdiv_probe" / "probe.c";
         const fs::path probe = root / "branch_probe" / "probe.c";
         const fs::path fp_probe = root / "fp_probe" / "probe.c";
         if (fs::exists(runtime)) {
@@ -1307,6 +1442,10 @@ int main() {
         }
         if (fs::exists(mem_probe)) {
             fs::copy_file(mem_probe, dest / "memory_probe.c",
+                          fs::copy_options::overwrite_existing);
+        }
+        if (fs::exists(sdiv_probe)) {
+            fs::copy_file(sdiv_probe, dest / "sdiv_probe.c",
                           fs::copy_options::overwrite_existing);
         }
         if (fs::exists(probe)) {

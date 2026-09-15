@@ -2334,8 +2334,18 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 else    s = "{ uint32_t _a=(uint32_t)" + xn + ",_b=(uint32_t)" + xm + "; c->x[" + std::to_string(rd) + "]=(uint64_t)(_b?_a/_b:0); }";
                 break;
             case 3:  // SDIV
-                if (sf) s = "{ int64_t _a=(int64_t)" + xn + ",_b=(int64_t)" + xm + "; c->x[" + std::to_string(rd) + "]=(uint64_t)(_b?_a/_b:0); }";
-                else    s = "{ int32_t _a=(int32_t)(uint32_t)" + xn + ",_b=(int32_t)(uint32_t)" + xm + "; c->x[" + std::to_string(rd) + "]=(uint64_t)(uint32_t)(_b?_a/_b:0); }";
+                // ARM defines INT_MIN / -1 as INT_MIN (result not representable as
+                // a positive value of the same width). C signed division of that
+                // case is undefined, so guard it before `/`.
+                if (sf)
+                    s = "{ int64_t _a=(int64_t)" + xn + ",_b=(int64_t)" + xm +
+                        "; c->x[" + std::to_string(rd) +
+                        "]=(uint64_t)(!_b?0:(_a==INT64_MIN&&_b==-1)?_a:_a/_b); }";
+                else
+                    s = "{ int32_t _a=(int32_t)(uint32_t)" + xn +
+                        ",_b=(int32_t)(uint32_t)" + xm + "; c->x[" +
+                        std::to_string(rd) +
+                        "]=(uint64_t)(uint32_t)(!_b?0:(_a==INT32_MIN&&_b==-1)?_a:_a/_b); }";
                 break;
             case 8:  // LSLV
                 if (sf) s = "{ c->x[" + std::to_string(rd) + "]=" + xn + "<<(" + xm + "&63); }";
