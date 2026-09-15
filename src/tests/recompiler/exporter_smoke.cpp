@@ -160,6 +160,19 @@ constexpr u32 kSvc0 = 0xD4000001u;
 constexpr u32 kRetX5 = 0xD65F00A0u;
 constexpr u32 kRetX30 = 0xD65F03C0u;
 constexpr u32 kBlrX30 = 0xD63F03C0u;
+constexpr u32 kMsrFpcrX0 = 0xD51B4400u;
+constexpr u32 kMrsX0Fpcr = 0xD53B4400u;
+constexpr u32 kMrsX1Fpsr = 0xD53B4421u;
+constexpr u32 kFaddD2D0D1 = 0x1E612802u;
+constexpr u32 kFmulD2D0D1 = 0x1E610802u;
+constexpr u32 kFdivD2D0D1 = 0x1E611802u;
+constexpr u32 kFsqrtD0D1 = 0x1E61C020u;
+constexpr u32 kFcvtS0D1 = 0x1E624020u;
+constexpr u32 kScvtfD0X1 = 0x9E620020u;
+constexpr u32 kFaddpD0V1 = 0x7E70D820u;
+constexpr u32 kFaddV0V1V2_2d = 0x4E62D420u;
+constexpr u32 kFmlaV0V1V2_2d = 0x4E62CC20u;
+constexpr u32 kFabsD0D1 = 0x1E60C020u;
 
 bool AesHelpersAtFileScope(const std::string& runtime_c) {
     const auto save = runtime_c.find("int recomp_save_write(");
@@ -274,6 +287,27 @@ std::string TranslateInsn(u32 insn, u64 pc) {
     return body;
 }
 
+bool BodyUnhandled(const std::string& body) {
+    return body.find("recomp_unhandled") != std::string::npos;
+}
+
+bool BodyReadsFpcr(const std::string& body) {
+    return body.find("c->fpcr") != std::string::npos;
+}
+
+void ExpectFpControlledOrUnhandled(const char* name, u32 insn) {
+    const std::string body = TranslateInsn(insn, 0x1000);
+    if (BodyUnhandled(body)) {
+        pass(std::string(name) + " routed to accurate backend");
+        return;
+    }
+    if (BodyReadsFpcr(body)) {
+        pass(std::string(name) + " translated C reads c->fpcr");
+        return;
+    }
+    fail(std::string(name) + " uses host FP without guest FPCR: " + body);
+}
+
 void TestTranslatedShape() {
     const std::string ret5 = TranslateInsn(kRetX5, 0x1000);
     if (ret5.find("c->x[5]") == std::string::npos) {
@@ -377,6 +411,142 @@ void TestBranchProbes(const fs::path& root) {
     pass("RET X5 / RET X30 / BLR X30 executed");
 }
 
+void TestFpControl(const fs::path& root) {
+    const std::string msr = TranslateInsn(kMsrFpcrX0, 0x1000);
+    const std::string mrs_fpcr = TranslateInsn(kMrsX0Fpcr, 0x1004);
+    const std::string mrs_fpsr = TranslateInsn(kMrsX1Fpsr, 0x1008);
+    const std::string fadd = TranslateInsn(kFaddD2D0D1, 0x100C);
+
+    if (msr.find("c->fpcr") == std::string::npos) {
+        fail("MSR FPCR does not store c->fpcr: " + msr);
+        return;
+    }
+    if (mrs_fpcr.find("c->fpcr") == std::string::npos) {
+        fail("MRS FPCR does not read c->fpcr: " + mrs_fpcr);
+        return;
+    }
+    pass("MSR/MRS FPCR translated C stores and loads the field");
+
+    const std::string fabsd = TranslateInsn(kFabsD0D1, 0x1000);
+    if (BodyUnhandled(fabsd) || fabsd.find("fabs") == std::string::npos) {
+        fail("FABS Dd should stay translated: " + fabsd);
+    } else {
+        pass("FABS Dd stays bitwise translated");
+    }
+
+    ExpectFpControlledOrUnhandled("FADD Dd", kFaddD2D0D1);
+    ExpectFpControlledOrUnhandled("FMUL Dd", kFmulD2D0D1);
+    ExpectFpControlledOrUnhandled("FDIV Dd", kFdivD2D0D1);
+    ExpectFpControlledOrUnhandled("FSQRT Dd", kFsqrtD0D1);
+    ExpectFpControlledOrUnhandled("FCVT Sd,Dd", kFcvtS0D1);
+    ExpectFpControlledOrUnhandled("SCVTF Dd,Xn", kScvtfD0X1);
+    ExpectFpControlledOrUnhandled("FADDP Dd", kFaddpD0V1);
+    ExpectFpControlledOrUnhandled("FADD Vd.2D", kFaddV0V1V2_2d);
+    ExpectFpControlledOrUnhandled("FMLA Vd.2D", kFmlaV0V1V2_2d);
+
+    if (BodyUnhandled(fadd) || BodyReadsFpcr(fadd)) {
+        return;
+    }
+
+    std::ostringstream src;
+    src << "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
+           "typedef struct {\n"
+           "  uint64_t x[32];\n"
+           "  uint64_t pc;\n"
+           "  uint64_t vreg[32][2];\n"
+           "  uint64_t fpcr;\n"
+           "  uint64_t fpsr;\n"
+           "} GuestContext;\n"
+           "uint64_t g_module_base = 0;\n"
+           "static void msr_fpcr(GuestContext* c) {\n"
+        << msr
+        << "}\nstatic void mrs_fpcr(GuestContext* c) {\n"
+        << mrs_fpcr
+        << "}\nstatic void mrs_fpsr(GuestContext* c) {\n"
+        << mrs_fpsr
+        << "}\nstatic void fadd_d2(GuestContext* c) {\n"
+        << fadd
+        << "}\nstatic uint64_t run_fadd(uint64_t fpcr) {\n"
+           "  GuestContext c;\n"
+           "  memset(&c, 0, sizeof c);\n"
+           "  c.x[0] = fpcr;\n"
+           "  msr_fpcr(&c);\n"
+           "  mrs_fpcr(&c);\n"
+           "  c.vreg[0][0] = 0x3FF0000000000000ULL;\n"
+           "  c.vreg[1][0] = 0x3CA0000000000000ULL;\n"
+           "  fadd_d2(&c);\n"
+           "  mrs_fpsr(&c);\n"
+           "  printf(\"FPCR wrote=%llx read=%llx sum=%llx fpsr=%llx\\n\",\n"
+           "         (unsigned long long)fpcr,\n"
+           "         (unsigned long long)c.x[0],\n"
+           "         (unsigned long long)c.vreg[2][0],\n"
+           "         (unsigned long long)c.x[1]);\n"
+           "  if (c.x[0] != fpcr) return 0;\n"
+           "  return c.vreg[2][0];\n"
+           "}\nint main(void) {\n"
+           "  const uint64_t rp = run_fadd(0x400000ULL);\n"
+           "  const uint64_t rm = run_fadd(0x800000ULL);\n"
+           "  printf(\"FADD 1+2^-53 RP=%llx RM=%llx\\n\",\n"
+           "         (unsigned long long)rp, (unsigned long long)rm);\n"
+           "  if (rp == 0 || rm == 0) return 1;\n"
+           "  if (rp == rm) {\n"
+           "    printf(\"FPCR rounding not applied\\n\");\n"
+           "    return 1;\n"
+           "  }\n"
+           "  if (rp != 0x3FF0000000000001ULL) {\n"
+           "    printf(\"RP sum is not 1.0+ulp\\n\");\n"
+           "    return 1;\n"
+           "  }\n"
+           "  if (rm != 0x3FF0000000000000ULL) {\n"
+           "    printf(\"RM sum is not 1.0\\n\");\n"
+           "    return 1;\n"
+           "  }\n"
+           "  return 0;\n"
+           "}\n";
+
+    const fs::path probe_src = root / "fp_probe";
+    fs::create_directories(probe_src);
+    if (!WriteFile(probe_src / "probe.c", src.str())) {
+        return;
+    }
+    if (!WriteFile(probe_src / "CMakeLists.txt",
+                   "cmake_minimum_required(VERSION 3.13)\n"
+                   "project(suyu_fp_probe C)\n"
+                   "set(CMAKE_C_STANDARD 11)\n"
+                   "set(CMAKE_C_EXTENSIONS OFF)\n"
+                   "add_executable(fp_probe probe.c)\n")) {
+        return;
+    }
+
+    const fs::path probe_build = probe_src / "build";
+    if (CmakeBuild(probe_src, probe_build, "fp_probe", true) != 0) {
+        return;
+    }
+
+    fs::path exe = probe_build / "fp_probe";
+#ifdef _WIN32
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Release" / "fp_probe.exe";
+    }
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Debug" / "fp_probe.exe";
+    }
+#else
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Release" / "fp_probe";
+    }
+#endif
+    if (!fs::exists(exe)) {
+        fail("fp_probe executable not found under " + probe_build.string());
+        return;
+    }
+    if (RunArgs({exe.string()}) != 0) {
+        fail("FADD under guest FPCR RP vs RM");
+        return;
+    }
+    pass("FADD honors guest FPCR rounding");
+}
+
 } // namespace
 
 int main() {
@@ -393,18 +563,24 @@ int main() {
     TestTranslatedShape();
     TestEmitProjectCompile(root);
     TestBranchProbes(root);
+    TestFpControl(root);
 
     if (const char* ev = std::getenv("SUYU_SMOKE_EVIDENCE_DIR")) {
         const fs::path dest(ev);
         fs::create_directories(dest);
         const fs::path runtime = root / "emit_project" / "recomp_runtime.c";
         const fs::path probe = root / "branch_probe" / "probe.c";
+        const fs::path fp_probe = root / "fp_probe" / "probe.c";
         if (fs::exists(runtime)) {
             fs::copy_file(runtime, dest / "recomp_runtime.c",
                           fs::copy_options::overwrite_existing);
         }
         if (fs::exists(probe)) {
             fs::copy_file(probe, dest / "branch_probe.c",
+                          fs::copy_options::overwrite_existing);
+        }
+        if (fs::exists(fp_probe)) {
+            fs::copy_file(fp_probe, dest / "fp_probe.c",
                           fs::copy_options::overwrite_existing);
         }
         std::cout << "copied evidence to " << dest << std::endl;

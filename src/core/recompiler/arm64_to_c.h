@@ -1280,8 +1280,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    constexpr bool kTranslateHostFpArithmetic = false;
+
     // FADDP, scalar: add the two lanes of the source together.
     if ((i & 0xFFBFFC00) == 0x7E30D800) {
+        if (!kTranslateHostFpArithmetic) {
+            put_unhandled();
+            return true;
+        }
         const bool dbl = ((i >> 22) & 1) != 0;
         const u32 rn = (i >> 5) & 31, rd = i & 31;
         const char* ct = dbl ? "double" : "float";
@@ -1824,6 +1830,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
 
             // SCVTF / UCVTF: integer register -> FP register.
             if (rmode == 0 && (opcode == 2 || opcode == 3)) {
+                if (!kTranslateHostFpArithmetic) {
+                    put_unhandled();
+                    return true;
+                }
                 const std::string src = sf ? (opcode == 2 ? "(int64_t)" + Xz(rn)
                                                           : "(uint64_t)" + Xz(rn))
                                            : (opcode == 2 ? "(int32_t)" + Xz(rn)
@@ -2179,6 +2189,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // Two-source: FMUL/FDIV/FADD/FSUB (opcode in bits 15..12).
             if (((i >> 10) & 3) == 2) {
                 const u32 opcode = (i >> 12) & 15;
+                if (opcode <= 8 && !kTranslateHostFpArithmetic) {
+                    put_unhandled();
+                    return true;
+                }
                 const char* op = nullptr;
                 switch (opcode) {
                 case 0: op = "*"; break;
@@ -2214,6 +2228,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // Opcode 0001xx, where the low two bits name the destination:
             // 00 single, 01 double, 11 half. Half stays on the fallback.
             if (((i >> 10) & 0x1F) == 0x10 && (((i >> 15) & 0x3C) == 0x04)) {
+                if (!kTranslateHostFpArithmetic) {
+                    put_unhandled();
+                    return true;
+                }
                 const u32 dst = (i >> 15) & 3;
                 if (ftype == 0 && dst == 1) {           // single -> double
                     put("{ float _s; double _d; memcpy(&_s,&c->vreg[" + std::to_string(rn) +
@@ -2238,7 +2256,13 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 case 0: expr = "_a"; break;                             // FMOV
                 case 1: expr = dbl ? "fabs(_a)" : "fabsf(_a)"; break;   // FABS
                 case 2: expr = "-_a"; break;                            // FNEG
-                case 3: expr = dbl ? "sqrt(_a)" : "sqrtf(_a)"; break;   // FSQRT
+                case 3:                                                 // FSQRT
+                    if (!kTranslateHostFpArithmetic) {
+                        put_unhandled();
+                        return true;
+                    }
+                    expr = dbl ? "sqrt(_a)" : "sqrtf(_a)";
+                    break;
                 default: break;
                 }
                 if (!expr.empty()) {
@@ -2355,6 +2379,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // conversion handled further up - the operand is a lane here, not a
             // general register.
             if (opcode == 0x1D) {
+                if (!kTranslateHostFpArithmetic) {
+                    put_unhandled();
+                    return true;
+                }
                 const char* ct = dbl ? "double" : "float";
                 const int fsz = dbl ? 8 : 4;
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
@@ -2558,6 +2586,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             const int bytes = scl_idx ? fsz : (Q ? 16 : 8);
             const int lanes = bytes / fsz;
             if (!(dbl && L)) {   // L must be zero for the 64-bit form
+                if (!kTranslateHostFpArithmetic) {
+                    put_unhandled();
+                    return true;
+                }
                 std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
                                 "],_r[" + std::to_string(lanes) + "],_m; ";
                 s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
@@ -2803,6 +2835,12 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             const char* ct = dbl ? "double" : "float";
             const int fsz  = dbl ? 8 : 4;
             const int fne  = vbytes / fsz;
+            if (((opc5 == 0x19 && !U) || (opc5 == 0x1A && !U) ||
+                 (opc5 == 0x1B && U && !a) || (opc5 == 0x1F && U && !a)) &&
+                !kTranslateHostFpArithmetic) {
+                put_unhandled();
+                return true;
+            }
             // Emit an element-wise FP operation, optionally accumulating into rd.
             auto fp_op = [&](const char* expr, bool acc) {
                 std::string s = "{ ";
