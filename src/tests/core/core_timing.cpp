@@ -50,9 +50,17 @@ u64 TestTimerSpeed(Core::Timing::CoreTiming& core_timing) {
     return end - start;
 }
 
+void ResetCallbackState() {
+    callbacks_ran_flags.reset();
+    delays.fill(0);
+    expected_callback = 0;
+}
+
 } // Anonymous namespace
 
 TEST_CASE("CoreTiming[BasicOrder]", "[core]") {
+    ResetCallbackState();
+
     ScopeInit guard;
     auto& core_timing = guard.core_timing;
     std::vector<std::shared_ptr<Core::Timing::EventType>> events{
@@ -62,8 +70,6 @@ TEST_CASE("CoreTiming[BasicOrder]", "[core]") {
         Core::Timing::CreateEvent("callbackD", HostCallbackTemplate<3>),
         Core::Timing::CreateEvent("callbackE", HostCallbackTemplate<4>),
     };
-
-    expected_callback = 0;
 
     core_timing.SyncPause(true);
 
@@ -93,6 +99,8 @@ TEST_CASE("CoreTiming[BasicOrder]", "[core]") {
 }
 
 TEST_CASE("CoreTiming[BasicOrderNoPausing]", "[core]") {
+    ResetCallbackState();
+
     ScopeInit guard;
     auto& core_timing = guard.core_timing;
     std::vector<std::shared_ptr<Core::Timing::EventType>> events{
@@ -105,8 +113,6 @@ TEST_CASE("CoreTiming[BasicOrderNoPausing]", "[core]") {
 
     core_timing.SyncPause(true);
     core_timing.SyncPause(false);
-
-    expected_callback = 0;
 
     const u64 start = core_timing.GetGlobalTimeNs().count();
     const u64 one_micro = 1000U;
