@@ -1,7 +1,8 @@
 name: Exporter smoke
 
 # Portable acceptance check for the active AArch64 exporter: EmitProject
-# compile plus RET/BLR probes. Uses src/tests/recompiler and arm64_to_c.h.
+# compile plus RET/BLR probes, and the headless homebrew runtime harness.
+# Uses src/tests/recompiler and arm64_to_c.h.
 # Does not build the emulator or run tools/static_recompiler.
 
 on:

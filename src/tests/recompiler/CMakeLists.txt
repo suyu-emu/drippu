@@ -24,6 +24,13 @@ target_include_directories(exporter_smoke PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
+add_executable(homebrew_harness homebrew_harness.cpp)
+target_compile_features(homebrew_harness PRIVATE cxx_std_20)
+target_include_directories(homebrew_harness PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
 file(TO_CMAKE_PATH "${CMAKE_COMMAND}" SUYU_SMOKE_CMAKE)
 file(TO_CMAKE_PATH "${CMAKE_C_COMPILER}" SUYU_SMOKE_C_COMPILER)
 set(SUYU_SMOKE_GENERATOR "${CMAKE_GENERATOR}")
@@ -32,5 +39,10 @@ configure_file(smoke_config.h.in smoke_config.h @ONLY)
 
 add_test(NAME exporter_smoke COMMAND exporter_smoke)
 set_tests_properties(exporter_smoke PROPERTIES
+    TIMEOUT 180
+)
+
+add_test(NAME homebrew_harness COMMAND homebrew_harness)
+set_tests_properties(homebrew_harness PROPERTIES
     TIMEOUT 180
 )
