@@ -1,4 +1,5 @@
 ; SPDX-FileCopyrightText: Copyright 2026 suyu team
+; SPDX-FileCopyrightText: Copyright 2026 SourCreamCulture / drippu
 ; SPDX-License-Identifier: GPL-3.0-or-later
 
 ; Usage:
@@ -20,10 +21,12 @@
 Unicode true
 ManifestDPIAware true
 
-!define PRODUCT_NAME "suyu"
-!define PRODUCT_PUBLISHER "suyu team"
-!define PRODUCT_WEB_SITE "https://suyu-emu.org"
-!define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_NAME}.exe"
+!define PRODUCT_NAME "drippu"
+!define PRODUCT_EXE "suyu.exe"
+!define PRODUCT_CLI_EXE "suyu-cli.exe"
+!define PRODUCT_PUBLISHER "SourCreamCulture / drippu"
+!define PRODUCT_WEB_SITE "https://github.com/SourCreamCulture/drippu"
+!define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_EXE}"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 
 !define BINARY_SOURCE_DIR "..\bin"
@@ -52,7 +55,7 @@ Page custom desktopShortcutPageCreate desktopShortcutPageLeave
 ; Instfiles page
 !insertmacro MUI_PAGE_INSTFILES
 ; Finish page
-!define MUI_FINISHPAGE_RUN "$INSTDIR\suyu.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${PRODUCT_EXE}"
 !insertmacro MUI_PAGE_FINISH
 
 ; Uninstaller pages
@@ -124,9 +127,9 @@ Section "Base"
   File /r "${BINARY_SOURCE_DIR}\*"
 
   ; Create start menu and desktop shortcuts
-  CreateShortCut "$SMPROGRAMS\$(^Name).lnk" "$INSTDIR\suyu.exe"
+  CreateShortCut "$SMPROGRAMS\$(^Name).lnk" "$INSTDIR\${PRODUCT_EXE}"
   ${If} $DesktopShortcut == 1
-    CreateShortCut "$DESKTOP\$(^Name).lnk" "$INSTDIR\suyu.exe"
+    CreateShortCut "$DESKTOP\$(^Name).lnk" "$INSTDIR\${PRODUCT_EXE}"
   ${EndIf}
 SectionEnd
 
@@ -135,12 +138,12 @@ SectionEnd
 Section -Post
   WriteUninstaller "$INSTDIR\uninst.exe"
 
-  WriteRegStr HKCU "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\suyu.exe"
+  WriteRegStr HKCU "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\${PRODUCT_EXE}"
 
   ; Write metadata for add/remove programs applet
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayName" "$(^Name)"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "UninstallString" "$INSTDIR\uninst.exe"
-  WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\suyu.exe"
+  WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXE}"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "InstallLocation" "$INSTDIR"
@@ -152,8 +155,8 @@ Section -Post
   WriteRegStr HKCU "Software\Classes\.xci" "" "$(^Name)"
   WriteRegStr HKCU "Software\Classes\.nro" "" "$(^Name)"
   WriteRegStr HKCU "Software\Classes\.kip" "" "$(^Name)"
-  WriteRegStr HKCU "Software\Classes\$(^Name)\DefaultIcon" "" "$INSTDIR\suyu.exe,0"
-  WriteRegStr HKCU "Software\Classes\$(^Name)\Shell\open\command" "" '"$INSTDIR\suyu.exe" %1'
+  WriteRegStr HKCU "Software\Classes\$(^Name)\DefaultIcon" "" "$INSTDIR\${PRODUCT_EXE},0"
+  WriteRegStr HKCU "Software\Classes\$(^Name)\Shell\open\command" "" '"$INSTDIR\${PRODUCT_EXE}" %1'
 SectionEnd
 
 Section Uninstall
@@ -161,8 +164,8 @@ Section Uninstall
   Delete "$SMPROGRAMS\$(^Name).lnk"
 
   ; Be a bit careful to not delete files a user may have put into the install directory.
-  Delete "$INSTDIR\suyu.exe"
-  Delete "$INSTDIR\suyu-cli.exe"
+  Delete "$INSTDIR\${PRODUCT_EXE}"
+  Delete "$INSTDIR\${PRODUCT_CLI_EXE}"
   Delete "$INSTDIR\uninst.exe"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\README.md"

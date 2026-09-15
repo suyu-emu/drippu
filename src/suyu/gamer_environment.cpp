@@ -352,7 +352,7 @@ QPixmap LoadSidebarBrandLogo(int target_width, int target_height) {
         QDir(app_dir).filePath(QStringLiteral("branding/suyu_logo_variant_alt.png")),
         QDir(app_dir).filePath(QStringLiteral("branding/suyu_logo_variant_primary.png")),
         QStringLiteral(":/img/suyu_logo.svg"),
-        QStringLiteral(":/img/suyu.svg"),
+        QStringLiteral(":/img/drippu.svg"),
     };
 
     for (const QString& path : candidates) {
@@ -534,7 +534,7 @@ void GamerEnvironment::SetupSidebar(QHBoxLayout* root_layout) {
     if (!logo_px.isNull()) {
         logo->setPixmap(logo_px);
     } else {
-        logo->setText(QStringLiteral("suyu"));
+        logo->setText(QStringLiteral("drippu"));
         QFont f = logo->font();
         f.setPixelSize(26);
         f.setBold(true);
@@ -1880,7 +1880,7 @@ void GamerEnvironment::paintEvent(QPaintEvent*) {
     // driven by an elapsed-time phase, so it loops smoothly and costs nothing
     // to keep running.
     {
-        // Use the square standalone suyu mark (dist/suyu.svg), NOT the wide
+        // Use the square standalone drippu mark (dist/drippu.svg), NOT the wide
         // "suyu__Logo-Pill" lockup that :/img/suyu_logo.svg maps to. That
         // pill asset is 2421x912 and includes the "suyu" wordmark on an
         // opaque black rounded-rect; rendering it into a square 160x160 tile
@@ -1890,7 +1890,7 @@ void GamerEnvironment::paintEvent(QPaintEvent*) {
         // mark is square by construction, so it tiles/drifts undistorted and
         // has no baked-in background plate.
         static const QPixmap mark =
-            QIcon(QStringLiteral(":/img/suyu.svg")).pixmap(QSize(256, 256));
+            QIcon(QStringLiteral(":/img/drippu.svg")).pixmap(QSize(256, 256));
         if (!mark.isNull()) {
             const qreal t = ambient_clock_.isValid()
                                 ? qreal(ambient_clock_.elapsed()) / 1000.0

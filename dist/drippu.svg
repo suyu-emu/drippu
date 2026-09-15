@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+SPDX-FileCopyrightText: 2026 SourCreamCulture / drippu
+SPDX-License-Identifier: GPL-3.0-or-later
+
+Original drippu product mark. Not derived from suyu, yuzu, or eden logos.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="dripFill" x1="96" y1="48" x2="416" y2="464" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2EC4B6"/>
+      <stop offset="1" stop-color="#0B6E4F"/>
+    </linearGradient>
+    <linearGradient id="coreFill" x1="180" y1="200" x2="340" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F7F3E8"/>
+      <stop offset="1" stop-color="#D9EDE6"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="#0F2A24"/>
+  <path
+    d="M256 72
+       C256 72 148 214 148 300
+       C148 372 198 424 256 424
+       C314 424 364 372 364 300
+       C364 214 256 72 256 72Z"
+    fill="url(#dripFill)"/>
+  <circle cx="256" cy="298" r="78" fill="url(#coreFill)"/>
+  <circle cx="220" cy="250" r="18" fill="#FFFFFF" fill-opacity="0.55"/>
+</svg>

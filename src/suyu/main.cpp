@@ -3992,7 +3992,7 @@ void GMainWindow::OnMenuReportCompatibility() {
         compatdb.exec();
     } else {
         QMessageBox::critical(
-            this, tr("Missing suyu Account"),
+            this, tr("Missing drippu Account"),
             tr("In order to submit a game compatibility test case, you must link your suyu "
                "account.<br><br/>To link your suyu account, go to Emulation &gt; Configuration "
                "&gt; "
@@ -6357,7 +6357,7 @@ void GMainWindow::RunFirstRunSetupIfNeeded() {
     settings.setValue(QStringLiteral("first_run_done"), true);
 
     QDialog dialog(this);
-    dialog.setWindowTitle(tr("Welcome to suyu"));
+    dialog.setWindowTitle(tr("Welcome to drippu"));
     auto* layout = new QVBoxLayout(&dialog);
 
     auto* heading = new QLabel(tr("<h2>Let's get you set up</h2>"), &dialog);
@@ -7378,11 +7378,11 @@ void GMainWindow::UpdateWindowTitle(std::string_view title_name, std::string_vie
     const auto description = std::string(Common::g_scm_desc);
     const auto build_id = std::string(Common::g_build_id);
 
-    const auto suyu_title = fmt::format("suyu | {}-{}", branch_name, description);
+    const auto drippu_title = fmt::format("drippu | {}-{}", branch_name, description);
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
     const auto window_title = !build_fullname.empty() ? build_fullname
-                                                      : (override_title.empty() ? suyu_title : override_title);
+                                                      : (override_title.empty() ? drippu_title : override_title);
 
     if (title_name.empty()) {
         setWindowTitle(QString::fromStdString(window_title));
@@ -7760,8 +7760,8 @@ bool GMainWindow::ConfirmClose() {
         UISettings::values.confirm_before_stopping.GetValue() == ConfirmStop::Ask_Based_On_Game) {
         return true;
     }
-    const auto text = tr("Are you sure you want to close suyu?");
-    return question(this, tr("suyu"), text);
+    const auto text = tr("Are you sure you want to close drippu?");
+    return question(this, tr("drippu"), text);
 }
 
 void GMainWindow::closeEvent(QCloseEvent* event) {
@@ -7841,7 +7841,7 @@ bool GMainWindow::ConfirmChangeGame() {
 
     // Use custom question to link controller navigation
     return question(
-        this, tr("suyu"),
+        this, tr("drippu"),
         tr("Are you sure you want to stop the emulation? Any unsaved progress will be lost."),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
 }
@@ -7853,7 +7853,7 @@ bool GMainWindow::ConfirmForceLockedExit() {
     const auto text = tr("The currently running application has requested suyu to not exit.\n\n"
                          "Would you like to bypass this and exit anyway?");
 
-    return question(this, tr("suyu"), text);
+    return question(this, tr("drippu"), text);
 }
 
 void GMainWindow::RequestGameExit() {
@@ -8423,8 +8423,10 @@ int main(int argc, char* argv[]) {
     Common::ConfigureNvidiaEnvironmentFlags();
 
     // Init settings params
+    // Keep organization/application names stable for config paths; display as drippu.
     QCoreApplication::setOrganizationName(QStringLiteral("suyu team"));
     QCoreApplication::setApplicationName(QStringLiteral("suyu"));
+    QCoreApplication::setApplicationDisplayName(QStringLiteral("drippu"));
 
 #ifdef _WIN32
     QByteArray current_qt_qpa = qgetenv("QT_QPA_PLATFORM");

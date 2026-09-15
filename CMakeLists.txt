@@ -729,8 +729,13 @@ endif()
 if(ENABLE_QT AND UNIX AND NOT APPLE)
     install(FILES "dist/dev.suyu_emu.suyu.desktop"
         DESTINATION "share/applications")
-    install(FILES "dist/suyu.svg"
-        DESTINATION "share/icons/hicolor/scalable/apps")
+    install(FILES "dist/drippu.svg"
+        DESTINATION "share/icons/hicolor/scalable/apps"
+        RENAME "drippu.svg")
+    # Keep the legacy FreeDesktop icon name working for theme lookups.
+    install(FILES "dist/drippu.svg"
+        DESTINATION "share/icons/hicolor/scalable/apps"
+        RENAME "dev.suyu_emu.suyu.svg")
 
     install(FILES "dist/dev.suyu_emu.suyu.xml"
         DESTINATION "share/mime/packages")

@@ -1,15 +1,15 @@
-# suyu
+# drippu
 
 <h1 align="center">
   <br>
-  <img src="dist/suyu.svg" alt="suyu" height="128">
+  <img src="dist/drippu.svg" alt="drippu" height="128">
   <br>
-  <b>suyu</b>
+  <b>drippu</b>
   <br>
 </h1>
 
 <h4 align="center">
-Nintendo Switch emulator and native recompiler — based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
+Nintendo Switch emulator and native recompiler — a continued fork of suyu, based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
 </h4>
 
 <p align="center">
@@ -20,42 +20,38 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 
 ---
 
-> **This is the final public release of suyu — v0.04. This repository is a public archive.**
+> **drippu is an active fork continuation of the suyu codebase** (formerly published as suyu v0.04).
 >
-> No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
+> Development continues here under GPL-3.0-or-later. This repository is not a final archive — builds, fixes, and platform work may continue from this tree.
 >
-> **Note:** a small number of fixes were later pulled in from a community
-> continuation of this codebase, after users reported that installed
-> updates/DLC, service handler registration, and RomFS registration were all
-> broken in the archived build. Those fixes are folded in here as bug fixes to
-> suyu itself; this remains the same final v0.04 release, not new development.
+> The project inherits suyu’s codebase and history (itself based on Eden / yuzu). Binary and internal target names may still say `suyu` in places; the product presents as **drippu**.
 
 ## About
 
-suyu is a Nintendo Switch emulator and AArch64 native recompiler written in C++. It can run decrypted Switch titles using either:
+drippu is a Nintendo Switch emulator and AArch64 native recompiler written in C++. It can run decrypted Switch titles using either:
 
-- **HLE/emulation mode** — full hardware-level emulation via the suyu core (GPU, CPU, audio, services)
-- **Recompiler mode** — ahead-of-time static recompilation of Switch AArch64 game code to native x86-64 executables, bundled with suyu's HLE backend
+- **HLE/emulation mode** — full hardware-level emulation via the drippu core (GPU, CPU, audio, services)
+- **Recompiler mode** — ahead-of-time static recompilation of Switch AArch64 game code to native x86-64 executables, bundled with drippu's HLE backend
 
-Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improvements to UI, recompiler, and platform support.
+Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with improvements to UI, recompiler, and platform support carried forward from suyu and continued in drippu.
 
 ## Status
 
-Final version: **v0.04**. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android).
+Continued development under the drippu name. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android) when configured.
 
-Platforms: Windows, Linux, Android. macOS/iOS not included in this release.
+Platforms: Windows, Linux, Android. macOS/iOS support depends on the build configuration in use.
 
 ## Legal Notice
 
-suyu is a GPLv3 program, which allows fully free redistribution of its source code and releases liability of its authors for how this software is used as stated in Section 15 and 16.
+drippu is a GPLv3 program, which allows fully free redistribution of its source code and releases liability of its authors for how this software is used as stated in Section 15 and 16.
 
-The suyu Emulator program does not circumvent Nintendo's technological protection measures (TPMs) as the user is required to provide both the Nintendo Switch software & the encryption keys for these games, and the suyu Emulator uses a mode of the Advanced Encryption Standard (AES), an open encryption standard established by the US NIST, along with the encryption keys that the user themselves must lawfully acquire, to decrypt the software. As the standard is public and available to use by all, it does not constitute as the Digital Market Copyright Act's (DMCA) definition of "circumventing a technological measure" as defined in Section 1201(a)(3).
+The drippu Emulator program does not circumvent Nintendo's technological protection measures (TPMs) as the user is required to provide both the Nintendo Switch software & the encryption keys for these games, and the drippu Emulator uses a mode of the Advanced Encryption Standard (AES), an open encryption standard established by the US NIST, along with the encryption keys that the user themselves must lawfully acquire, to decrypt the software. As the standard is public and available to use by all, it does not constitute as the Digital Market Copyright Act's (DMCA) definition of "circumventing a technological measure" as defined in Section 1201(a)(3).
 
-The suyu Emulator also falls under the exemptions stated in Section 1201(f) of the DMCA as this software was created for the purposes of reverse engineering the Nintendo Switch software (known as Horizon OS) to create interoperability with Nintendo Switch games and software with the Windows, macOS, and GNU/Linux operating systems.
+The drippu Emulator also falls under the exemptions stated in Section 1201(f) of the DMCA as this software was created for the purposes of reverse engineering the Nintendo Switch software (known as Horizon OS) to create interoperability with Nintendo Switch games and software with the Windows, macOS, and GNU/Linux operating systems.
 
-Any aggressive DMCA claims or takedown notices against projects that explicitly disclaim piracy support, require user-provided keys, and limit functionality to interoperability (such as suyu) could constitute overreach or misuse of the DMCA.
+Any aggressive DMCA claims or takedown notices against projects that explicitly disclaim piracy support, require user-provided keys, and limit functionality to interoperability (such as drippu) could constitute overreach or misuse of the DMCA.
 
-As derived from §512(f), if Nintendo (or an affiliated entity) knowingly materially misrepresents that a project like suyu is infringing (or circumvents TPMs) when it does not, especially if they fail to consider fair use, interoperability exemptions under §1201(f), or the fact that the emulator requires user-provided keys and does not itself contain proprietary Nintendo code, they can be made liable for any Damages against suyu.
+As derived from §512(f), if Nintendo (or an affiliated entity) knowingly materially misrepresents that a project like drippu is infringing (or circumvents TPMs) when it does not, especially if they fail to consider fair use, interoperability exemptions under §1201(f), or the fact that the emulator requires user-provided keys and does not itself contain proprietary Nintendo code, they can be made liable for any Damages against drippu.
 
 ## Building
 
@@ -85,6 +81,8 @@ cmake --build build --target suyu suyu-cmd
 ```sh
 cd src/android && ./gradlew assembleMainlineRelease
 ```
+
+Build targets remain `suyu` / `suyu-cmd` for now (deep path and target renames are deferred).
 
 ## License
 

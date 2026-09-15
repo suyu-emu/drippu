@@ -23,7 +23,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <key>CFBundleLongVersionString</key>
     <string></string>
     <key>CFBundleName</key>
-    <string>suyu</string>
+    <string>drippu</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

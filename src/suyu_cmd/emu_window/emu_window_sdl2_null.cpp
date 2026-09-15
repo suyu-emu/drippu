@@ -17,7 +17,7 @@
 EmuWindow_SDL2_Null::EmuWindow_SDL2_Null(InputCommon::InputSubsystem* input_subsystem_,
                                          Core::System& system_, bool fullscreen)
     : EmuWindow_SDL2{input_subsystem_, system_} {
-    const std::string window_title = fmt::format("suyu {} | {}-{} (Null)", Common::g_build_name,
+    const std::string window_title = fmt::format("drippu {} | {}-{} (Null)", Common::g_build_name,
                                                  Common::g_scm_branch, Common::g_scm_desc);
     render_window =
         SDL_CreateWindow(window_title.c_str(),
@@ -34,7 +34,7 @@ EmuWindow_SDL2_Null::EmuWindow_SDL2_Null(InputCommon::InputSubsystem* input_subs
     OnResize();
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     SDL_PumpEvents();
-    LOG_INFO(Frontend, "suyu Version: {} | {}-{} (Null)", Common::g_build_name,
+    LOG_INFO(Frontend, "drippu Version: {} | {}-{} (Null)", Common::g_build_name,
              Common::g_scm_branch, Common::g_scm_desc);
 }
 
