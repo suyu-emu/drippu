@@ -16,6 +16,7 @@
 #include "common/string_util.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_icache.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "core/core.h"
@@ -857,6 +858,20 @@ struct ArmRecomp::Impl {
     std::unique_ptr<ArmDynarmic64> fallback{};
     bool in_fallback{false};
     bool fallback_unavailable{false};
+    suyu::recomp::RecompICache icache{};
+
+    RecompBlockFn LookupAot(u64 pc) {
+        const RecompBlockFn block = lookup ? lookup(pc) : nullptr;
+        if (!block || icache.AllowsAot()) {
+            return block;
+        }
+        static std::atomic<int> refused{0};
+        if (refused.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Core_ARM,
+                        "recomp: refusing stale AOT at {:#x} after icache invalidate", pc);
+        }
+        return nullptr;
+    }
 };
 
 ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
@@ -920,6 +935,10 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
+    if (True(hr & HaltReason::CacheInvalidation)) {
+        impl->icache.Clear();
+        impl->ctx.chain_budget = 0;
+    }
     if (True(hr & HaltReason::SupervisorCall)) {
         impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
     }
@@ -930,7 +949,7 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
 
     // Return to recompiled execution as soon as the PC is covered again, so a
     // single uncovered function costs only the time spent inside it.
-    if (impl->lookup && impl->lookup(impl->ctx.pc)) {
+    if (impl->LookupAot(impl->ctx.pc)) {
         impl->in_fallback = false;
         g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1009,7 +1028,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             return HaltReason::PrefetchAbort;
         }
 
-        RecompBlockFn block = impl->lookup(impl->ctx.pc);
+        RecompBlockFn block = impl->LookupAot(impl->ctx.pc);
         // Test hook: forces every lookup past the Nth to miss, so the JIT
         // fallback below can be exercised on a title that would otherwise never
         // hit a gap. Unset in normal runs.
@@ -1030,12 +1049,15 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 }
             }
         }
+        if (block && !impl->icache.AllowsAot()) {
+            block = nullptr;
+        }
         // A miss is now recoverable, so it can happen many times per second;
         // the full diagnostic dump is kept for the first few only, where it is
         // still useful for finding which indirect call went uncovered.
         static std::atomic<int> miss_count{0};
         const int miss_index = block ? 0 : miss_count.fetch_add(1, std::memory_order_relaxed);
-        if (!block && miss_index < 8) {
+        if (!block && impl->icache.AllowsAot() && miss_index < 8) {
             std::string trail;
             const size_t count = std::min<size_t>(impl->trail_pos, Impl::kTrail);
             for (size_t i = 0; i < count; ++i) {
@@ -1131,7 +1153,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // The budget bounds that chain, and what is left of it afterwards says
         // how many blocks actually ran - without which every count here would
         // report chains rather than blocks.
-        impl->ctx.chain_budget = kChainBudget;
+        impl->ctx.chain_budget = impl->icache.AllowsAot() ? kChainBudget : 0;
         block(&impl->ctx);
         {
             const int spent = kChainBudget - impl->ctx.chain_budget;
@@ -1194,7 +1216,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
-    const RecompBlockFn block = impl->lookup(impl->ctx.pc);
+    const RecompBlockFn block = impl->LookupAot(impl->ctx.pc);
     if (!block) {
         return HaltReason::PrefetchAbort;
     }
@@ -1206,13 +1228,19 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
 }
 
 void ArmRecomp::ClearInstructionCache() {
-    // Statically recompiled code is fixed at build time; there is no
-    // translation cache to invalidate. Self-modifying guest code is
-    // consequently unsupported by this backend by construction.
+    impl->icache.Clear();
+    impl->ctx.chain_budget = 0;
+    if (impl->fallback) {
+        impl->fallback->ClearInstructionCache();
+    }
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
-    // See ClearInstructionCache.
+    impl->icache.Clear();
+    impl->ctx.chain_budget = 0;
+    if (impl->fallback) {
+        impl->fallback->InvalidateCacheRange(addr, size);
+    }
 }
 
 void ArmRecomp::GetContext(Kernel::Svc::ThreadContext& ctx) const {

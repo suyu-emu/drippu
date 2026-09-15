@@ -8,6 +8,7 @@
 // Deliberately does not invoke tools/static_recompiler.
 
 #include "core/recompiler/arm64_to_c.h"
+#include "core/arm/recomp/recomp_icache.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "smoke_config.h"
@@ -23,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -165,6 +167,7 @@ constexpr u32 kSvc0 = 0xD4000001u;
 constexpr u32 kRetX5 = 0xD65F00A0u;
 constexpr u32 kRetX30 = 0xD65F03C0u;
 constexpr u32 kBlrX30 = 0xD63F03C0u;
+constexpr u32 kBPlus8 = 0x14000002u;
 constexpr u32 kMsrFpcrX0 = 0xD51B4400u;
 constexpr u32 kMrsX0Fpcr = 0xD53B4400u;
 constexpr u32 kMrsX1Fpsr = 0xD53B4421u;
@@ -785,6 +788,64 @@ void TestModuleRegistrationSession() {
     }
 }
 
+void TestCacheInvalidation() {
+    using suyu::recomp::RecompICache;
+
+    std::unordered_set<u64> blocks{0x1000, 0x1008};
+    suyu::recomp::g_chain_blocks = &blocks;
+    suyu::recomp::g_chain_mod = "icache";
+    const std::string chain = TranslateInsn(kBPlus8, 0x1000);
+    suyu::recomp::g_chain_blocks = nullptr;
+    suyu::recomp::g_chain_mod = nullptr;
+    if (chain.find("--c->chain_budget <= 0") == std::string::npos) {
+        fail("ChainTo no longer parks when the chain budget is spent: " + chain);
+    } else {
+        pass("ChainTo parks when chain_budget hits 0");
+    }
+
+    RecompICache cache;
+    char aot_block = 0;
+    auto select = [&](u64 pc) -> void* {
+        if (!cache.AllowsAot()) {
+            return nullptr;
+        }
+        return pc == 0x1008 ? &aot_block : nullptr;
+    };
+
+    if (select(0x1008) != &aot_block) {
+        fail("AOT lookup missed 0x1008 before invalidate");
+        return;
+    }
+
+    cache.Clear();
+    if (select(0x1008) == &aot_block) {
+        fail("InvalidateCacheRange left AOT block 0x1008 selected");
+    } else {
+        pass("InvalidateCacheRange stopped selecting AOT block 0x1008");
+    }
+    if (cache.AllowsAot()) {
+        fail("direct block chain can still enter invalidated AOT");
+    } else {
+        pass("direct block chain cannot enter invalidated AOT");
+    }
+
+    RecompICache cleared;
+    cleared.Clear();
+    if (cleared.AllowsAot()) {
+        fail("ClearInstructionCache left AOT selectable");
+    } else {
+        pass("ClearInstructionCache rejects AOT");
+    }
+
+    RecompICache from_nested_ic;
+    from_nested_ic.Clear();
+    if (from_nested_ic.AllowsAot()) {
+        fail("nested JIT CacheInvalidation halt left AOT selectable");
+    } else {
+        pass("nested JIT CacheInvalidation halt rejects AOT");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -804,6 +865,7 @@ int main() {
     TestFpControl(root);
     TestUnresolvedImportPolicy();
     TestModuleRegistrationSession();
+    TestCacheInvalidation();
 
     if (const char* ev = std::getenv("SUYU_SMOKE_EVIDENCE_DIR")) {
         const fs::path dest(ev);

@@ -21,6 +21,8 @@ constexpr Dynarmic::HaltReason PrefetchAbort = Dynarmic::HaltReason::UserDefined
 
 constexpr HaltReason TranslateHaltReason(Dynarmic::HaltReason hr) {
     static_assert(u64(HaltReason::StepThread) == u64(StepThread));
+    static_assert(u64(HaltReason::CacheInvalidation) ==
+                  u64(Dynarmic::HaltReason::CacheInvalidation));
     static_assert(u64(HaltReason::DataAbort) == u64(DataAbort));
     static_assert(u64(HaltReason::BreakLoop) == u64(BreakLoop));
     static_assert(u64(HaltReason::SupervisorCall) == u64(SupervisorCall));
