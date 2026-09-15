@@ -4216,19 +4216,25 @@ uint64_t recomp_cntpct(GuestContext* c){
 
 /* Resolve a guest address to a host pointer the way Memory::GetPointerImpl
    does: mask, bounds check, one page-table entry, extract the backing pointer.
-   A null result means unmapped, debug, or GPU-tracked memory, all of which have
-   to go through the emulator callback so the rasterizer is told about the
-   access. Only a real backing pointer is handled here.
+   A null result means unmapped, debug, GPU-tracked, or a multi-byte access that
+   spills past this page / the address-space end - all of which have to go
+   through the emulator callback. Adjacent guest pages need not share contiguous
+   host backing, so walking `size` bytes from a start-page pointer is wrong.
 
    Deliberately not inlined into the generated code. Forcing it inline at every
    access site was measured: main.dll went from 100 MB to 222 MB and the race
    phase lost 14%, so whatever the call cost, the instruction cache cost more. */
-static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
+static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va, uint32_t size){
   const RecompHostMem* hm = c->host_mem;
   uintptr_t raw, p;
-  if(!hm || !hm->page_entries) return 0;
+  uint64_t page_size, page_off;
+  if(!hm || !hm->page_entries || size == 0) return 0;
   va &= 0xffffffffffffULL;                 /* AArch64 ignores the top 16 bits */
   if(va >= hm->address_space_max) return 0;
+  if(size > hm->address_space_max - va) return 0;
+  page_size = 1ULL << hm->page_bits;
+  page_off = va & (page_size - 1);
+  if(page_off > page_size - size) return 0; /* crosses into the next guest page */
   raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
                             + (va >> hm->page_bits) * hm->page_entry_stride);
   p = raw & (uintptr_t)hm->pointer_mask;
@@ -4236,21 +4242,21 @@ static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
 }
 
 uint64_t recomp_load8 (GuestContext* c,uint64_t a){
-  unsigned char* p=recomp_host_ptr(c,a); if(p) return (uint64_t)*p; return memload(c,a,1);}
+  unsigned char* p=recomp_host_ptr(c,a,1); if(p) return (uint64_t)*p; return memload(c,a,1);}
 uint64_t recomp_load16(GuestContext* c,uint64_t a){
-  unsigned char* p=recomp_host_ptr(c,a); if(p){uint16_t v;memcpy(&v,p,2);return (uint64_t)v;} return memload(c,a,2);}
+  unsigned char* p=recomp_host_ptr(c,a,2); if(p){uint16_t v;memcpy(&v,p,2);return (uint64_t)v;} return memload(c,a,2);}
 uint64_t recomp_load32(GuestContext* c,uint64_t a){
-  unsigned char* p=recomp_host_ptr(c,a); if(p){uint32_t v;memcpy(&v,p,4);return (uint64_t)v;} return memload(c,a,4);}
+  unsigned char* p=recomp_host_ptr(c,a,4); if(p){uint32_t v;memcpy(&v,p,4);return (uint64_t)v;} return memload(c,a,4);}
 uint64_t recomp_load64(GuestContext* c,uint64_t a){
-  unsigned char* p=recomp_host_ptr(c,a); if(p){uint64_t v;memcpy(&v,p,8);return v;} return memload(c,a,8);}
+  unsigned char* p=recomp_host_ptr(c,a,8); if(p){uint64_t v;memcpy(&v,p,8);return v;} return memload(c,a,8);}
 void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){
-  unsigned char* p=recomp_host_ptr(c,a); if(p){*p=(unsigned char)v;return;} memstore(c,a,1,v);}
+  unsigned char* p=recomp_host_ptr(c,a,1); if(p){*p=(unsigned char)v;return;} memstore(c,a,1,v);}
 void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){
-  unsigned char* p=recomp_host_ptr(c,a); if(p){uint16_t t=(uint16_t)v;memcpy(p,&t,2);return;} memstore(c,a,2,v);}
+  unsigned char* p=recomp_host_ptr(c,a,2); if(p){uint16_t t=(uint16_t)v;memcpy(p,&t,2);return;} memstore(c,a,2,v);}
 void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){
-  unsigned char* p=recomp_host_ptr(c,a); if(p){uint32_t t=(uint32_t)v;memcpy(p,&t,4);return;} memstore(c,a,4,v);}
+  unsigned char* p=recomp_host_ptr(c,a,4); if(p){uint32_t t=(uint32_t)v;memcpy(p,&t,4);return;} memstore(c,a,4,v);}
 void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
-  unsigned char* p=recomp_host_ptr(c,a); if(p){memcpy(p,&v,8);return;} memstore(c,a,8,v);}
+  unsigned char* p=recomp_host_ptr(c,a,8); if(p){memcpy(p,&v,8);return;} memstore(c,a,8,v);}
 
 #ifndef RECOMP_STATIC_HOST
 /* Owned by the runtime in the single-module shapes (standalone exe, loadable
