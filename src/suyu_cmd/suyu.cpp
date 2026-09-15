@@ -26,6 +26,7 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
@@ -95,6 +96,7 @@ struct SuyuRecompStaticModule {
     const char* name;
     void (*(*lookup)(u64))(void*);
     void (*set_base)(u64);
+    const suyu::recomp::RecompImageAbi* (*abi)();
 };
 #ifdef SUYU_CMD_STATIC_RECOMP
 const SuyuRecompStaticModule* suyu_recomp_static_modules(unsigned* count);
@@ -661,26 +663,40 @@ int main(int argc, char** argv) {
         rom_found:;
     }
 
-    // Native recompiled CPU modules, in NSO load order: rtld(0), main(1),
-    // subsdk0-N(2..N+1), sdk(last). Whichever way they arrive, registering any
-    // of them makes ArmRecomp run the game's CPU natively instead of dynarmic.
-    struct RecompModule {
-        Core::RecompBlockFn (*lookup)(u64){};
-        void (*set_base)(u64){};
-    };
-    static std::vector<RecompModule> s_recomp_modules;
+    using suyu::recomp::ApplyModuleBase;
+    using suyu::recomp::ImageReject;
+    using suyu::recomp::ImageRejectName;
+    using suyu::recomp::PlaceLoadedModule;
+    using suyu::recomp::RecompImageExports;
+    using suyu::recomp::RecompModuleMap;
+    static RecompModuleMap s_recomp_modules;
+    bool recomp_map_failed = false;
 
-    // Preferred path: modules compiled straight into this executable. Nothing
-    // to find on disk, nothing to load, and no version skew between the exe and
-    // its modules.
+    auto place_one = [&](const RecompImageExports& ex, const char* origin) {
+        const ImageReject rejected = PlaceLoadedModule(s_recomp_modules, ex);
+        if (rejected != ImageReject::Ok) {
+            LOG_ERROR(Frontend, "Rejected recompiled module from {}: {}", origin,
+                      ImageRejectName(rejected));
+            recomp_map_failed = true;
+            return false;
+        }
+        return true;
+    };
+
 #ifdef SUYU_CMD_STATIC_RECOMP
     {
         unsigned count = 0;
         const SuyuRecompStaticModule* mods = suyu_recomp_static_modules(&count);
         for (unsigned i = 0; i < count; ++i) {
-            s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base});
-            LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
-                     mods[i].name ? mods[i].name : "?");
+            RecompImageExports ex{};
+            ex.lookup = mods[i].lookup;
+            ex.set_base = mods[i].set_base;
+            ex.abi = mods[i].abi;
+            const char* origin = mods[i].name ? mods[i].name : "static";
+            if (place_one(ex, origin)) {
+                LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp candidate", i,
+                         origin);
+            }
         }
     }
 #endif
@@ -689,15 +705,14 @@ int main(int argc, char** argv) {
     // recompiled_rtld.dll, recompiled_image.dll (main), recompiled_subsdk0.dll,
     // recompiled_sdk.dll. Skipped entirely when modules are already linked in.
 #ifdef _WIN32
-    if (s_recomp_modules.empty()) {
+    if (s_recomp_modules.count == 0 && !recomp_map_failed) {
         wchar_t _exe_w[MAX_PATH]{};
         GetModuleFileNameW(nullptr, _exe_w, MAX_PATH);
         const auto _exe_dir = std::filesystem::path(_exe_w).parent_path();
 
-        // Load in standard NSO load order: rtld, main (recompiled_image), subsdk0..9, sdk
         std::vector<std::wstring> dll_order = {
             L"recompiled_rtld.dll",
-            L"recompiled_image.dll",  // main
+            L"recompiled_image.dll",
             L"recompiled_subsdk0.dll", L"recompiled_subsdk1.dll", L"recompiled_subsdk2.dll",
             L"recompiled_subsdk3.dll", L"recompiled_subsdk4.dll", L"recompiled_subsdk5.dll",
             L"recompiled_subsdk6.dll", L"recompiled_subsdk7.dll", L"recompiled_subsdk8.dll",
@@ -707,40 +722,53 @@ int main(int argc, char** argv) {
 
         for (const auto& dll_name : dll_order) {
             const auto p = _exe_dir / dll_name;
-            if (!std::filesystem::exists(p)) continue;
+            if (!std::filesystem::exists(p)) {
+                continue;
+            }
             HMODULE h = LoadLibraryW(p.wstring().c_str());
             if (!h) {
                 LOG_WARNING(Frontend, "Found {} but LoadLibrary failed (err={})",
                             Common::UTF16ToUTF8(dll_name), GetLastError());
                 continue;
             }
-            using LookupFn = Core::RecompBlockFn (*)(u64);
-            using SetBaseFn = void (*)(u64);
-            auto lkp = reinterpret_cast<LookupFn>(GetProcAddress(h, "recomp_image_lookup"));
-            auto sbf = reinterpret_cast<SetBaseFn>(GetProcAddress(h, "recomp_image_set_base"));
-            if (lkp) {
-                s_recomp_modules.push_back({lkp, sbf});
-                LOG_INFO(Frontend, "Native recompiled module [{}] loaded from {} — ArmRecomp active",
-                         s_recomp_modules.size() - 1, Common::UTF16ToUTF8(dll_name));
+            RecompImageExports ex{};
+            ex.lookup = reinterpret_cast<suyu::recomp::RecompImageLookupFn>(
+                GetProcAddress(h, "recomp_image_lookup"));
+            ex.set_base = reinterpret_cast<suyu::recomp::RecompImageSetBaseFn>(
+                GetProcAddress(h, "recomp_image_set_base"));
+            ex.abi = reinterpret_cast<suyu::recomp::RecompImageAbiFn>(
+                GetProcAddress(h, "recomp_image_abi"));
+            if (!ex.lookup) {
+                continue;
+            }
+            if (place_one(ex, Common::UTF16ToUTF8(dll_name).c_str())) {
+                LOG_INFO(Frontend, "Native recompiled module loaded from {} — ArmRecomp candidate",
+                         Common::UTF16ToUTF8(dll_name));
             }
         }
     }
 #endif
 
-    if (!s_recomp_modules.empty()) {
-        // Combined lookup: try each module's lookup until one returns non-null.
+    bool any_recomp = false;
+    for (uint32_t i = 0; i < suyu::recomp::kRecompMaxModules; ++i) {
+        if (s_recomp_modules.slots[i].lookup) {
+            any_recomp = true;
+            break;
+        }
+    }
+    if (any_recomp && !recomp_map_failed) {
         Core::SetRecompLookup([](u64 pc) -> Core::RecompBlockFn {
-            for (const auto& m : s_recomp_modules) {
-                if (auto fn = m.lookup(pc)) return fn;
+            for (uint32_t i = 0; i < suyu::recomp::kRecompMaxModules; ++i) {
+                if (auto lkp = s_recomp_modules.slots[i].lookup) {
+                    if (auto fn = lkp(pc)) {
+                        return fn;
+                    }
+                }
             }
             return nullptr;
         });
-        // Route base to the module at the same index in load order.
-        // rtld=index0, main=index1, subsdk0=index2, ..., sdk=last.
-        Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {
-            if (index < s_recomp_modules.size() && s_recomp_modules[index].set_base) {
-                s_recomp_modules[index].set_base(base);
-            }
+        Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
+            ApplyModuleBase(s_recomp_modules, index, module, base);
         });
         // A window running native recompiled code is a standalone game export,
         // not the suyu dev frontend — the window chrome (title/icon) should

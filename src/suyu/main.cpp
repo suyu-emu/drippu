@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 
 #include <fmt/ranges.h>
 
@@ -90,6 +91,9 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QFile>
 #include <QFileInfo>
 #include <QFileDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QInputDialog>
 #include <QProcess>
 #include <QLineEdit>
@@ -136,6 +140,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core_timing.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
@@ -6417,10 +6422,12 @@ namespace {
         // Hands out the image's block index so the dispatcher can do the lookup
         // itself instead of calling across the shared-object boundary for it.
         int (*get_index)(u64*, u64*, Core::RecompBlockFn**);
+        const suyu::recomp::RecompImageAbi* abi = nullptr;
         u64 base = 0;
     };
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
+suyu::recomp::RecompModuleMap loaded_map;
 
 // A compact, sorted view of the records above. The dispatcher runs tens of
 // millions of times a second, and a RecompImage is ~56 bytes with a std::string
@@ -6461,6 +6468,55 @@ void RebuildOwnerTable() {
               [](const OwnerEntry& a, const OwnerEntry& b) { return a.base < b.base; });
     owner_count = n;
 }
+
+using ExpectedBuildIds =
+    std::unordered_map<std::string, std::array<uint8_t, suyu::recomp::kRecompBuildIdSize>>;
+
+ExpectedBuildIds LoadExpectedBuildIds(const QString& image_dir) {
+    ExpectedBuildIds out;
+    const QStringList candidates = {
+        QDir(image_dir).absoluteFilePath(QStringLiteral("aot_manifest.json")),
+        QDir(image_dir).absoluteFilePath(QStringLiteral("../aot_manifest.json")),
+    };
+    QByteArray json;
+    for (const QString& path : candidates) {
+        QFile f(path);
+        if (f.open(QIODevice::ReadOnly)) {
+            json = f.readAll();
+            break;
+        }
+    }
+    if (json.isEmpty()) {
+        return out;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(json);
+    if (!doc.isObject()) {
+        return out;
+    }
+    const QJsonArray modules = doc.object().value(QStringLiteral("modules")).toArray();
+    for (const QJsonValue& value : modules) {
+        const QJsonObject mod = value.toObject();
+        const std::string name = mod.value(QStringLiteral("name")).toString().toStdString();
+        const std::string hex = mod.value(QStringLiteral("build_id")).toString().toStdString();
+        std::array<uint8_t, suyu::recomp::kRecompBuildIdSize> id{};
+        if (name.empty() || !suyu::recomp::ParseBuildIdHex(hex, id.data())) {
+            continue;
+        }
+        out.emplace(name, id);
+    }
+    return out;
+}
+
+QDir SkipCmakeBuildFolders(QDir dir) {
+    while (dir.dirName() == QStringLiteral("Release") ||
+           dir.dirName() == QStringLiteral("Debug") ||
+           dir.dirName() == QStringLiteral("build")) {
+        if (!dir.cdUp()) {
+            break;
+        }
+    }
+    return dir;
+}
 } // Anonymous namespace
 
 void GMainWindow::UnloadRecompiledImages() {
@@ -6471,6 +6527,7 @@ void GMainWindow::UnloadRecompiledImages() {
     }
     loaded_images.clear();
     loaded_records.clear();
+    loaded_map = {};
     owner_count = 0;
 }
 
@@ -6540,38 +6597,64 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     QDirIterator it(dir, {pattern}, QDir::Files, QDirIterator::Subdirectories);
     std::vector<QLibrary*> found;
     std::vector<RecompImage> records;
+    suyu::recomp::RecompModuleMap pending;
+    const ExpectedBuildIds expected = LoadExpectedBuildIds(dir);
+    bool rejected = false;
     while (it.hasNext()) {
         auto* lib = new QLibrary(it.next(), this);
         if (!lib->load()) {
             lib->deleteLater();
             continue;
         }
-        const auto fn =
-            reinterpret_cast<Core::RecompLookupFn>(lib->resolve("recomp_image_lookup"));
-        if (!fn) {
-            // Some other library that happens to sit in the tree.
+        suyu::recomp::RecompImageExports ex{};
+        ex.lookup = reinterpret_cast<suyu::recomp::RecompImageLookupFn>(
+            lib->resolve("recomp_image_lookup"));
+        if (!ex.lookup) {
             lib->unload();
             lib->deleteLater();
             continue;
         }
-        found.push_back(lib);
+        ex.set_base = reinterpret_cast<suyu::recomp::RecompImageSetBaseFn>(
+            lib->resolve("recomp_image_set_base"));
+        ex.abi = reinterpret_cast<suyu::recomp::RecompImageAbiFn>(lib->resolve("recomp_image_abi"));
 
-        // The module this image was built from is the directory holding it,
-        // walking up past the build output folders cmake created.
-        QDir owner = QFileInfo(lib->fileName()).absoluteDir();
-        while (owner.dirName() == QStringLiteral("Release") ||
-               owner.dirName() == QStringLiteral("Debug") ||
-               owner.dirName() == QStringLiteral("build")) {
-            if (!owner.cdUp()) {
-                break;
+        suyu::recomp::ImageExpect expect{};
+        if (ex.abi) {
+            if (const suyu::recomp::RecompImageAbi* abi = ex.abi()) {
+                const auto hit = expected.find(abi->module_name);
+                if (hit != expected.end()) {
+                    expect.build_id = hit->second.data();
+                }
             }
         }
-        auto* set_base =
-            reinterpret_cast<void (*)(u64)>(lib->resolve("recomp_image_set_base"));
+        const suyu::recomp::ImageReject reason =
+            suyu::recomp::PlaceLoadedModule(pending, ex, expect);
+        if (reason != suyu::recomp::ImageReject::Ok) {
+            LOG_ERROR(Frontend, "Rejected recompiled image {}: {}",
+                      lib->fileName().toStdString(), suyu::recomp::ImageRejectName(reason));
+            rejected = true;
+            lib->unload();
+            lib->deleteLater();
+            continue;
+        }
+
+        found.push_back(lib);
+
+        QDir owner = SkipCmakeBuildFolders(QFileInfo(lib->fileName()).absoluteDir());
         auto* get_index = reinterpret_cast<int (*)(u64*, u64*, Core::RecompBlockFn**)>(
             lib->resolve("recomp_image_index"));
-        records.push_back(
-            RecompImage{owner.dirName().toStdString(), fn, set_base, get_index, 0});
+        const suyu::recomp::RecompImageAbi* abi = ex.abi ? ex.abi() : nullptr;
+        records.push_back(RecompImage{owner.dirName().toStdString(),
+                                      reinterpret_cast<Core::RecompLookupFn>(ex.lookup),
+                                      ex.set_base, get_index, abi, 0});
+    }
+
+    if (rejected) {
+        for (auto* lib : found) {
+            lib->unload();
+            lib->deleteLater();
+        }
+        return 0;
     }
 
     if (found.empty()) {
@@ -6584,64 +6667,34 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     }
     loaded_images = std::move(found);
     loaded_records = std::move(records);
+    loaded_map = pending;
 
-    // Kernel module names carry an "nn" prefix that the export directories do
-    // not ("nnrtld" against "rtld"), so try both spellings.
     Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
-        // Try the name first - it works for rtld - then fall back to load
-        // order. A game's own modules are not named after the files they were
-        // exported from: main is named after the game ("cross2_Release.nss"),
-        // and the others come through as "nnSdk" and "multimedia". Load order
-        // is identical across titles, so position is the dependable key.
-        // Switch load order is rtld, main, subsdk0..subsdk9, sdk. This table had
-        // only four entries {rtld, main, subsdk0, sdk}, which silently mismaps
-        // any title with more than one subsdk: the module at index 3 is subsdk1,
-        // but a 4-entry table hands it the *sdk* image, and every module from
-        // index 4 on gets no image at all.
-        //
-        // a second title loads nine modules. Four were left uncovered and one
-        // was given the wrong image, so most PCs resolved to a neighbouring
-        // module and missed. sdk is still matched by name first (kernel calls it
-        // "nnSdk"), which is what keeps it correct regardless of module count -
-        // it is the only entry whose position depends on how many subsdks a
-        // title happens to have.
-        static const char* kByLoadOrder[] = {
-            "rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3",
-            "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
-            "sdk",
-        };
-
-        std::string name = module;
-        auto ci_equal = [](const std::string& a, const std::string& b) {
-            return a.size() == b.size() &&
-                   std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
-                       return std::tolower(static_cast<unsigned char>(x)) ==
-                              std::tolower(static_cast<unsigned char>(y));
-                   });
-        };
-        auto match = [&](const std::string& candidate) -> RecompImage* {
-            for (auto& record : loaded_records) {
-                // Kernel module names ("nnSdk") and export directory names
-                // ("sdk") differ in case as well as the "nn" prefix already
-                // stripped above - a case-sensitive compare here silently
-                // fails and falls through to guessing by load order instead
-                // of the name actually matching.
-                if (ci_equal(record.name, candidate)) {
-                    return &record;
+        const std::string name = module ? module : "";
+        suyu::recomp::ApplyModuleBase(loaded_map, index, name.c_str(), base);
+        RecompImage* record = nullptr;
+        if (index < suyu::recomp::kRecompMaxModules && loaded_map.slots[index].abi) {
+            const auto* abi = loaded_map.slots[index].abi;
+            for (auto& rec : loaded_records) {
+                if (rec.abi == abi) {
+                    rec.base = loaded_map.slots[index].base;
+                    record = &rec;
+                    break;
                 }
             }
-            return nullptr;
-        };
-        RecompImage* record = match(name);
-        if (!record && name.rfind("nn", 0) == 0) {
-            record = match(name.substr(2));
         }
-        if (!record && index < std::size(kByLoadOrder)) {
-            record = match(kByLoadOrder[index]);
+        if (!record) {
+            if (const auto* slot = suyu::recomp::SlotByName(loaded_map, name.c_str())) {
+                for (auto& rec : loaded_records) {
+                    if (rec.abi == slot->abi) {
+                        rec.base = slot->base;
+                        record = &rec;
+                        break;
+                    }
+                }
+            }
         }
-        if (record && record->set_base) {
-            record->base = base;
-            record->set_base(base);
+        if (record && record->base != 0) {
             RebuildOwnerTable();
             LOG_INFO(Frontend, "Recompiled image for module '{}' (#{}) based at {:#x}", name,
                      index, base);

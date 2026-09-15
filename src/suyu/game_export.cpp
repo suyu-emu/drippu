@@ -1696,13 +1696,16 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         suyu::recomp::RecompileStats stats{};
         bool emit_ok = false;
         try {
+            suyu::recomp::RecompImageIdentity identity{};
+            identity.module_index = suyu::recomp::ModuleIndexOrUnknown(mod.name.toStdString());
+            suyu::recomp::ParseBuildIdHex(mod.build_id_hex.toStdString(), identity.build_id);
             stats = suyu::recomp::EmitProject(
                 mod.name.toStdString(), mod.text_bytes.data(), mod.text_bytes.size(),
                 mod.text_vaddr, mod_dir.toStdString(), /*source_only=*/false,
                 mod.rodata_bytes.empty() ? nullptr : mod.rodata_bytes.data(),
                 mod.rodata_bytes.size(),
                 mod.data_bytes.empty() ? nullptr : mod.data_bytes.data(), mod.data_bytes.size(),
-                mod.entry_vaddr, game_name.toStdString(), &exported_roots);
+                mod.entry_vaddr, game_name.toStdString(), &exported_roots, &identity);
             emit_ok = true;
 
             // Report coverage, not just volume. Block and instruction counts say
@@ -1922,21 +1925,25 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                  "/* Lists this game's statically linked recompiled modules in NSO load\n"
                  "   order. Consumed by src/suyu_cmd/suyu.cpp. */\n"
                  "#include <stdint.h>\n\n"
-                 "typedef void (*SuyuRecompBlockFn)(void*);\n\n";
+                 "typedef void (*SuyuRecompBlockFn)(void*);\n"
+                 "typedef struct RecompImageAbi RecompImageAbi;\n\n";
             for (const auto& m : ordered) {
                 o << "extern SuyuRecompBlockFn recomp_image_lookup_" << m << "(uint64_t);\n"
                   << "extern void recomp_image_set_base_" << m << "(uint64_t);\n"
+                  << "extern const RecompImageAbi* recomp_image_abi_" << m << "(void);\n"
                   << "extern uint64_t g_module_base_" << m << ";\n";
             }
             o << "\ntypedef struct {\n"
                  "    const char* name;\n"
                  "    SuyuRecompBlockFn (*lookup)(uint64_t);\n"
                  "    void (*set_base)(uint64_t);\n"
+                 "    const RecompImageAbi* (*abi)(void);\n"
                  "} SuyuRecompStaticModule;\n\n"
                  "static const SuyuRecompStaticModule s_modules[] = {\n";
             for (const auto& m : ordered) {
                 o << "    { \"" << m << "\", recomp_image_lookup_" << m
-                  << ", recomp_image_set_base_" << m << " },\n";
+                  << ", recomp_image_set_base_" << m
+                  << ", recomp_image_abi_" << m << " },\n";
             }
             o << "};\n\n"
                  "const SuyuRecompStaticModule* suyu_recomp_static_modules(unsigned* count) {\n"

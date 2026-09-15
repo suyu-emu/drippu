@@ -9,6 +9,7 @@
 
 #include "core/recompiler/arm64_to_c.h"
 #include "core/arm/recomp/recomp_icache.h"
+#include "core/arm/recomp/recomp_image_abi.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "smoke_config.h"
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -846,6 +848,191 @@ void TestCacheInvalidation() {
     }
 }
 
+void DummyBlock(void* c) {
+    (void)c;
+}
+
+suyu::recomp::RecompImageBlockFn DummyLookup(u64 pc) {
+    (void)pc;
+    return DummyBlock;
+}
+
+void TestSharedImageAbi(const fs::path& root) {
+    using suyu::recomp::ApplyModuleBase;
+    using suyu::recomp::ImageExpect;
+    using suyu::recomp::ImageReject;
+    using suyu::recomp::PlaceLoadedModule;
+    using suyu::recomp::RecompImageAbi;
+    using suyu::recomp::RecompImageExports;
+    using suyu::recomp::RecompModuleMap;
+    using suyu::recomp::SlotByName;
+    using suyu::recomp::ValidateImageExports;
+    using suyu::recomp::kRecompBuildIdSize;
+    using suyu::recomp::kRecompImageAbiVersion;
+    using suyu::recomp::kRecompMaxModules;
+    using suyu::recomp::kRecompRegsPrefixSize;
+
+    RecompImageExports lookup_only{};
+    lookup_only.lookup = DummyLookup;
+    if (ValidateImageExports(lookup_only) == ImageReject::Ok) {
+        fail("lookup-only image accepted with no ABI, hash, or setter");
+    } else {
+        pass("lookup-only image rejected");
+    }
+
+    static RecompImageAbi main_abi{};
+    main_abi.abi_version = kRecompImageAbiVersion;
+    main_abi.abi_size = static_cast<uint32_t>(sizeof(RecompImageAbi));
+    main_abi.context_size = 2048;
+    main_abi.regs_prefix_size = kRecompRegsPrefixSize;
+    main_abi.module_index = 1;
+    std::memset(main_abi.build_id, 0x11, kRecompBuildIdSize);
+    std::strncpy(main_abi.module_name, "main", sizeof(main_abi.module_name) - 1);
+    auto main_abi_fn = []() -> const RecompImageAbi* { return &main_abi; };
+
+    RecompImageExports no_setter{};
+    no_setter.lookup = DummyLookup;
+    no_setter.abi = main_abi_fn;
+    if (ValidateImageExports(no_setter) == ImageReject::Ok) {
+        fail("image without recomp_image_set_base was accepted");
+    } else {
+        pass("missing set_base rejected");
+    }
+
+    RecompImageExports no_abi{};
+    no_abi.lookup = DummyLookup;
+    no_abi.set_base = +[](u64) {};
+    if (ValidateImageExports(no_abi) == ImageReject::Ok) {
+        fail("image without recomp_image_abi was accepted");
+    } else {
+        pass("missing ABI export rejected");
+    }
+
+    static RecompImageAbi bad_ver = main_abi;
+    bad_ver.abi_version = 0;
+    RecompImageExports wrong_ver{};
+    wrong_ver.lookup = DummyLookup;
+    wrong_ver.set_base = +[](u64) {};
+    wrong_ver.abi = []() -> const RecompImageAbi* { return &bad_ver; };
+    if (ValidateImageExports(wrong_ver) == ImageReject::Ok) {
+        fail("ABI version 0 was accepted");
+    } else {
+        pass("ABI version mismatch rejected");
+    }
+
+    static RecompImageAbi bad_prefix = main_abi;
+    bad_prefix.regs_prefix_size = 256;
+    RecompImageExports wrong_prefix{};
+    wrong_prefix.lookup = DummyLookup;
+    wrong_prefix.set_base = +[](u64) {};
+    wrong_prefix.abi = []() -> const RecompImageAbi* { return &bad_prefix; };
+    if (ValidateImageExports(wrong_prefix) == ImageReject::Ok) {
+        fail("regs prefix size 256 was accepted");
+    } else {
+        pass("context prefix mismatch rejected");
+    }
+
+    uint8_t expected_hash[kRecompBuildIdSize];
+    std::memset(expected_hash, 0x22, kRecompBuildIdSize);
+    ImageExpect expect_hash{};
+    expect_hash.build_id = expected_hash;
+    RecompImageExports hashed{};
+    hashed.lookup = DummyLookup;
+    hashed.set_base = +[](u64) {};
+    hashed.abi = main_abi_fn;
+    if (ValidateImageExports(hashed, expect_hash) == ImageReject::Ok) {
+        fail("image build_id 0x11 accepted for title hash 0x22");
+    } else {
+        pass("title/update content hash mismatch rejected");
+    }
+
+    static RecompImageAbi sdk_abi{};
+    sdk_abi.abi_version = kRecompImageAbiVersion;
+    sdk_abi.abi_size = static_cast<uint32_t>(sizeof(RecompImageAbi));
+    sdk_abi.context_size = 2048;
+    sdk_abi.regs_prefix_size = kRecompRegsPrefixSize;
+    sdk_abi.module_index = 2;
+    std::memset(sdk_abi.build_id, 0x33, kRecompBuildIdSize);
+    std::strncpy(sdk_abi.module_name, "sdk", sizeof(sdk_abi.module_name) - 1);
+
+    RecompModuleMap map{};
+    RecompImageExports main_ex{};
+    main_ex.lookup = DummyLookup;
+    main_ex.set_base = +[](u64) {};
+    main_ex.abi = main_abi_fn;
+    RecompImageExports sdk_ex{};
+    sdk_ex.lookup = DummyLookup;
+    sdk_ex.set_base = +[](u64) {};
+    sdk_ex.abi = []() -> const RecompImageAbi* { return &sdk_abi; };
+    PlaceLoadedModule(map, main_ex);
+    PlaceLoadedModule(map, sdk_ex);
+    ApplyModuleBase(map, 0, "rtld", 0x7100000000ULL);
+    ApplyModuleBase(map, 1, "main", 0x7100200000ULL);
+    ApplyModuleBase(map, 2, "sdk", 0x7101000000ULL);
+    const auto* main_slot = SlotByName(map, "main");
+    const auto* sdk_slot = SlotByName(map, "sdk");
+    if (!main_slot || main_slot->base == 0x7100000000ULL) {
+        fail("omitting rtld assigned rtld's base 0x7100000000 to main");
+    } else if (main_slot->base != 0x7100200000ULL) {
+        fail("main base is not 0x7100200000");
+    } else {
+        pass("main kept its own base when rtld was omitted");
+    }
+    if (!sdk_slot || sdk_slot->base == 0x7100200000ULL) {
+        fail("omitting rtld assigned main's base 0x7100200000 to sdk");
+    } else if (sdk_slot->base != 0x7101000000ULL) {
+        fail("sdk base is not 0x7101000000");
+    } else {
+        pass("sdk kept its own base when rtld was omitted");
+    }
+
+    const auto* nn_main = SlotByName(map, "nnmain");
+    if (!nn_main || nn_main != main_slot) {
+        fail("nnmain did not match the main slot");
+    } else {
+        pass("nnmain matches main");
+    }
+
+    static RecompImageAbi unknown_abi = main_abi;
+    unknown_abi.module_index = kRecompMaxModules;
+    std::strncpy(unknown_abi.module_name, "abi", sizeof(unknown_abi.module_name) - 1);
+    RecompModuleMap unknown_map{};
+    RecompImageExports unknown_ex{};
+    unknown_ex.lookup = DummyLookup;
+    unknown_ex.set_base = +[](u64) {};
+    unknown_ex.abi = []() -> const RecompImageAbi* { return &unknown_abi; };
+    if (PlaceLoadedModule(unknown_map, unknown_ex) != ImageReject::IndexRange) {
+        fail("unknown module_index occupied a load slot");
+    } else {
+        pass("unknown module_index rejected as out of range");
+    }
+
+    const fs::path out = root / "abi_export";
+    fs::create_directories(out);
+    u32 text[1] = {kSvc0};
+    suyu::recomp::EmitProject("abi", reinterpret_cast<const suyu::recomp::u8*>(text), sizeof(text),
+                              0x1000, out.string(), true);
+    const std::string generated = ReadFile(out / "recomp_export.c");
+    if (generated.find("recomp_image_abi") == std::string::npos) {
+        fail("EmitProject export has no recomp_image_abi");
+    } else {
+        pass("EmitProject exports recomp_image_abi");
+    }
+    if (generated.find("build_id") == std::string::npos &&
+        generated.find("0x11") == std::string::npos) {
+        fail("EmitProject export has no content hash");
+    } else {
+        pass("EmitProject export carries a content hash");
+    }
+    const std::string unknown_index =
+        std::to_string(kRecompRegsPrefixSize) + "u,\n  " + std::to_string(kRecompMaxModules) + "u,";
+    if (generated.find(unknown_index) == std::string::npos) {
+        fail("EmitProject unknown name stored module_index 0");
+    } else {
+        pass("EmitProject unknown name emits out-of-range module_index");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -866,6 +1053,7 @@ int main() {
     TestUnresolvedImportPolicy();
     TestModuleRegistrationSession();
     TestCacheInvalidation();
+    TestSharedImageAbi(root);
 
     if (const char* ev = std::getenv("SUYU_SMOKE_EVIDENCE_DIR")) {
         const fs::path dest(ev);

@@ -17,6 +17,7 @@
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_icache.h"
+#include "core/arm/recomp/recomp_image_abi.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "core/core.h"
@@ -67,6 +68,8 @@ struct GuestContextView {
     // point would be at a different offset on each side.
     int chain_budget;
 };
+
+static_assert(sizeof(GuestContextView) == suyu::recomp::kRecompRegsPrefixSize);
 
 // Matches RecompHostMem in the generated runtime. The recompiled code calls
 // through this for every guest access, so that it reads and writes the
