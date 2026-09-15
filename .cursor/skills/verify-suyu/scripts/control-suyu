@@ -155,16 +155,23 @@ def tcp_ready(host: str, port: int, timeout: float = 0.4) -> bool:
         return False
 
 
+def mcp_timeout_s() -> float:
+    # get_lobby_row_counts can block the GUI thread up to ~15s waiting for rooms.
+    return float(os.environ.get("SUYU_MCP_TIMEOUT", "60"))
+
+
 def mcp_request(method: str, params: dict[str, Any] | None = None, req_id: int = 1) -> dict[str, Any]:
     payload: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
     if params is not None:
         payload["params"] = params
     body = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
-    with socket.create_connection((MCP_HOST, MCP_PORT), timeout=20) as sock:
+    timeout = mcp_timeout_s()
+    with socket.create_connection((MCP_HOST, MCP_PORT), timeout=timeout) as sock:
         sock.sendall(body)
-        sock.shutdown(socket.SHUT_WR)
+        # Do not SHUT_WR: Qt's MCP listener treats a half-close as end-of-session and
+        # drops the response for long tools (get_lobby_row_counts waits up to ~15s).
         chunks: list[bytes] = []
-        sock.settimeout(20)
+        sock.settimeout(timeout)
         while True:
             try:
                 data = sock.recv(65536)
@@ -177,7 +184,10 @@ def mcp_request(method: str, params: dict[str, Any] | None = None, req_id: int =
                 break
     raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
     if not raw:
-        die("MCP returned an empty response")
+        die(
+            "MCP returned an empty response "
+            f"(waited {timeout:g}s; raise SUYU_MCP_TIMEOUT for slow tools like get_lobby_row_counts)"
+        )
     line = raw.splitlines()[0]
     try:
         return json.loads(line)

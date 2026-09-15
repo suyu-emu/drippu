@@ -1,11 +1,13 @@
 ---
 name: verify-suyu
-description: "Drive the suyu Qt desktop emulator the way a user does — launch an isolated instance, talk to its localhost MCP JSON-RPC, and prove UI behavior. Use when verifying suyu frontend changes, game-library/settings/mode flows, or any Qt UI work in this repo."
+description: "Drive the drippu/suyu Qt desktop emulator the way a user does — launch an isolated instance, talk to its localhost MCP JSON-RPC, and prove UI behavior. Use when verifying frontend changes, game-library/settings/mode flows, or any Qt UI work in this repo (binary and MCP id are still suyu)."
 ---
 
-# Verify suyu
+# Verify suyu (drippu UI)
 
-suyu is a Qt 6 desktop Nintendo Switch emulator. The user-facing surface is the `suyu` window (Gamer / Programmer / Hacker layouts). `suyu-cmd` is a separate SDL CLI for booting a game; Android is a separate Gradle app. This skill covers the **Qt desktop frontend only**.
+The product’s user-facing brand is **drippu**; the Qt desktop binary, MCP `emulator` id, XDG/QSettings org paths, and this skill directory are still **`suyu`** (deep renames deferred). The window chrome is mixed: idle title like `suyu v0.04 (early access) — drippu`, Gamer sidebar logo still reads **suyu** with a smaller **drippu** mark, and some dialogs keep `suyu` in the title while Qt appends ` — drippu` from the application display name.
+
+`suyu-cmd` is a separate SDL CLI for booting a game; Android is a separate Gradle app. This skill covers the **Qt desktop frontend only**.
 
 Do not boot copyrighted titles, dump keys, or install firmware you do not already have. Library, mode, settings, and status tools work without dumps.
 
@@ -42,6 +44,8 @@ export SUYU_VERIFY_RUN_ID="${SUYU_VERIFY_RUN_ID:-$RANDOM}"
 export SUYU_VERIFY_BIN="${SUYU_VERIFY_BIN:-$PWD/build-verify/bin/suyu}"
 # Optional: send proof PNGs/JSON somewhere durable (cleanup will not delete it)
 export SUYU_VERIFY_EVIDENCE_DIR="${SUYU_VERIFY_EVIDENCE_DIR:-/tmp/suyu-verify-$SUYU_VERIFY_RUN_ID/evidence}"
+# Optional: MCP socket read timeout seconds (default 60). Raise for slow tools.
+export SUYU_MCP_TIMEOUT="${SUYU_MCP_TIMEOUT:-60}"
 .cursor/skills/verify-suyu/scripts/control-suyu launch
 ```
 
@@ -52,8 +56,8 @@ What launch actually does:
 - Refuses if port **9742** is already listening for another PID.
 - Sets `XDG_DATA_HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` under `/tmp/suyu-verify-$RUN_ID/`.
 - Runs from an empty workdir so a portable `user/` directory cannot steal paths (cwd `user/` beats XDG).
-- Seeds `$XDG_CONFIG_HOME/suyu/suyu.conf` with `first_run_done=true` so the modal **Welcome to suyu** dialog does not block MCP.
-- Seeds `$XDG_CONFIG_HOME/suyu team/suyu.conf` with `RememberMode=true` and starts `suyu -gamer` so the **suyu | Setup Profile** mode selector never appears.
+- Seeds `$XDG_CONFIG_HOME/suyu/suyu.conf` with `first_run_done=true` so the modal **Welcome to drippu** dialog does not block MCP.
+- Seeds `$XDG_CONFIG_HOME/suyu team/suyu.conf` with `RememberMode=true` and starts `suyu -gamer` so the **drippu | Setup Profile** mode selector never appears.
 - Starts a new process group; teardown kills that PID only.
 
 Teardown: `.cursor/skills/verify-suyu/scripts/control-suyu cleanup`
@@ -70,7 +74,7 @@ A healthy report has `"ok": true` and:
 
 - `pid_alive` true for the PID in `instance.json`
 - `port_owned_by_us` true (ss listeners on 9742 include that PID)
-- `system.emulator` is `"suyu"`
+- `system.emulator` is `"suyu"` (MCP identity; not the drippu display brand)
 - `system.app_dir` is the directory of the launched binary
 - `ui_state.mode` is `gamer`, `programmer`, or `hacker`
 
@@ -94,7 +98,7 @@ Stable handles (tool names and string arguments, not CSS):
 | `get_ui_state` / `get_emulator_state` | `{}` | `mode`, `current_view` (`library`/`social`), `search_filter`, `game_count`, `emu_running` |
 | `get_system_info` | `{}` | `emulator=suyu`, `qt_version`, `app_dir` |
 | `set_app_mode` | `mode`: `gamer` \| `programmer` \| `hacker` | `success`, `mode` |
-| `navigate_gamer_view` | `view`: `library`, `social`, `settings`, `multiplayer`, `manual`, `website`, `more_options` | `success`; `settings` opens **suyu Configuration** |
+| `navigate_gamer_view` | `view`: `library`, `social`, `settings`, `multiplayer`, `manual`, `website`, `more_options` | `success`; `settings` opens **suyu Configuration** (modal; may empty the MCP reply — prove via screenshot / window title) |
 | `set_gamer_search_filter` | `filter` string | `search_filter` on next `get_ui_state` |
 | `add_game_directory` | `path` absolute dir | `list_configured_game_dirs` |
 | `list_configured_game_dirs` | `{}` | `directories[].path` |
@@ -103,10 +107,18 @@ Stable handles (tool names and string arguments, not CSS):
 | `trigger_ui_action` | `action`: `configure`, `open_user_manual`, `install_keys_dialog`, `install_firmware_dialog`, `export_game`, `nintendo_account`, `steam_integration`, `toggle_fullscreen` | named dialog/window |
 | `capture_ui_screenshot` | `path`, `target`: `main_window` \| `active_modal` \| `active_window` \| `central_widget` | PNG on disk |
 | `get_firmware_status` / `get_keys_status` | `{}` | `prod_keys_present`, `nand_path` (expect false on a clean isolate) |
-| `get_lobby_row_counts` | `{}` | public room browser; needs network; blocks ~15s |
+| `get_lobby_row_counts` | `{}` | public room browser; needs network; blocks ~15s — keep `SUYU_MCP_TIMEOUT` ≥ 60 |
 | `launch_game_path` / `stop_emulation` | ROM path | needs keys + a dump; skip unless the run has both |
 
-User-visible strings to assert in screenshots: window title `suyu`; Gamer nav `Library`, `Settings`, `Multiplayer`, `Social`; library hero `Library` / `Your collection, curated.`; empty copy `No games found.`; search placeholder `Search your games...`; buttons `Add a Game`, `Load a Game`; config dialog title `suyu Configuration`; welcome dialog `Welcome to suyu` (must not appear after launch seeding).
+User-visible strings to assert in screenshots / window titles:
+
+- Main window idle title contains `suyu` and `drippu` (live form: `suyu v0.04 (early access) — drippu` when `BUILD_FULLNAME` is set; Qt may append ` — drippu` from the application display name).
+- Gamer nav `Library`, `Settings`, `Multiplayer`, `Social`; sidebar brand mark is still primarily **suyu** with a smaller **drippu** label.
+- Library hero `Library` / `Your collection, curated.`; empty copy starts with `No games found.` (full string also mentions Add a Game); search placeholder `Search your games...`; buttons `Add a Game`, `Load a Game`.
+- Config dialog title `suyu Configuration` (often shown as `suyu Configuration — drippu`).
+- Mode selector title `drippu | Setup Profile` (must not appear after launch seeding).
+- Welcome dialog `Welcome to drippu` (must not appear after launch seeding).
+- Lobby title contains `Public Room Browser`.
 
 Gamer sidebar objectName `gamerSidebar`; grid objectName `gameGrid`. Prefer MCP over picking those by pixel.
 
@@ -153,8 +165,15 @@ XDG isolation is enough for settings/NAND/keys. Never create a `user/` directory
 .cursor/skills/verify-suyu/scripts/control-suyu doctor
 .cursor/skills/verify-suyu/scripts/control-suyu call get_ui_state
 .cursor/skills/verify-suyu/scripts/control-suyu call add_game_directory '{"path":"/tmp/suyu-verify-games"}'
+.cursor/skills/verify-suyu/scripts/control-suyu call get_lobby_row_counts
 .cursor/skills/verify-suyu/scripts/control-suyu screenshot --path "$SUYU_VERIFY_EVIDENCE_DIR/library.png"
 .cursor/skills/verify-suyu/scripts/control-suyu cleanup
 ```
+
+Env vars (keep these names — they match binary/MCP/XDG identity):
+
+- `SUYU_VERIFY_RUN_ID` / `SUYU_VERIFY_BIN` / `SUYU_VERIFY_EVIDENCE_DIR` / `SUYU_VERIFY_ROOT`
+- `SUYU_MCP_HOST` / `SUYU_MCP_PORT` (default `127.0.0.1:9742`)
+- `SUYU_MCP_TIMEOUT` — socket read timeout seconds (default `60`). Required headroom for `get_lobby_row_counts`.
 
 Keep `--run-id` / `SUYU_VERIFY_RUN_ID` stable across launch, doctor, drive, and cleanup.
