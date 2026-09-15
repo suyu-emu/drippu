@@ -16,6 +16,7 @@
 #include "common/string_util.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -206,10 +207,30 @@ struct RecompCounters {
         std::scoped_lock lk{hist_lock};
         ++miss_pc[pc];
     }
+
+    void Reset() {
+        static_blocks.store(0, std::memory_order_relaxed);
+        svc_calls.store(0, std::memory_order_relaxed);
+        fallback_from_miss.store(0, std::memory_order_relaxed);
+        fallback_from_unhandled.store(0, std::memory_order_relaxed);
+        jit_to_static.store(0, std::memory_order_relaxed);
+        unresolved_import_traps.store(0, std::memory_order_relaxed);
+        no_fallback_available.store(0, std::memory_order_relaxed);
+        std::scoped_lock lk{hist_lock};
+        unhandled_insn.clear();
+        miss_pc.clear();
+        svc_numbers.clear();
+        modules.clear();
+    }
 };
 
 RecompCounters g_counters;
-std::atomic<int> g_live_instances{0};
+std::atomic<bool> g_coverage_reported{false};
+
+suyu::recomp::RecompSession& HostRecompSession() {
+    static suyu::recomp::RecompSession session;
+    return session;
+}
 
 template <typename Map>
 auto TopN(const Map& m, size_t n) {
@@ -846,20 +867,18 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;
     impl->uses_wall_clock = uses_wall_clock;
-    // One instance is built per core; the last one torn down prints the run's
-    // execution-coverage report.
-    g_live_instances.fetch_add(1, std::memory_order_relaxed);
+    if (HostRecompSession().AttachProcess(process)) {
+        g_counters.Reset();
+        g_coverage_reported.store(false, std::memory_order_relaxed);
+    }
 }
 
 ArmRecomp::~ArmRecomp() {
-    // Report on the *first* instance torn down, not the last. Waiting for the
-    // last one means the report is lost whenever anything still holds a
-    // reference at shutdown - which happens, and silently costs the whole run's
-    // measurement. All per-core instances go down together, so the first is
-    // just as complete.
-    g_live_instances.fetch_sub(1, std::memory_order_acq_rel);
-    static std::once_flag reported;
-    std::call_once(reported, [] { ReportRecompCoverage(); });
+    bool expected = false;
+    if (g_coverage_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        ReportRecompCoverage();
+    }
+    HostRecompSession().DetachProcess(impl->owner_process);
 }
 
 bool ArmRecomp::EnterFallback() {
@@ -934,15 +953,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
 
     impl->RefreshPageTable();
 
-    // Registering every loaded image's base with the host dispatcher is a
-    // side effect of this call, not something its return value is used for
-    // here - the dispatcher needs it done once before the first lookup, or
-    // every image's base stays 0 and every lookup misses.
-    static bool bases_registered = false;
-    if (!bases_registered) {
-        bases_registered = true;
-        impl->ModuleBaseFor(thread, impl->ctx.pc);
-    }
+    HostRecompSession().EnsureModuleBasesRegistered(
+        [&] { impl->ModuleBaseFor(thread, impl->ctx.pc); });
 
     if (!impl->rela_applied) {
         impl->rela_applied = true;

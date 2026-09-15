@@ -8,9 +8,11 @@
 // Deliberately does not invoke tools/static_recompiler.
 
 #include "core/recompiler/arm64_to_c.h"
+#include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "smoke_config.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -649,6 +652,139 @@ void TestUnresolvedImportPolicy() {
     }
 }
 
+struct SessionModule {
+    const char* name;
+    u64 base;
+};
+
+struct SessionDispatcher {
+    SessionModule bases[8]{};
+    size_t count = 0;
+    void SetBase(size_t index, const char* name, u64 base) {
+        if (index >= 8) {
+            return;
+        }
+        if (index >= count) {
+            count = index + 1;
+        }
+        bases[index] = SessionModule{name, base};
+    }
+};
+
+void RegisterModules(SessionDispatcher& disp, const SessionModule* mods, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        disp.SetBase(i, mods[i].name, mods[i].base);
+    }
+}
+
+void TestModuleRegistrationSession() {
+    using suyu::recomp::RecompSession;
+
+    RecompSession session;
+    SessionDispatcher disp;
+    int process_a = 1;
+    int process_b = 2;
+
+    const SessionModule title_a_boot1[] = {
+        {"rtld", 0x7100000000ULL},
+        {"main", 0x7100200000ULL},
+        {"nnSdk", 0x7101000000ULL},
+    };
+    session.AttachProcess(&process_a);
+    session.EnsureModuleBasesRegistered(
+        [&] { RegisterModules(disp, title_a_boot1, 3); });
+    if (disp.count != 3 || disp.bases[1].base != 0x7100200000ULL) {
+        fail("first boot did not register main at 0x7100200000");
+    } else {
+        pass("first boot registers module bases");
+    }
+
+    bool reregistered = false;
+    session.EnsureModuleBasesRegistered([&] {
+        reregistered = true;
+        RegisterModules(disp, title_a_boot1, 3);
+    });
+    if (reregistered) {
+        fail("second core of the same boot re-registered bases");
+    } else {
+        pass("second core of the same boot does not re-register");
+    }
+
+    session.NoteStaticBlock();
+    session.NoteStaticBlock();
+    if (session.static_blocks() != 2) {
+        fail("coverage did not count this process");
+    }
+
+    session.DetachProcess(&process_a);
+    session.AttachProcess(&process_a);
+    const SessionModule title_a_boot2[] = {
+        {"rtld", 0x7200000000ULL},
+        {"main", 0x7200200000ULL},
+        {"nnSdk", 0x7201000000ULL},
+    };
+    session.EnsureModuleBasesRegistered(
+        [&] { RegisterModules(disp, title_a_boot2, 3); });
+    if (disp.bases[1].base != 0x7200200000ULL) {
+        fail("stop/start ASLR still has main at 0x7100200000");
+    } else {
+        pass("stop/start same title with ASLR re-registers main");
+    }
+    if (session.static_blocks() != 0) {
+        fail("coverage still holds the previous process");
+    } else {
+        pass("stop/start resets coverage");
+    }
+
+    session.DetachProcess(&process_a);
+    session.AttachProcess(&process_b);
+    const SessionModule title_b[] = {
+        {"rtld", 0x7300000000ULL},
+        {"cross2_Release.nss", 0x7300400000ULL},
+        {"nnSdk", 0x7302000000ULL},
+    };
+    session.EnsureModuleBasesRegistered([&] { RegisterModules(disp, title_b, 3); });
+    if (disp.bases[1].base != 0x7300400000ULL) {
+        fail("title switch still has the previous main base");
+    } else {
+        pass("switching titles re-registers main");
+    }
+
+    session.DetachProcess(&process_b);
+    RecompSession cores;
+    int process_c = 3;
+    cores.AttachProcess(&process_c);
+    SessionDispatcher core_disp;
+    std::atomic<int> registrations{0};
+    const SessionModule aslr_cores[] = {
+        {"rtld", 0x7400000000ULL},
+        {"main", 0x7400200000ULL},
+        {"nnSdk", 0x7401000000ULL},
+    };
+    auto register_cores = [&] {
+        cores.EnsureModuleBasesRegistered([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            registrations.fetch_add(1, std::memory_order_relaxed);
+            RegisterModules(core_disp, aslr_cores, 3);
+        });
+    };
+    std::thread t0(register_cores);
+    std::thread t1(register_cores);
+    std::thread t2(register_cores);
+    std::thread t3(register_cores);
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+    if (const int n = registrations.load(std::memory_order_relaxed); n != 1) {
+        fail("four cores registered bases " + std::to_string(n) + " times");
+    } else if (core_disp.bases[1].base != 0x7400200000ULL) {
+        fail("four cores did not publish the ASLR main base");
+    } else {
+        pass("four cores register once and wait");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -667,6 +803,7 @@ int main() {
     TestBranchProbes(root);
     TestFpControl(root);
     TestUnresolvedImportPolicy();
+    TestModuleRegistrationSession();
 
     if (const char* ev = std::getenv("SUYU_SMOKE_EVIDENCE_DIR")) {
         const fs::path dest(ev);
