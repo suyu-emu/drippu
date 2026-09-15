@@ -184,6 +184,11 @@ constexpr u32 kFaddpD0V1 = 0x7E70D820u;
 constexpr u32 kFaddV0V1V2_2d = 0x4E62D420u;
 constexpr u32 kFmlaV0V1V2_2d = 0x4E62CC20u;
 constexpr u32 kFabsD0D1 = 0x1E60C020u;
+constexpr u32 kSdivX0X1X2 = 0x9AC20C20u;
+constexpr u32 kSdivW0W1W2 = 0x1AC20C20u;
+constexpr u32 kSdivX0X0X1 = 0x9AC10C00u;   // Rd == Rn
+constexpr u32 kSdivX0XzrX1 = 0x9AC10FE0u;  // Rn = XZR
+constexpr u32 kSdivX0X1Xzr = 0x9ADF0C20u;  // Rm = XZR
 
 bool AesHelpersAtFileScope(const std::string& runtime_c) {
     const auto save = runtime_c.find("int recomp_save_write(");
@@ -339,6 +344,372 @@ void TestTranslatedShape() {
     } else {
         pass("BLR X30 translated C reads the target before writing LR");
     }
+}
+
+fs::path FindBuiltExe(const fs::path& build, const char* name) {
+    const fs::path candidates[] = {
+        build / name,
+#ifdef _WIN32
+        build / "Release" / (std::string(name) + ".exe"),
+        build / "Debug" / (std::string(name) + ".exe"),
+#else
+        build / "Release" / name,
+#endif
+    };
+    for (const fs::path& p : candidates) {
+        if (fs::exists(p)) {
+            return p;
+        }
+    }
+    return {};
+}
+
+void TestMemoryBoundaries(const fs::path& root) {
+    // Drive the actual RuntimeC helpers with a crafted page table: guest page 0
+    // and page 1 map to nonadjacent host regions, and a second case leaves page 1
+    // unmapped/tracked (null entry). Wide accesses at the page edge must take the
+    // callback path; same-page accesses may stay on the fast path.
+    const fs::path probe_src = root / "memory_probe";
+    fs::create_directories(probe_src);
+    if (!WriteFile(probe_src / "recomp_runtime.h", suyu::recomp::RuntimeH())) {
+        return;
+    }
+    if (!WriteFile(probe_src / "recomp_runtime.c", suyu::recomp::RuntimeC())) {
+        return;
+    }
+    if (!WriteFile(probe_src / "stub_lookup.c",
+                   "void* recomp_lookup(unsigned long long pc){ (void)pc; return 0; }\n")) {
+        return;
+    }
+
+    const char* probe_c = R"C(#include "recomp_runtime.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+enum { PAGE_BITS = 12, PAGE_SIZE = 1 << PAGE_BITS, N_PAGES = 4 };
+
+static uintptr_t page_entries[N_PAGES];
+static unsigned char backing[PAGE_SIZE * 4];
+static unsigned char* page0_host;
+static unsigned char* page1_host;
+static int callbacks;
+/* page1 may be mapped discontiguous or have a null PTE (tracked/unmapped). */
+
+static unsigned char* host_for(uint64_t va) {
+  if (va < PAGE_SIZE) return page0_host;
+  if (va < 2 * PAGE_SIZE) return page1_host;
+  return 0;
+}
+
+static uint64_t probe_load(void* user, uint64_t va, uint32_t size) {
+  (void)user;
+  ++callbacks;
+  uint64_t v = 0;
+  for (uint32_t i = 0; i < size; ++i) {
+    unsigned char* h = host_for(va + i);
+    if (!h) return 0;
+    ((unsigned char*)&v)[i] = h[(va + i) & (PAGE_SIZE - 1)];
+  }
+  return v;
+}
+
+static void probe_store(void* user, uint64_t va, uint32_t size, uint64_t value) {
+  (void)user;
+  ++callbacks;
+  for (uint32_t i = 0; i < size; ++i) {
+    unsigned char* h = host_for(va + i);
+    if (!h) return;
+    h[(va + i) & (PAGE_SIZE - 1)] = ((unsigned char*)&value)[i];
+  }
+}
+
+static void map_page(int page, unsigned char* host) {
+  uint64_t va_base = (uint64_t)page << PAGE_BITS;
+  page_entries[page] = host ? ((uintptr_t)host - (uintptr_t)va_base) : 0;
+}
+
+static int expect_eq(const char* name, uint64_t got, uint64_t want) {
+  printf("%s: got=%llx want=%llx callbacks=%d\n", name,
+         (unsigned long long)got, (unsigned long long)want, callbacks);
+  return got != want;
+}
+
+int main(void) {
+  int fail = 0;
+  page0_host = backing;
+  page1_host = backing + 2 * PAGE_SIZE;
+  memset(backing, 0xCC, sizeof backing);
+
+  RecompHostMem hm;
+  memset(&hm, 0, sizeof hm);
+  hm.load = probe_load;
+  hm.store = probe_store;
+  hm.page_entries = page_entries;
+  hm.page_entry_stride = sizeof(uintptr_t);
+  hm.page_bits = PAGE_BITS;
+  hm.pointer_mask = ~(uintptr_t)0;
+  hm.address_space_max = (uint64_t)N_PAGES << PAGE_BITS;
+
+  GuestContext ctx;
+  memset(&ctx, 0, sizeof ctx);
+  ctx.host_mem = &hm;
+  ctx.pending_svc = ~0ULL;
+
+  map_page(0, page0_host);
+  map_page(1, page1_host);
+  memset(page0_host, 0, PAGE_SIZE);
+  page0_host[0x100] = 0x11; page0_host[0x101] = 0x22;
+  page0_host[0x102] = 0x33; page0_host[0x103] = 0x44;
+  page0_host[0x104] = 0x55; page0_host[0x105] = 0x66;
+  page0_host[0x106] = 0x77; page0_host[0x107] = 0x88;
+  callbacks = 0;
+  fail |= expect_eq("same-page load16", recomp_load16(&ctx, 0x100), 0x2211);
+  if (callbacks != 0) { printf("same-page load16 took callback\n"); fail = 1; }
+  callbacks = 0;
+  fail |= expect_eq("same-page load32", recomp_load32(&ctx, 0x100), 0x44332211ULL);
+  if (callbacks != 0) fail = 1;
+  callbacks = 0;
+  fail |= expect_eq("same-page load64", recomp_load64(&ctx, 0x100), 0x8877665544332211ULL);
+  if (callbacks != 0) fail = 1;
+
+  memset(backing, 0xCC, sizeof backing);
+  page0_host[PAGE_SIZE - 1] = 0x11;
+  page1_host[0] = 0x22;
+  backing[PAGE_SIZE] = 0xAA;
+  callbacks = 0;
+  fail |= expect_eq("cross-page load16 discontig", recomp_load16(&ctx, PAGE_SIZE - 1), 0x2211);
+  if (callbacks == 0) { printf("cross-page load16 skipped callback\n"); fail = 1; }
+
+  page0_host[PAGE_SIZE - 1] = 0x11;
+  page1_host[0] = 0x22;
+  backing[PAGE_SIZE] = 0xAA;
+  callbacks = 0;
+  recomp_store16(&ctx, PAGE_SIZE - 1, 0x4433);
+  printf("cross-page store16: p0=%02x p1=%02x gap=%02x callbacks=%d\n",
+         page0_host[PAGE_SIZE - 1], page1_host[0], backing[PAGE_SIZE], callbacks);
+  if (page0_host[PAGE_SIZE - 1] != 0x33 || page1_host[0] != 0x44 ||
+      backing[PAGE_SIZE] != 0xAA || callbacks == 0) fail = 1;
+
+  memset(page0_host, 0, PAGE_SIZE);
+  memset(page1_host, 0, PAGE_SIZE);
+  page0_host[PAGE_SIZE - 1] = 0x01;
+  page1_host[0] = 0x02; page1_host[1] = 0x03; page1_host[2] = 0x04;
+  callbacks = 0;
+  fail |= expect_eq("cross-page load32 discontig", recomp_load32(&ctx, PAGE_SIZE - 1),
+                    0x04030201ULL);
+  if (callbacks == 0) fail = 1;
+
+  memset(page0_host, 0, PAGE_SIZE);
+  memset(page1_host, 0, PAGE_SIZE);
+  page0_host[PAGE_SIZE - 1] = 0x09;
+  for (int i = 0; i < 7; i++) page1_host[i] = (unsigned char)(0x10 + i);
+  callbacks = 0;
+  fail |= expect_eq("cross-page load64 discontig", recomp_load64(&ctx, PAGE_SIZE - 1),
+                    0x1615141312111009ULL);
+  if (callbacks == 0) fail = 1;
+
+  memset(page0_host, 0, PAGE_SIZE);
+  memset(page1_host, 0, PAGE_SIZE);
+  page0_host[PAGE_SIZE - 1] = 0xA0;
+  for (int i = 0; i < 15; i++) page1_host[i] = (unsigned char)(0xA1 + i);
+  callbacks = 0;
+  {
+    uint64_t lo = recomp_load64(&ctx, PAGE_SIZE - 1);
+    uint64_t hi = recomp_load64(&ctx, PAGE_SIZE - 1 + 8);
+    printf("simd composed: lo=%llx hi=%llx callbacks=%d\n",
+           (unsigned long long)lo, (unsigned long long)hi, callbacks);
+    if (lo != 0xA7A6A5A4A3A2A1A0ULL || hi != 0xAFAEADACABAAA9A8ULL) fail = 1;
+    if (callbacks == 0) fail = 1;
+  }
+
+  /* Tracked / unmapped second page: null PTE forces callback. */
+  map_page(1, 0);
+  memset(page0_host, 0, PAGE_SIZE);
+  page0_host[PAGE_SIZE - 1] = 0x11;
+  page1_host[0] = 0x22; page1_host[1] = 0x33; page1_host[2] = 0x44;
+  page1_host[3] = 0x55; page1_host[4] = 0x66; page1_host[5] = 0x77;
+  page1_host[6] = 0x88;
+  callbacks = 0;
+  fail |= expect_eq("cross-page load16 tracked", recomp_load16(&ctx, PAGE_SIZE - 1), 0x2211);
+  if (callbacks == 0) { printf("tracked load16 skipped callback\n"); fail = 1; }
+  callbacks = 0;
+  fail |= expect_eq("cross-page load32 unmapped-pte", recomp_load32(&ctx, PAGE_SIZE - 1),
+                    0x44332211ULL);
+  if (callbacks == 0) fail = 1;
+  callbacks = 0;
+  fail |= expect_eq("cross-page load64 unmapped-pte", recomp_load64(&ctx, PAGE_SIZE - 1),
+                    0x8877665544332211ULL);
+  if (callbacks == 0) fail = 1;
+
+  backing[PAGE_SIZE] = 0xAA;
+  page0_host[PAGE_SIZE - 1] = 0x00;
+  page1_host[0] = 0x00;
+  callbacks = 0;
+  recomp_store16(&ctx, PAGE_SIZE - 1, 0xBBAA);
+  printf("tracked store16: p0=%02x p1=%02x gap=%02x callbacks=%d\n",
+         page0_host[PAGE_SIZE - 1], page1_host[0], backing[PAGE_SIZE], callbacks);
+  if (page0_host[PAGE_SIZE - 1] != 0xAA || page1_host[0] != 0xBB ||
+      backing[PAGE_SIZE] != 0xAA || callbacks == 0) fail = 1;
+
+  return fail;
+}
+)C";
+    if (!WriteFile(probe_src / "probe.c", probe_c)) {
+        return;
+    }
+    if (!WriteFile(probe_src / "CMakeLists.txt",
+                   "cmake_minimum_required(VERSION 3.13)\n"
+                   "project(suyu_memory_probe C)\n"
+                   "set(CMAKE_C_STANDARD 11)\n"
+                   "add_executable(memory_probe probe.c recomp_runtime.c stub_lookup.c)\n"
+                   "target_include_directories(memory_probe PRIVATE "
+                   "${CMAKE_CURRENT_SOURCE_DIR})\n")) {
+        return;
+    }
+
+    const fs::path probe_build = probe_src / "build";
+    if (CmakeBuild(probe_src, probe_build, "memory_probe", false) != 0) {
+        return;
+    }
+    const fs::path exe = FindBuiltExe(probe_build, "memory_probe");
+    if (exe.empty()) {
+        fail("memory_probe executable not found under " + probe_build.string());
+        return;
+    }
+    if (RunArgs({exe.string()}) != 0) {
+        fail("memory_probe execution");
+        return;
+    }
+    pass("page-edge load/store (discontig/tracked/unmapped) via RuntimeC");
+}
+
+void TestSdivProbes(const fs::path& root) {
+    const std::string sdiv_x = TranslateInsn(kSdivX0X1X2, 0x1000);
+    const std::string sdiv_w = TranslateInsn(kSdivW0W1W2, 0x1000);
+    const std::string sdiv_alias = TranslateInsn(kSdivX0X0X1, 0x1000);
+    const std::string sdiv_xzr_n = TranslateInsn(kSdivX0XzrX1, 0x1000);
+    const std::string sdiv_xzr_m = TranslateInsn(kSdivX0X1Xzr, 0x1000);
+
+    if (sdiv_x.find("INT64_MIN") == std::string::npos ||
+        sdiv_x.find("_a/_b") == std::string::npos) {
+        fail("SDIV X missing INT64_MIN guard: " + sdiv_x);
+    } else {
+        pass("SDIV X translated C guards INT64_MIN / -1");
+    }
+    if (sdiv_w.find("INT32_MIN") == std::string::npos ||
+        sdiv_w.find("_a/_b") == std::string::npos) {
+        fail("SDIV W missing INT32_MIN guard: " + sdiv_w);
+    } else {
+        pass("SDIV W translated C guards INT32_MIN / -1");
+    }
+
+    std::ostringstream src;
+    src << "#include <stdint.h>\n#include <stdio.h>\n#include <limits.h>\n"
+           "typedef struct { uint64_t x[32]; } GuestContext;\n"
+           "static void sdiv_x(GuestContext* c) {\n"
+        << sdiv_x
+        << "}\nstatic void sdiv_w(GuestContext* c) {\n"
+        << sdiv_w
+        << "}\nstatic void sdiv_alias(GuestContext* c) {\n"
+        << sdiv_alias
+        << "}\nstatic void sdiv_xzr_n(GuestContext* c) {\n"
+        << sdiv_xzr_n
+        << "}\nstatic void sdiv_xzr_m(GuestContext* c) {\n"
+        << sdiv_xzr_m
+        << "}\n"
+           "static void clear(GuestContext* c) {\n"
+           "  int i; for (i = 0; i < 32; i++) c->x[i] = 0;\n"
+           "}\n"
+           "static int expect_u64(const char* name, uint64_t got, uint64_t want) {\n"
+           "  printf(\"%s: got=%llx want=%llx\\n\", name,\n"
+           "         (unsigned long long)got, (unsigned long long)want);\n"
+           "  return got != want;\n"
+           "}\n"
+           "int main(void) {\n"
+           "  GuestContext c;\n"
+           "  int fail = 0;\n"
+           "  clear(&c); c.x[1] = (uint64_t)INT64_MIN; c.x[2] = (uint64_t)(int64_t)-1;\n"
+           "  sdiv_x(&c);\n"
+           "  fail |= expect_u64(\"SDIV X INT64_MIN/-1\", c.x[0], (uint64_t)INT64_MIN);\n"
+           "  clear(&c); c.x[1] = (uint64_t)(uint32_t)INT32_MIN; c.x[2] = (uint64_t)(uint32_t)-1;\n"
+           "  sdiv_w(&c);\n"
+           "  fail |= expect_u64(\"SDIV W INT32_MIN/-1\", c.x[0], (uint64_t)(uint32_t)INT32_MIN);\n"
+           "  clear(&c); c.x[1] = 42; c.x[2] = 0;\n"
+           "  sdiv_x(&c);\n"
+           "  fail |= expect_u64(\"SDIV X /0\", c.x[0], 0);\n"
+           "  clear(&c); c.x[1] = 42; c.x[2] = 0;\n"
+           "  sdiv_w(&c);\n"
+           "  fail |= expect_u64(\"SDIV W /0\", c.x[0], 0);\n"
+           "  clear(&c); c.x[1] = (uint64_t)(int64_t)-15; c.x[2] = (uint64_t)(int64_t)-3;\n"
+           "  sdiv_x(&c);\n"
+           "  fail |= expect_u64(\"SDIV X -15/-3\", c.x[0], 5);\n"
+           "  clear(&c); c.x[1] = (uint64_t)(uint32_t)(int32_t)-15;\n"
+           "  c.x[2] = (uint64_t)(uint32_t)(int32_t)-3;\n"
+           "  sdiv_w(&c);\n"
+           "  fail |= expect_u64(\"SDIV W -15/-3\", c.x[0], 5);\n"
+           "  clear(&c); c.x[0] = (uint64_t)INT64_MIN; c.x[1] = (uint64_t)(int64_t)-1;\n"
+           "  sdiv_alias(&c);\n"
+           "  fail |= expect_u64(\"SDIV X0,X0,X1 overflow alias\", c.x[0], (uint64_t)INT64_MIN);\n"
+           "  clear(&c); c.x[0] = 0xdead; c.x[1] = 7;\n"
+           "  sdiv_xzr_n(&c);\n"
+           "  fail |= expect_u64(\"SDIV X0,XZR,X1\", c.x[0], 0);\n"
+           "  clear(&c); c.x[1] = 99;\n"
+           "  sdiv_xzr_m(&c);\n"
+           "  fail |= expect_u64(\"SDIV X0,X1,XZR\", c.x[0], 0);\n"
+           "  return fail;\n"
+           "}\n";
+
+    const fs::path probe_src = root / "sdiv_probe";
+    fs::create_directories(probe_src);
+    if (!WriteFile(probe_src / "probe.c", src.str())) {
+        return;
+    }
+    // Prefer UBSan when the toolchain provides it (GCC libubsan on this Linux VM).
+    const char* cmake_txt =
+        "cmake_minimum_required(VERSION 3.13)\n"
+        "project(suyu_sdiv_probe C)\n"
+        "set(CMAKE_C_STANDARD 11)\n"
+        "set(CMAKE_C_EXTENSIONS OFF)\n"
+        "add_executable(sdiv_probe probe.c)\n"
+        "include(CheckCCompilerFlag)\n"
+        "set(_suyu_ubsan_flag \"-fsanitize=undefined\")\n"
+        "check_c_compiler_flag(\"${_suyu_ubsan_flag}\" SUYU_HAS_UBSAN)\n"
+        "if (SUYU_HAS_UBSAN)\n"
+        "  target_compile_options(sdiv_probe PRIVATE ${_suyu_ubsan_flag} -fno-sanitize-recover=undefined)\n"
+        "  target_link_options(sdiv_probe PRIVATE ${_suyu_ubsan_flag})\n"
+        "endif()\n";
+    if (!WriteFile(probe_src / "CMakeLists.txt", cmake_txt)) {
+        return;
+    }
+
+    const fs::path probe_build = probe_src / "build";
+    if (CmakeBuild(probe_src, probe_build, "sdiv_probe", true) != 0) {
+        return;
+    }
+
+    fs::path exe = probe_build / "sdiv_probe";
+#ifdef _WIN32
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Release" / "sdiv_probe.exe";
+    }
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Debug" / "sdiv_probe.exe";
+    }
+#else
+    if (!fs::exists(exe)) {
+        exe = probe_build / "Release" / "sdiv_probe";
+    }
+#endif
+    if (!fs::exists(exe)) {
+        fail("sdiv_probe executable not found under " + probe_build.string());
+        return;
+    }
+    if (RunArgs({exe.string()}) != 0) {
+        fail("sdiv_probe execution (UBSan or result mismatch)");
+        return;
+    }
+    pass("SDIV overflow/zero/neg/alias/XZR executed");
 }
 
 void TestBranchProbes(const fs::path& root) {
@@ -1234,6 +1605,8 @@ int main() {
     std::cout << "exporter smoke workdir: " << root << std::endl;
     TestTranslatedShape();
     TestEmitProjectCompile(root);
+    TestMemoryBoundaries(root);
+    TestSdivProbes(root);
     TestBranchProbes(root);
     TestFpControl(root);
     TestUnresolvedImportPolicy();
@@ -1246,10 +1619,20 @@ int main() {
         const fs::path dest(ev);
         fs::create_directories(dest);
         const fs::path runtime = root / "emit_project" / "recomp_runtime.c";
+        const fs::path mem_probe = root / "memory_probe" / "probe.c";
+        const fs::path sdiv_probe = root / "sdiv_probe" / "probe.c";
         const fs::path probe = root / "branch_probe" / "probe.c";
         const fs::path fp_probe = root / "fp_probe" / "probe.c";
         if (fs::exists(runtime)) {
             fs::copy_file(runtime, dest / "recomp_runtime.c",
+                          fs::copy_options::overwrite_existing);
+        }
+        if (fs::exists(mem_probe)) {
+            fs::copy_file(mem_probe, dest / "memory_probe.c",
+                          fs::copy_options::overwrite_existing);
+        }
+        if (fs::exists(sdiv_probe)) {
+            fs::copy_file(sdiv_probe, dest / "sdiv_probe.c",
                           fs::copy_options::overwrite_existing);
         }
         if (fs::exists(probe)) {
