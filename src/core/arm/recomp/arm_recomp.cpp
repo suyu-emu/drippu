@@ -863,7 +863,7 @@ struct ArmRecomp::Impl {
     bool fallback_unavailable{false};
     suyu::recomp::RecompICache icache{};
 
-    RecompBlockFn LookupAot(u64 pc) {
+        RecompBlockFn LookupAot(u64 pc) {
         const RecompBlockFn block = lookup ? lookup(pc) : nullptr;
         if (!block || icache.AllowsAot()) {
             return block;
@@ -1294,6 +1294,8 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
 }
 
 void ArmRecomp::ClearInstructionCache() {
+    // Permanent AOT reject: guest code may have changed under the image the
+    // static pass translated. Further RunThread/StepThread must use the JIT.
     impl->icache.Clear();
     impl->ctx.chain_budget = 0;
     if (impl->fallback) {
@@ -1302,7 +1304,12 @@ void ArmRecomp::ClearInstructionCache() {
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
-    impl->icache.Clear();
+    // Range invalidate (loader RX protect, page-table copies) must flush the
+    // Dynarmic fallback without permanently rejecting AOT. AOT was compiled
+    // for the image bytes being mapped; treating every loader invalidate as
+    // ClearInstructionCache would kill ArmRecomp before the first guest insn.
+    // Guest IC ops that mean bytes changed under us arrive as CacheInvalidation
+    // halt reasons and call icache.Clear() from RunFallback/StepFallback.
     impl->ctx.chain_budget = 0;
     if (impl->fallback) {
         impl->fallback->InvalidateCacheRange(addr, size);

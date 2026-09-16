@@ -419,10 +419,16 @@ void ArmDynarmic32::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic32::ClearInstructionCache() {
+    if (m_cb) {
+        m_cb->last_code_addr = u64(-1);
+    }
     m_jit->ClearCache();
 }
 
 void ArmDynarmic32::InvalidateCacheRange(u64 addr, std::size_t size) {
+    if (m_cb) {
+        m_cb->last_code_addr = u64(-1);
+    }
     m_jit->InvalidateCacheRange(static_cast<u32>(addr), size);
 }
 

@@ -14,9 +14,8 @@
 //   - StepThread policy audit (miss / unhandled must use the same fallback
 //     entry as RunThread; production ArmRecomp::StepThread is fixed to match)
 //
-// Standalone: no System/Kernel/Dynarmic. Full ArmRecomp+Dynarmic+HLE coverage
-// remains blocked while externals/dynarmic (and friends) are uninitialized —
-// see GAPS at the bottom of the PASS summary.
+// Standalone: no System/Kernel/Dynarmic. Real ArmRecomp+Dynarmic+kernel coverage
+// lives in recomp_stack_harness (full-tree build only).
 
 #include "core/recompiler/arm64_to_c.h"
 #include "core/arm/recomp/recomp_icache.h"
@@ -60,8 +59,7 @@ void pass(const std::string& msg) {
 std::string Quote(const std::string& s) {
     return "'" + s + "'";
 }
-#endif
-
+#else
 std::string QuoteWinArg(std::string_view arg) {
     const bool need_quote =
         arg.empty() || arg.find_first_of(" \t\n\v\"") != std::string_view::npos;
@@ -101,6 +99,7 @@ std::string JoinWindowsCommandLine(const std::vector<std::string>& args) {
     }
     return line;
 }
+#endif
 
 int RunArgs(const std::vector<std::string>& args) {
     if (args.empty()) {
@@ -765,13 +764,13 @@ void TestHomebrewRuntimeProbe(const fs::path& root) {
 
 void PrintGaps() {
     std::cout
-        << "GAPS (blocked without initialized externals / full emulator build):\n"
-        << "  - ArmRecomp linked against real Dynarmic JIT (externals/dynarmic uninit)\n"
-        << "  - Kernel HLE SVC dispatch / KThread scheduling / multi PhysicalCore\n"
+        << "GAPS (this harness is stub-only; see recomp_stack_harness for real stack):\n"
+        << "  - ArmRecomp + in-tree Dynarmic + ApplicationMemory: recomp_stack_harness\n"
+        << "  - Full PhysicalCore::RunThread -> Svc::Call HLE (needs safe SVC + services)\n"
+        << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
         << "  - Debugger gdbstub StepThread against a live guest process\n"
-        << "  - IC IVAU -> InvalidateCacheRange on a running title\n"
-        << "  - Real NSO homebrew load without keys/firmware/game dumps\n"
-        << "Harness covers the ArmRecomp dispatch contracts with hosted stubs.\n";
+        << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
+        << "This harness covers ArmRecomp dispatch contracts with hosted stubs.\n";
 }
 
 } // namespace

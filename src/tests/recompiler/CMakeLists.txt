@@ -46,3 +46,19 @@ add_test(NAME homebrew_harness COMMAND homebrew_harness)
 set_tests_properties(homebrew_harness PROPERTIES
     TIMEOUT 180
 )
+
+# Real ArmRecomp + Dynarmic + kernel stack. Only when nested in the full
+# emulator build (links `core`). Standalone recompiler/ CMake project skips it.
+if (NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    add_executable(recomp_stack_harness recomp_stack_harness.cpp)
+    target_compile_features(recomp_stack_harness PRIVATE cxx_std_20)
+    # frontend_common supplies PlayTimeManager referenced from core's NS services
+    # once System symbols pull that translation unit into the link.
+    target_link_libraries(recomp_stack_harness PRIVATE core common frontend_common dynarmic::dynarmic
+                          ${CMAKE_DL_LIBS})
+    target_include_directories(recomp_stack_harness PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    add_test(NAME recomp_stack_harness COMMAND recomp_stack_harness)
+    set_tests_properties(recomp_stack_harness PROPERTIES
+        TIMEOUT 180
+    )
+endif()

@@ -47,6 +47,6 @@ jobs:
           name: cmake-log-tests
           path: cmake_configure.log
       - name: Build tests
-        run: cmake --build build --target tests -j4
+        run: cmake --build build --target tests recomp_stack_harness -j4
       - name: Run tests
-        run: ctest --test-dir build --output-on-failure -R '^tests$'
+        run: ctest --test-dir build --output-on-failure -R '^(tests|recomp_stack_harness)$'

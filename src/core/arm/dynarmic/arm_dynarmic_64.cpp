@@ -446,10 +446,19 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
+    // JIT ClearCache alone is not enough: MemoryReadCode keeps a host-side
+    // page snapshot. Without resetting it, a later retranslate after guest RX
+    // was rewritten still feeds the old bytes into the JIT.
+    if (m_cb) {
+        m_cb->last_code_addr = u64(-1);
+    }
     m_jit->ClearCache();
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
+    if (m_cb) {
+        m_cb->last_code_addr = u64(-1);
+    }
     m_jit->InvalidateCacheRange(addr, size);
 }
 
