@@ -105,6 +105,14 @@ public:
         return Architecture::AArch64;
     }
 
+    bool IsRecompBackend() const override {
+        return true;
+    }
+
+    /// True until ClearInstructionCache permanently rejects Translate AOT.
+    /// InvalidateCacheRange (loader RX protect) must leave this true.
+    bool AllowsAot() const;
+
     void GetContext(Kernel::Svc::ThreadContext& ctx) const override;
     void SetContext(const Kernel::Svc::ThreadContext& ctx) override;
     void SetTpidrroEl0(u64 value) override;

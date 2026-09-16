@@ -11,6 +11,7 @@
 // Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
 // safe live HLE). Does not load copyrighted titles or keys.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -138,7 +139,9 @@ constexpr u64 kOffUnhandled = 0x0800;
 constexpr u64 kOffUnhandledPark = 0x0808; // clears in_fallback after Dynarmic SVC
 constexpr u64 kOffMiss = 0x1000;          // registered AOT; force-miss target
 constexpr u64 kOffMissPark = 0x1008;
-constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7
+// AOT proof: Translate MOVZ #7 / SVC #1, but guest RX is BEEF/99 (Dynarmic twin differs).
+constexpr u64 kOffAotProof = 0x1400;
+constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
 constexpr u64 kOffCrossPage = 0x1FFC;
 constexpr u64 kCodeBytes = 3 * Kernel::PageSize;
 constexpr u64 kImageBytes = 4 * Kernel::PageSize;
@@ -161,6 +164,7 @@ constexpr u32 kSvc1 = 0xD4000021u;
 
 u64 g_entry = 0;
 u64 g_force_miss_pc = 0;
+std::atomic<u64> g_lookup_calls{0};
 
 using BlockFn = void (*)(void*);
 using SetBaseFn = void (*)(u64);
@@ -170,11 +174,21 @@ BlockFn g_block_unhandled = nullptr;
 BlockFn g_block_unhandled_park = nullptr;
 BlockFn g_block_miss = nullptr;
 BlockFn g_block_miss_park = nullptr;
+BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
 
+Core::ArmRecomp* AsRecomp(Core::ArmInterface* iface) {
+    if (!iface || !iface->IsRecompBackend()) {
+        return nullptr;
+    }
+    // Safe after IsRecompBackend(): builds are -fno-rtti.
+    return static_cast<Core::ArmRecomp*>(iface);
+}
+
 Core::RecompBlockFn Lookup(u64 pc) {
+    g_lookup_calls.fetch_add(1, std::memory_order_relaxed);
     if (g_force_miss_pc != 0 && pc == g_force_miss_pc) {
         return nullptr;
     }
@@ -192,6 +206,9 @@ Core::RecompBlockFn Lookup(u64 pc) {
     }
     if (pc == g_entry + kOffMissPark) {
         return g_block_miss_park;
+    }
+    if (pc == g_entry + kOffAotProof) {
+        return g_block_aot_proof;
     }
     if (pc == g_entry + kOffPlain) {
         return g_block_plain;
@@ -213,6 +230,9 @@ std::string BuildAotSource() {
     const std::string t_mov_beef = TranslateInsn(kMovzX0Beef, kOffMiss);
     const std::string t_svc99 = TranslateInsn(kSvc99, kOffMiss + 4);
     const std::string t_park_m = TranslateInsn(kSvc1, kOffMissPark);
+    // AOT proof site: Translate #7/SVC1 while guest RX holds BEEF/99.
+    const std::string t_proof_mov = TranslateInsn(kMovzX0_7, kOffAotProof);
+    const std::string t_proof_svc = TranslateInsn(kSvc1, kOffAotProof + 4);
     const std::string t_mov7 = TranslateInsn(kMovzX0_7, kOffPlain);
     const std::string t_svc1 = TranslateInsn(kSvc1, kOffPlain + 4);
 
@@ -291,6 +311,11 @@ void block_miss_park(GuestContext* c) {
     src << t_park_m;
     src << R"C(}
 
+void block_aot_proof(GuestContext* c) {
+)C";
+    src << t_proof_mov << t_proof_svc;
+    src << R"C(}
+
 void block_plain(GuestContext* c) {
 )C";
     src << t_mov7 << t_svc1;
@@ -367,13 +392,16 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_unhandled_park = reinterpret_cast<BlockFn>(dlsym(g_so, "block_unhandled_park"));
     g_block_miss = reinterpret_cast<BlockFn>(dlsym(g_so, "block_miss"));
     g_block_miss_park = reinterpret_cast<BlockFn>(dlsym(g_so, "block_miss_park"));
+    g_block_aot_proof = reinterpret_cast<BlockFn>(dlsym(g_so, "block_aot_proof"));
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
     ExpectTrue("dlsym recomp_set_module_base", g_set_base != nullptr);
     ExpectTrue("dlsym block_tls_svc", g_block_tls != nullptr);
     ExpectTrue("dlsym block_unhandled", g_block_unhandled != nullptr);
     ExpectTrue("dlsym block_miss", g_block_miss != nullptr);
+    ExpectTrue("dlsym block_aot_proof", g_block_aot_proof != nullptr);
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
-    return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_plain;
+    return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
+           g_block_plain;
 #endif
 }
 
@@ -397,7 +425,10 @@ void WriteGuestImage(std::vector<u8>& image) {
     put(kOffMiss + 4, kSvc99);
     put(kOffMissPark, kSvc1);
     put(kOffUnhandledPark, kSvc1);
-    // Plain / icache site.
+    // AOT proof: guest RX is Dynarmic twin (BEEF/99); AOT Translate is #7/SVC1.
+    put(kOffAotProof, kMovzX0Beef);
+    put(kOffAotProof + 4, kSvc99);
+    // Plain / icache site (guest RX matches Translate).
     put(kOffPlain, kMovzX0_7);
     put(kOffPlain + 4, kSvc1);
 }
@@ -447,7 +478,10 @@ struct StackFixture {
 
         arm = process->GetArmInterface(0);
         ExpectTrue("ArmInterface installed", arm != nullptr);
+        ExpectTrue("process ArmInterface is ArmRecomp", arm->IsRecompBackend());
         ExpectTrue("SetRecompLookup still set", Core::GetRecompLookup() == &Lookup);
+        auto* recomp = AsRecomp(arm);
+        ExpectTrue("AsRecomp after IsRecompBackend", recomp != nullptr);
 
         Kernel::CodeSet codeset;
         codeset.memory.assign(kImageBytes, 0);
@@ -463,13 +497,30 @@ struct StackFixture {
         codeset.DataSegment().size = static_cast<u32>(kImageBytes - kCodeBytes);
         process->LoadModule(kernel, std::move(codeset), process->GetEntryPoint());
 
-        // Guest RX must hold the Translate'd encodings (not zeros).
+        // LoadModule → SetProcessMemoryPermission → InvalidateCacheRange must
+        // NOT permanently reject AOT (that is ClearInstructionCache only).
+        ExpectTrue("AllowsAot survived LoadModule InvalidateCacheRange", recomp->AllowsAot());
+        // Re-hit the same path explicitly so the fix is uniquely pinned even if
+        // LoadModule's invalidate were ever skipped.
+        for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+            if (auto* iface = process->GetArmInterface(i)) {
+                ExpectTrue("core is ArmRecomp", iface->IsRecompBackend());
+                iface->InvalidateCacheRange(g_entry, kCodeBytes);
+                ExpectTrue("AllowsAot after explicit InvalidateCacheRange",
+                           AsRecomp(iface)->AllowsAot());
+            }
+        }
+
+        // Guest RX must hold the Translate'd encodings (not zeros) at twin sites;
+        // AOT proof site deliberately diverges (BEEF/99 vs Translate #7/SVC1).
         ExpectEq("guest RX tls movz", system.ApplicationMemory().Read32(g_entry + kOffTlsSvc),
                  kMovzX0_1234);
         ExpectEq("guest RX tls svc", system.ApplicationMemory().Read32(g_entry + kOffTlsSvc + 24),
                  kSvc42);
         ExpectEq("guest RX miss", system.ApplicationMemory().Read32(g_entry + kOffMiss),
                  kMovzX0Beef);
+        ExpectEq("guest RX aot-proof Dynarmic twin",
+                 system.ApplicationMemory().Read32(g_entry + kOffAotProof), kMovzX0Beef);
 
         Kernel::KProcessAddress stack_bottom{};
         if (process->GetPageTable()
@@ -589,6 +640,36 @@ struct StackFixture {
     }
 };
 
+void ScenarioAotLiveProof(StackFixture& f) {
+    const int before = g_fails;
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("AOT-proof ArmRecomp", recomp != nullptr);
+    ExpectTrue("AOT-proof AllowsAot", recomp && recomp->AllowsAot());
+
+    // Guest RX at proof site is BEEF/99 — Dynarmic twin would yield those.
+    ExpectEq("AOT-proof guest RX != Translate twin",
+             f.system.ApplicationMemory().Read32(g_entry + kOffAotProof), kMovzX0Beef);
+    ExpectTrue("AOT-proof guest svc twin is 99 encoding",
+               f.system.ApplicationMemory().Read32(g_entry + kOffAotProof + 4) == kSvc99);
+
+    const u64 lookups_before = g_lookup_calls.load(std::memory_order_relaxed);
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffAotProof;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+
+    const auto hr = f.arm->RunThread(f.thread);
+    const u64 lookups_after = g_lookup_calls.load(std::memory_order_relaxed);
+    ExpectTrue("Lookup consulted during RunThread", lookups_after > lookups_before);
+    ExpectTrue("AOT-proof svc HaltReason", True(hr & Core::HaltReason::SupervisorCall));
+    // Translate AOT outcome (#7 / svc 1), not Dynarmic twin (BEEF / 99).
+    ExpectEq("AOT-proof svc (not Dynarmic twin 99)", f.arm->GetSvcNumber(), 1);
+    Kernel::Svc::ThreadContext out{};
+    f.arm->GetContext(out);
+    ExpectEq("AOT-proof x0 (not Dynarmic twin 0xBEEF)", out.r[0], 7);
+    ScenarioPass("ArmRecomp Translate AOT live (Lookup + outcome != guest RX twin)", before);
+}
+
 void ScenarioSvcTlsCrossPage(StackFixture& f) {
     const int before = g_fails;
     f.PrepThreadForTlsSvc(f.thread);
@@ -697,7 +778,10 @@ void ScenarioInvalidation(StackFixture& f) {
     // Dynarmic fallback that may already exist on each core.
     for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
         if (auto* iface = f.process->GetArmInterface(i)) {
+            ExpectTrue("inv Clear target is ArmRecomp", iface->IsRecompBackend());
+            ExpectTrue("AllowsAot before Clear", AsRecomp(iface)->AllowsAot());
             iface->ClearInstructionCache();
+            ExpectTrue("AllowsAot false after Clear only", !AsRecomp(iface)->AllowsAot());
         }
     }
 
@@ -767,8 +851,9 @@ void PrintGaps() {
         << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
         << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
         << "  - gdbstub StepThread against a live title\n"
-        << "Pinned here: SetRecompLookup process ArmRecomp, Translate AOT + guest RX,\n"
-        << "  LoadContext TLS publish, registered-PC force-miss, icache, restart, StepThread.\n";
+        << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
+        << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
+        << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread.\n";
 }
 
 } // namespace
@@ -791,6 +876,7 @@ int main() {
     }
     Pass("bootstrap SetRecompLookup + application KProcess ArmRecomp");
 
+    ScenarioAotLiveProof(*fix); // before Clear: proves Lookup + AOT != Dynarmic twin
     ScenarioSvcTlsCrossPage(*fix);
     ScenarioLoadContextTls(*fix);
     // Force-miss + unhandled need AllowsAot (registered Translate blocks).

@@ -77,6 +77,12 @@ public:
     // This returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.
     virtual Architecture GetArchitecture() const = 0;
 
+    // Discriminator for no-RTTI downcasts (builds use -fno-rtti).
+    // ArmRecomp overrides; Dynarmic/NCE keep the default.
+    virtual bool IsRecompBackend() const {
+        return false;
+    }
+
     // Context accessors.
     // These should not be called if the CPU is running.
     virtual void GetContext(Kernel::Svc::ThreadContext& ctx) const = 0;

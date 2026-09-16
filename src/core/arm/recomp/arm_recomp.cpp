@@ -1293,6 +1293,10 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     return HaltReason::StepThread;
 }
 
+bool ArmRecomp::AllowsAot() const {
+    return impl->icache.AllowsAot();
+}
+
 void ArmRecomp::ClearInstructionCache() {
     // Permanent AOT reject: guest code may have changed under the image the
     // static pass translated. Further RunThread/StepThread must use the JIT.
