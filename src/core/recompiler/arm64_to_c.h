@@ -3651,11 +3651,16 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS \"-O1\")\n"
        << "endif()\n\n"
        << "if(NOT RECOMP_STATIC_ONLY)\n"
-       << "add_executable(recompiled main.c recomp_runtime.c ${RECOMP_SOURCES})\n"
+       << "set(_recomp_exe recompiled)\n"
+       << "if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)\n"
+       << "  set(_recomp_exe recompiled_exe_" << mod << ")\n"
+       << "endif()\n"
+       << "add_executable(${_recomp_exe} main.c recomp_runtime.c ${RECOMP_SOURCES})\n"
+       << "set_target_properties(${_recomp_exe} PROPERTIES OUTPUT_NAME recompiled)\n"
        << "if(SDL2_FOUND)\n"
-       << "  target_compile_definitions(recompiled PRIVATE HAVE_SDL2)\n"
-       << "  target_include_directories(recompiled PRIVATE ${SDL2_INCLUDE_DIRS})\n"
-       << "  target_link_libraries(recompiled ${SDL2_LIBRARIES})\n"
+       << "  target_compile_definitions(${_recomp_exe} PRIVATE HAVE_SDL2)\n"
+       << "  target_include_directories(${_recomp_exe} PRIVATE ${SDL2_INCLUDE_DIRS})\n"
+       << "  target_link_libraries(${_recomp_exe} ${SDL2_LIBRARIES})\n"
        << "  message(STATUS \"SDL2 found — recompiled will open a game window\")\n"
        << "else()\n"
        << "  message(STATUS \"SDL2 not found — running headless (no window)\")\n"
@@ -3709,6 +3714,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << " PRIVATE SUYU_HOSTED_RECOMP=1 RECOMP_STATIC_MODULE=1"
        << " g_module_base=g_module_base_" << mod
        << " recomp_lookup=recomp_lookup_" << mod
+       << " recomp_build_index=recomp_build_index_" << mod
+       << " _recomp_index_view=_recomp_index_view_" << mod
+       << " recomp_image_index=recomp_image_index_" << mod
        << " recomp_image_lookup=recomp_image_lookup_" << mod
        << " recomp_image_set_base=recomp_image_set_base_" << mod
        << " recomp_image_abi=recomp_image_abi_" << mod

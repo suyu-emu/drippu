@@ -80,7 +80,7 @@ struct RecompModuleSlot {
 };
 
 struct RecompModuleMap {
-    RecompModuleSlot slots[kRecompMaxModules]{};
+    RecompModuleSlot modules[kRecompMaxModules]{};
     uint32_t count = 0;
 };
 
@@ -226,7 +226,7 @@ inline ImageReject PlaceLoadedModule(RecompModuleMap& map, const RecompImageExpo
     if (abi->module_index >= kRecompMaxModules) {
         return ImageReject::IndexRange;
     }
-    RecompModuleSlot& slot = map.slots[abi->module_index];
+    RecompModuleSlot& slot = map.modules[abi->module_index];
     if (slot.lookup || slot.set_base || slot.abi) {
         return ImageReject::DuplicateIndex;
     }
@@ -245,12 +245,12 @@ inline const RecompModuleSlot* SlotByName(const RecompModuleMap& map, const char
     }
     const char* stripped = WithoutNnPrefix(name);
     for (uint32_t i = 0; i < kRecompMaxModules; ++i) {
-        const RecompImageAbi* abi = map.slots[i].abi;
+        const RecompImageAbi* abi = map.modules[i].abi;
         if (!abi) {
             continue;
         }
         if (ModuleNameEqual(abi->module_name, name) || ModuleNameEqual(abi->module_name, stripped)) {
-            return &map.slots[i];
+            return &map.modules[i];
         }
     }
     return nullptr;
@@ -272,12 +272,12 @@ inline const RecompModuleSlot* SlotByBuildId(const RecompModuleMap& map,
         return nullptr;
     }
     for (uint32_t i = 0; i < kRecompMaxModules; ++i) {
-        const RecompImageAbi* abi = map.slots[i].abi;
+        const RecompImageAbi* abi = map.modules[i].abi;
         if (!abi) {
             continue;
         }
         if (std::memcmp(abi->build_id, build_id, kRecompBuildIdSize) == 0) {
-            return &map.slots[i];
+            return &map.modules[i];
         }
     }
     return nullptr;
@@ -316,17 +316,17 @@ inline bool SlotNameMatches(const RecompModuleSlot& slot, const char* name) {
 inline void ApplyModuleBase(RecompModuleMap& map, size_t index, const char* name, uint64_t base,
                             const uint8_t* build_id = nullptr) {
     if (const RecompModuleSlot* found = SlotByIdentity(map, name, build_id)) {
-        auto& slot = map.slots[static_cast<size_t>(found - map.slots)];
+        auto& slot = map.modules[static_cast<size_t>(found - map.modules)];
         if (slot.set_base) {
             slot.base = base;
             slot.set_base(base);
         }
         return;
     }
-    if (index >= kRecompMaxModules || !map.slots[index].set_base) {
+    if (index >= kRecompMaxModules || !map.modules[index].set_base) {
         return;
     }
-    const RecompModuleSlot& slot = map.slots[index];
+    const RecompModuleSlot& slot = map.modules[index];
     // Index fallback: only when the slot has no recorded identity yet, or the
     // provided name is empty / already matches. A named guest module must not
     // claim a differently named ABI slot via dense position alone.
@@ -334,8 +334,8 @@ inline void ApplyModuleBase(RecompModuleMap& map, size_t index, const char* name
         !SlotNameMatches(slot, name)) {
         return;
     }
-    map.slots[index].base = base;
-    map.slots[index].set_base(base);
+    map.modules[index].base = base;
+    map.modules[index].set_base(base);
 }
 
 }

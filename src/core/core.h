@@ -328,6 +328,9 @@ public:
 
     [[nodiscard]] Loader::AppLoader& GetAppLoader();
     [[nodiscard]] const Loader::AppLoader& GetAppLoader() const;
+    /// Null when no title has been loaded (harness / pre-Load System).
+    [[nodiscard]] Loader::AppLoader* TryGetAppLoader();
+    [[nodiscard]] const Loader::AppLoader* TryGetAppLoader() const;
 
     [[nodiscard]] Service::SM::ServiceManager& ServiceManager();
     [[nodiscard]] const Service::SM::ServiceManager& ServiceManager() const;

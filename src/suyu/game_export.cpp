@@ -1437,24 +1437,39 @@ static QString FindBestCmakeExecutable() {
 // of a recompiled module emits far more than 64 KiB (100+ translation units,
 // each with MSVC C4127/C4723 warnings), so an undrained loop deadlocks: the
 // parent hangs in waitForFinished, the child hangs in write, and no compiler
-// ever gets spawned for the remaining files. Everything read is accumulated
-// into `captured` so callers still get the full log for diagnostics.
+// ever gets spawned for the remaining files. Keep a bounded tail in `captured`
+// and, when requested, stream the complete diagnostics to `log_path`.
 static int RunProcessDrained(QProcess& proc, const QString& program, const QStringList& args,
-                             QString* captured = nullptr) {
+                             QString* captured = nullptr, const QString& log_path = {}) {
     QString sink;
     QString& out = captured ? *captured : sink;
     out.clear();
 
+    // Stream the complete output to disk; the bounded in-memory tail can lose
+    // the first linker errors behind thousands of subsequent warnings.
+    QFile log_file(log_path);
+    if (!log_path.isEmpty() && !log_file.open(QIODevice::WriteOnly)) {
+        LOG_WARNING(Frontend, "Could not open build log {}: {}", log_path.toStdString(),
+                    log_file.errorString().toStdString());
+    }
+
     proc.setProcessChannelMode(QProcess::MergedChannels);
     proc.start(program, args);
     if (!proc.waitForStarted(30000)) {
-        out += QStringLiteral("<process failed to start: %1>").arg(program);
+        out += QStringLiteral("<process failed to start: %1: %2>").arg(program, proc.errorString());
+        if (log_file.isOpen()) {
+            log_file.write(out.toUtf8());
+        }
         return -1;
     }
 
     const auto drain = [&] {
         const QByteArray chunk = proc.readAllStandardOutput();
         if (!chunk.isEmpty()) {
+            if (log_file.isOpen()) {
+                log_file.write(chunk);
+                log_file.flush();
+            }
             out += QString::fromLocal8Bit(chunk);
             // Keep the retained log bounded; only the tail is ever reported.
             if (out.size() > 1 << 20) {
@@ -1487,6 +1502,35 @@ static int RunProcessDrained(QProcess& proc, const QString& program, const QStri
     proc.waitForFinished(5000);
     drain();
     return proc.exitCode();
+}
+
+static QString BuildFailureSummary(const QString& log_path, const QString& tail) {
+    QFile log(log_path);
+    QStringList errors;
+    if (log.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream stream(&log);
+        const QRegularExpression error_pattern(
+            QStringLiteral("(?:fatal error|error [A-Z]+[0-9]+|CMake Error|error:|"
+                           "undefined reference|multiple definition)"),
+            QRegularExpression::CaseInsensitiveOption);
+        while (!stream.atEnd() && errors.size() < 6) {
+            const QString line = stream.readLine();
+            if (error_pattern.match(line).hasMatch()) {
+                errors.append(line.left(500));
+            }
+        }
+    }
+    return errors.isEmpty() ? tail.right(3000) : errors.join(QLatin1Char('\n'));
+}
+
+static void ShowBuildFailure(QWidget* parent, const QString& message,
+                             const QString& log_path, const QString& tail) {
+    QMessageBox box(QMessageBox::Critical, QObject::tr("Build Failed"), message,
+                    QMessageBox::Ok, parent);
+    box.setTextFormat(Qt::PlainText);
+    box.setInformativeText(QObject::tr("Build log: %1").arg(QDir::toNativeSeparators(log_path)));
+    box.setDetailedText(BuildFailureSummary(log_path, tail));
+    box.exec();
 }
 
 } // anonymous namespace
@@ -1538,6 +1582,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                            RecompileBackend backend,
                                            const QString& game_name) {
     QDir().mkpath(cache_dir);
+    const QString logs_dir = QFileInfo(cache_dir).dir().filePath(QStringLiteral("export-logs"));
+    QDir().mkpath(logs_dir);
 
     const QString manifest_path = cache_dir + QDir::separator() + QStringLiteral("aot_manifest.json");
 
@@ -1869,6 +1915,10 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const QString build_dir = mod_dir + QDir::separator() + QStringLiteral("build");
             QString configure_log;
             QString build_log;
+            const QString configure_log_path =
+                logs_dir + QLatin1Char('/') + mod.name + QStringLiteral(".configure.log");
+            const QString build_log_path =
+                logs_dir + QLatin1Char('/') + mod.name + QStringLiteral(".build.log");
 
             QProcess configure;
             const int configure_rc = RunProcessDrained(
@@ -1880,7 +1930,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                  // sources - three full compiles of a translation unit that can
                  // take 40 minutes each on a large title.
                  QStringLiteral("-DRECOMP_STATIC_ONLY=ON")},
-                &configure_log);
+                &configure_log, configure_log_path);
             if (configure_rc == 0) {
                 QProcess build;
                 const int build_rc =
@@ -1888,7 +1938,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                       {QStringLiteral("--build"), build_dir,
                                        QStringLiteral("--config"), QStringLiteral("Release"),
                                        QStringLiteral("--parallel")},
-                                      &build_log);
+                                      &build_log, build_log_path);
                 if (build_rc != 0) {
                     LOG_ERROR(Frontend, "Recompiled module {} failed to compile:\n{}",
                               mod.name.toStdString(), build_log.right(4000).toStdString());
@@ -1898,12 +1948,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         fallback_modules.append(mod.name);
                         continue;
                     }
-                    QMessageBox::critical(
-                        this, tr("Build Failed"),
-                        tr("Compiling module '%1' failed.\n\nThe generated sources are still in:\n"
-                           "%2\n\nEnable 'Fall back to interpreter' to continue despite build "
-                           "failures. See the suyu log for compiler output.")
-                            .arg(mod.name, mod_dir));
+                    ShowBuildFailure(this, tr("Compiling module '%1' failed.\nGenerated sources: %2")
+                                               .arg(mod.name, mod_dir), build_log_path, build_log);
                     return {};
                 }
             } else {
@@ -1915,11 +1961,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     fallback_modules.append(mod.name);
                     continue;
                 }
-                QMessageBox::critical(
-                    this, tr("Build Failed"),
-                    tr("CMake could not configure module '%1'.\n\nThe generated sources are in:\n"
-                       "%2\n\nEnable 'Fall back to interpreter' to continue despite failures.")
-                        .arg(mod.name, mod_dir));
+                ShowBuildFailure(this, tr("CMake could not configure module '%1'.\nGenerated sources: %2")
+                                           .arg(mod.name, mod_dir), configure_log_path, configure_log);
                 return {};
             }
 
@@ -1960,7 +2003,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (top_cmake.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream o(&top_cmake);
             o << "cmake_minimum_required(VERSION 3.13)\n"
-                 "project(" << game_name << "_recompiled C)\n\n"
+                 "project(suyu_recompiled_game LANGUAGES C)\n\n"
                  "# Add each recompiled module as a subdirectory.\n"
                  "# Each module builds its own 'recompiled' exe and 'recompiled_image' shared lib.\n";
             for (const auto& m : recomp_module_dirs) {
@@ -2153,16 +2196,20 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             int conf_rc = -1;
             QProcess conf;
             conf.setProcessEnvironment(vs_env);
+            QString conf_log_path;
+            int configure_attempt = 0;
             for (const auto& candidate : cmake_candidates) {
                 if (!QFile::exists(candidate)) {
                     continue;
                 }
+                conf_log_path =
+                    logs_dir + QStringLiteral("/launcher.configure.%1.log").arg(++configure_attempt);
                 conf_rc = RunProcessDrained(
                     conf, candidate,
                     {QStringLiteral("-S"), source_tree, QStringLiteral("-B"), build_tree,
                      QStringLiteral("-DSUYU_CMD_RECOMP_DIR=") +
                          QDir::fromNativeSeparators(recomp_root)},
-                    &conf_log);
+                    &conf_log, conf_log_path);
                 if (conf_rc == 0) {
                     cmake_exe = candidate;
                     break;
@@ -2174,6 +2221,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                             conf_log.right(3000).toStdString());
             }
             int link_rc = -1;
+            const QString link_log_path = logs_dir + QStringLiteral("/launcher.build.log");
             if (conf_rc == 0) {
                 QProcess bld;
                 bld.setProcessEnvironment(vs_env);
@@ -2183,14 +2231,21 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                                              QStringLiteral("suyu-cmd-static"),
                                              QStringLiteral("--config"), QStringLiteral("Release"),
                                              QStringLiteral("--parallel")},
-                                            &link_log);
+                                            &link_log, link_log_path);
                 if (link_rc != 0) {
-                    LOG_ERROR(Frontend, "suyu-cmd-static failed to link:\n{}",
-                              link_log.right(4000).toStdString());
+                    LOG_ERROR(Frontend, "suyu-cmd-static build failed; full log: {}\n{}",
+                              link_log_path.toStdString(),
+                              BuildFailureSummary(link_log_path, link_log).toStdString());
+                    ShowBuildFailure(this, tr("Building the static recompiled executable failed."),
+                                     link_log_path, link_log);
+                    return {};
                 }
             } else {
                 LOG_ERROR(Frontend, "cmake could not configure the static launcher:\n{}",
                           conf_log.right(4000).toStdString());
+                ShowBuildFailure(this, tr("CMake could not configure the static recompiled executable."),
+                                 conf_log_path, conf_log);
+                return {};
             }
 
             if (link_rc == 0) {
@@ -2596,7 +2651,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         if (bat.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream out(&bat);
             out << "@echo off\n";
-            out << "\"" << game_name << ".exe\"\n";
+            out << "\"%~dp0" << game_name << ".exe\" %*\n";
             bat.close();
         }
 

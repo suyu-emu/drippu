@@ -364,6 +364,67 @@ fs::path FindBuiltExe(const fs::path& build, const char* name) {
     return {};
 }
 
+void TestMultiModuleLink(const fs::path& root) {
+    const fs::path out = root / "Sonic Mania source project";
+    for (const std::string mod : {"main", "rtld"}) {
+        fs::create_directories(out / mod);
+        const u32 text[] = {mod == "main" ? kMovzX0_5 : 0xD28000E0u, kSvc0};
+        suyu::recomp::EmitProject(mod, reinterpret_cast<const suyu::recomp::u8*>(text),
+                                  sizeof(text), 0x1000, (out / mod).string(), true);
+    }
+    // Build all forms together: source exports must also have unique CMake
+    // target names, even when RECOMP_STATIC_ONLY is not set by a host.
+    if (!WriteFile(out / "CMakeLists.txt", R"CMAKE(cmake_minimum_required(VERSION 3.13)
+project(suyu_recompiled_game LANGUAGES C)
+add_subdirectory(main)
+add_subdirectory(rtld)
+add_executable(multimodule_probe probe.c)
+target_link_libraries(multimodule_probe PRIVATE recomp_static_main recomp_static_rtld)
+add_custom_target(all_module_forms DEPENDS multimodule_probe recompiled_exe_main
+                  recompiled_exe_rtld recompiled_image recompiled_rtld)
+)CMAKE") || !WriteFile(out / "probe.c", R"C(
+#include "main/recomp_runtime.h"
+extern BlockFn recomp_image_lookup_main(uint64_t);
+extern BlockFn recomp_image_lookup_rtld(uint64_t);
+extern void recomp_image_set_base_main(uint64_t);
+extern void recomp_image_set_base_rtld(uint64_t);
+extern int recomp_image_index_main(uint64_t*, uint64_t*, BlockFn**);
+extern int recomp_image_index_rtld(uint64_t*, uint64_t*, BlockFn**);
+int main(void) {
+    uint64_t lo1, hi1, lo2, hi2;
+    BlockFn *idx1, *idx2;
+    GuestContext c = {0};
+    recomp_image_set_base_main(0x100000);
+    recomp_image_set_base_rtld(0x200000);
+    if (!recomp_image_index_main(&lo1, &hi1, &idx1) ||
+        !recomp_image_index_rtld(&lo2, &hi2, &idx2)) return 1;
+    if (lo1 != 0x101000 || lo2 != 0x201000 || idx1 == idx2) return 2;
+    BlockFn a = recomp_image_lookup_main(lo1);
+    BlockFn b = recomp_image_lookup_rtld(lo2);
+    if (!a || !b || a == b || idx1[0] != a || idx2[0] != b) return 3;
+    a(&c);
+    if (c.x[0] != 5) return 4;
+    b(&c);
+    if (c.x[0] != 7) return 5;
+    recomp_image_set_base_main(0x300000);
+    if (recomp_image_lookup_main(0x301000) != a ||
+        recomp_image_lookup_rtld(lo2) != b) return 6;
+    return 0;
+}
+)C")) {
+        return;
+    }
+    if (CmakeBuild(out, out / "build", "all_module_forms", false) != 0) {
+        return;
+    }
+    const fs::path exe = FindBuiltExe(out / "build", "multimodule_probe");
+    if (exe.empty() || RunArgs({exe.string()}) != 0) {
+        fail("multiple generated modules must link and keep separate lookup indexes");
+        return;
+    }
+    pass("multiple generated modules link and execute with independent indexes and bases");
+}
+
 void TestMemoryBoundaries(const fs::path& root) {
     // Drive the actual RuntimeC helpers with a crafted page table: guest page 0
     // and page 1 map to nonadjacent host regions, and a second case leaves page 1
@@ -946,6 +1007,7 @@ u64 FindGuestReturnStub(u64 mod_base, Read32&& read32, u64 scan_limit = 0x100000
 }
 
 void TestUnresolvedImportPolicy() {
+    using suyu::recomp::ResolveUndefinedWeakSymbol;
     using suyu::recomp::FormatUnresolvedImportDiagnostic;
     using suyu::recomp::IsUnresolvedImportTrap;
     using suyu::recomp::kUnresolvedImportTrap;
@@ -954,6 +1016,15 @@ void TestUnresolvedImportPolicy() {
     using suyu::recomp::UnresolvedReloc;
     using suyu::recomp::UnresolvedSlotTarget;
     using suyu::recomp::UnresolvedTrapAction;
+
+    if (ResolveUndefinedWeakSymbol(0x22, 0) != std::optional<u64>{0} ||
+        ResolveUndefinedWeakSymbol(0x21, 0x18) != std::optional<u64>{0x18} ||
+        ResolveUndefinedWeakSymbol(0x12, 0).has_value() ||
+        ResolveUndefinedWeakSymbol(0x02, 0).has_value()) {
+        fail("undefined weak symbols must resolve to zero plus addend, not a trap");
+    } else {
+        pass("undefined weak functions/data resolve to zero; strong imports still trap");
+    }
 
     const u64 base = 0x7100000000ULL;
     std::vector<u32> text(16, 0xD503201Fu);
@@ -1605,6 +1676,7 @@ int main() {
     std::cout << "exporter smoke workdir: " << root << std::endl;
     TestTranslatedShape();
     TestEmitProjectCompile(root);
+    TestMultiModuleLink(root);
     TestMemoryBoundaries(root);
     TestSdivProbes(root);
     TestBranchProbes(root);

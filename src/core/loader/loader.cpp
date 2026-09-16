@@ -88,7 +88,13 @@ bool HasApplicationProgramContent(const std::shared_ptr<FileSys::NSP>& nsp) {
 } // namespace
 
 FileType IdentifyFile(FileSys::VirtualFile file) {
-    if (const auto nsp_type = IdentifyFileLoader<AppLoader_NSP>(file)) {
+    // A plaintext NSO (including an exported ExeFS/main) needs no keys. Check
+    // its unambiguous magic before any encrypted-container probe: probing it
+    // as an NCA first unnecessarily initializes header decryption and can fail
+    // when an export is launched without the emulator's encryption keys.
+    if (const auto nso_type = IdentifyFileLoader<AppLoader_NSO>(file)) {
+        return *nso_type;
+    } else if (const auto nsp_type = IdentifyFileLoader<AppLoader_NSP>(file)) {
         return *nsp_type;
     } else if (const auto xci_type = IdentifyFileLoader<AppLoader_XCI>(file)) {
         return *xci_type;
@@ -100,8 +106,6 @@ FileType IdentifyFile(FileSys::VirtualFile file) {
         return *nax_type;
     } else if (const auto kip_type = IdentifyFileLoader<AppLoader_KIP>(file)) {
         return *kip_type;
-    } else if (const auto nso_type = IdentifyFileLoader<AppLoader_NSO>(file)) {
-        return *nso_type;
     } else if (const auto romdir_type =
                    IdentifyFileLoader<AppLoader_DeconstructedRomDirectory>(file)) {
         return *romdir_type;

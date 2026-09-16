@@ -544,6 +544,22 @@ struct ArmRecomp::Impl {
             modules_read = true;
             if (auto* process = thread->GetOwnerProcess()) {
                 modules = FindModules(process);
+                // Debug names embedded in rodata are not ExeFS identities:
+                // "main" may call itself "Sonic Mania NX.nss", and two
+                // different modules may both call themselves "nnSdk". Use
+                // the loader's actual filename/base map for the application,
+                // otherwise most images never get a base (or share one).
+                Loader::AppLoader::Modules loaded_modules;
+                // TryGetAppLoader: no title is loaded in the stack harness.
+                if (process == system.ApplicationProcess()) {
+                    if (auto* loader = system.TryGetAppLoader();
+                        loader &&
+                        loader->ReadNSOModules(loaded_modules) ==
+                            Loader::ResultStatus::Success &&
+                        !loaded_modules.empty()) {
+                        modules = std::move(loaded_modules);
+                    }
+                }
                 g_counters.RecordModules(modules);
                 // Now that the loader has placed everything, tell each image
                 // where its own module went.
@@ -552,6 +568,8 @@ struct ArmRecomp::Impl {
                     size_t index = 0;
                     for (const auto& [module_base, name] : modules) {
                         setter(index++, name.c_str(), module_base);
+                        LOG_INFO(Core_ARM, "recomp: registered module '{}' at {:#x}", name,
+                                 module_base);
                     }
                 }
             }
@@ -638,6 +656,7 @@ struct ArmRecomp::Impl {
     struct SymInfo {
         std::string name;
         u64 value = 0;
+        u8 info = 0;
         bool defined = false;
     };
     SymInfo ReadSymbol(const DynInfo& d, u32 index) {
@@ -646,6 +665,7 @@ struct ArmRecomp::Impl {
         if (!d.symtab_va) return s;
         const u64 sym_va = d.symtab_va + static_cast<u64>(index) * 24;
         const u32 name_off = mem.Read32(sym_va);
+        s.info = mem.Read8(sym_va + 4);
         // st_shndx is a 2-byte field at offset 6 (st_name(4) st_info(1)
         // st_other(1) st_shndx(2) st_value(8) st_size(8)) - reading 4 bytes
         // here previously spilled into st_value's low bytes, corrupting the
@@ -768,6 +788,12 @@ struct ArmRecomp::Impl {
                     ++applied;
                 } else if (auto it = exports.find(sym.name); it != exports.end()) {
                     mem.Write64(d.mod_base + r_offset, it->second + addend);
+                    ++applied;
+                } else if (const auto weak =
+                               suyu::recomp::ResolveUndefinedWeakSymbol(sym.info, addend)) {
+                    // SDK optional hooks test their GOT entry for null before
+                    // calling. A trap address makes that test pass and crashes.
+                    mem.Write64(d.mod_base + r_offset, *weak);
                     ++applied;
                 } else if (r_type == R_AARCH64_ABS64 && r_sym == 0) {
                     // STN_UNDEF ABS64: S is 0 by definition, so the result is

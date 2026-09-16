@@ -751,7 +751,7 @@ int main(int argc, char** argv) {
 
     bool any_recomp = false;
     for (uint32_t i = 0; i < suyu::recomp::kRecompMaxModules; ++i) {
-        if (s_recomp_modules.slots[i].lookup) {
+        if (s_recomp_modules.modules[i].lookup) {
             any_recomp = true;
             break;
         }
@@ -759,7 +759,7 @@ int main(int argc, char** argv) {
     if (any_recomp && !recomp_map_failed) {
         Core::SetRecompLookup([](u64 pc) -> Core::RecompBlockFn {
             for (uint32_t i = 0; i < suyu::recomp::kRecompMaxModules; ++i) {
-                if (auto lkp = s_recomp_modules.slots[i].lookup) {
+                if (auto lkp = s_recomp_modules.modules[i].lookup) {
                     if (auto fn = lkp(pc)) {
                         return fn;
                     }

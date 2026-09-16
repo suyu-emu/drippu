@@ -15,7 +15,7 @@ namespace suyu::recomp {
 
 /// Bump when emitted C / runtime contract changes in a way that stale caches
 /// must not be reused (independent of the on-disk image ABI version).
-inline constexpr uint32_t kRecompEmitterRevision = 1;
+inline constexpr uint32_t kRecompEmitterRevision = 2;
 
 /// Manifest schema written by the exporter after this identity-aware reuse
 /// policy. Older manifests without emitter_revision / module build IDs are

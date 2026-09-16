@@ -752,6 +752,14 @@ const Loader::AppLoader& System::GetAppLoader() const {
     return *impl->app_loader;
 }
 
+Loader::AppLoader* System::TryGetAppLoader() {
+    return impl->app_loader.get();
+}
+
+const Loader::AppLoader* System::TryGetAppLoader() const {
+    return impl->app_loader.get();
+}
+
 void System::SetFilesystem(FileSys::VirtualFilesystem vfs) {
     impl->virtual_filesystem = std::move(vfs);
 }

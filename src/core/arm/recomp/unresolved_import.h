@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -46,6 +47,17 @@ inline const char* UnresolvedRelocName(UnresolvedReloc kind) {
 
 inline u64 UnresolvedSlotTarget() {
     return kUnresolvedImportTrap;
+}
+
+// An absent ELF STB_WEAK symbol is an optional import, not a broken import.
+// Its symbol value is zero; ABS64 callers still apply their relocation addend.
+// Call only after looking for a definition in the loaded modules.
+inline std::optional<u64> ResolveUndefinedWeakSymbol(uint8_t symbol_info, u64 addend) {
+    constexpr uint8_t kStbWeak = 2;
+    if ((symbol_info >> 4) == kStbWeak) {
+        return addend;
+    }
+    return std::nullopt;
 }
 
 inline bool IsUnresolvedImportTrap(u64 pc) {

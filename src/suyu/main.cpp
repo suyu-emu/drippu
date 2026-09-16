@@ -6708,8 +6708,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, const QString& gam
                 }
             }
         }
-        if (!record && index < suyu::recomp::kRecompMaxModules && loaded_map.slots[index].abi) {
-            const auto* abi = loaded_map.slots[index].abi;
+        if (!record && index < suyu::recomp::kRecompMaxModules && loaded_map.modules[index].abi) {
+            const auto* abi = loaded_map.modules[index].abi;
             // Only trust the dense index when the slot already matches this name
             // (or the guest supplied no name).
             if (!name.empty() && abi->module_name[0] != '\0' &&
@@ -6721,7 +6721,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, const QString& gam
             if (abi) {
                 for (auto& rec : loaded_records) {
                     if (rec.abi == abi) {
-                        rec.base = loaded_map.slots[index].base;
+                        rec.base = loaded_map.modules[index].base;
                         record = &rec;
                         break;
                     }
@@ -8426,7 +8426,7 @@ int main(int argc, char* argv[]) {
     // Keep organization/application names stable for config paths; display as drippu.
     QCoreApplication::setOrganizationName(QStringLiteral("suyu team"));
     QCoreApplication::setApplicationName(QStringLiteral("suyu"));
-    QCoreApplication::setApplicationDisplayName(QStringLiteral("drippu"));
+    QApplication::setApplicationDisplayName(QStringLiteral("drippu"));
 
 #ifdef _WIN32
     QByteArray current_qt_qpa = qgetenv("QT_QPA_PLATFORM");
