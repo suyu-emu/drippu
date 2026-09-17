@@ -68,6 +68,7 @@
 #include "core/memory.h"
 #include "core/recompiler/arm64_to_c.h"
 #include "smoke_config.h"
+#include "tests/recompiler/insn_correctness.h"
 
 namespace fs = std::filesystem;
 using suyu::recomp::u32;
@@ -113,6 +114,17 @@ std::string Quote(const std::string& s) {
     return "'" + s + "'";
 }
 #endif
+
+void AppendSanitizerCmakeArgs(std::vector<std::string>& cfg) {
+    const char* flags = SUYU_SMOKE_SANITIZER_FLAGS;
+    if (!flags || flags[0] == '\0') {
+        return;
+    }
+    cfg.push_back(std::string("-DCMAKE_C_FLAGS=") + flags);
+    cfg.push_back(std::string("-DCMAKE_CXX_FLAGS=") + flags);
+    cfg.push_back(std::string("-DCMAKE_EXE_LINKER_FLAGS=") + flags);
+    cfg.push_back(std::string("-DCMAKE_SHARED_LINKER_FLAGS=") + flags);
+}
 
 int RunArgs(const std::vector<std::string>& args) {
     if (args.empty()) {
@@ -169,9 +181,10 @@ constexpr u64 kOffCrossPage = 0x1FFC;
 constexpr u64 kOffBench = 0x2400;
 constexpr int kBenchAdds = 512;
 constexpr u32 kBenchSvcImm = 3;
-constexpr u64 kCodeBytes = 4 * Kernel::PageSize;
-constexpr u64 kImageBytes = 5 * Kernel::PageSize;
+constexpr u64 kCodeBytes = 5 * Kernel::PageSize;
+constexpr u64 kImageBytes = 6 * Kernel::PageSize;
 constexpr u64 kOffBenchScratch = kCodeBytes; // data-segment word STR/LDR bounce
+constexpr u64 kOffInsnScratch = kCodeBytes + 0x40;
 
 // AArch64 encodings (also written into guest RX).
 constexpr u32 kMovzX0_1234 = 0xD2824680u;
@@ -210,6 +223,7 @@ BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
 BlockFn g_block_step_no_svc = nullptr;
 BlockFn g_block_bench = nullptr;
+BlockFn g_block_insn[suyu::recomp::insn_test::kInsnBlockCount]{};
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
 
@@ -739,6 +753,14 @@ Core::RecompBlockFn Lookup(u64 pc) {
     if (pc == g_entry + kOffBench) {
         return g_block_bench;
     }
+    if (pc >= g_entry + suyu::recomp::insn_test::kOffInsn) {
+        const u64 rel = pc - (g_entry + suyu::recomp::insn_test::kOffInsn);
+        const u64 idx = rel / suyu::recomp::insn_test::kInsnStride;
+        if (idx < static_cast<u64>(suyu::recomp::insn_test::kInsnBlockCount) &&
+            rel % suyu::recomp::insn_test::kInsnStride == 0) {
+            return g_block_insn[idx];
+        }
+    }
     return nullptr;
 }
 
@@ -816,6 +838,52 @@ void recomp_store64(GuestContext* c, uint64_t a, uint64_t v) {
     const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
     if (hm && hm->store) hm->store(hm->user, a, 8, v);
 }
+uint64_t recomp_load8(GuestContext* c, uint64_t a) {
+    const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
+    if (hm && hm->load) return hm->load(hm->user, a, 1);
+    return 0;
+}
+uint64_t recomp_load16(GuestContext* c, uint64_t a) {
+    const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
+    if (hm && hm->load) return hm->load(hm->user, a, 2);
+    return 0;
+}
+uint64_t recomp_load32(GuestContext* c, uint64_t a) {
+    const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
+    if (hm && hm->load) return hm->load(hm->user, a, 4);
+    return 0;
+}
+void recomp_store8(GuestContext* c, uint64_t a, uint64_t v) {
+    const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
+    if (hm && hm->store) hm->store(hm->user, a, 1, v);
+}
+void recomp_store16(GuestContext* c, uint64_t a, uint64_t v) {
+    const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
+    if (hm && hm->store) hm->store(hm->user, a, 2, v);
+}
+void recomp_store32(GuestContext* c, uint64_t a, uint64_t v) {
+    const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
+    if (hm && hm->store) hm->store(hm->user, a, 4, v);
+}
+void recomp_set_flags(GuestContext* c,int is_sub,uint64_t a,uint64_t b,uint64_t r,int is64){
+    uint64_t m=is64?~0ULL:0xFFFFFFFFULL; r&=m;a&=m;b&=m;
+    uint64_t s=is64?0x8000000000000000ULL:0x80000000ULL;
+    c->z=(r==0); c->n=(r&s)?1:0;
+    if(is_sub){ c->c=(a>=b); c->v=(((a^b)&(a^r))&s)?1:0; }
+    else { c->c=(r<a); c->v=((~(a^b)&(a^r))&s)?1:0; }
+}
+uint64_t recomp_umulh(uint64_t a,uint64_t b){
+    uint64_t al=a&0xFFFFFFFFULL, ah=a>>32, bl=b&0xFFFFFFFFULL, bh=b>>32;
+    uint64_t ll=al*bl, lh=al*bh, hl=ah*bl, hh=ah*bh;
+    uint64_t mid=(ll>>32)+(lh&0xFFFFFFFFULL)+(hl&0xFFFFFFFFULL);
+    return hh+(lh>>32)+(hl>>32)+(mid>>32);
+}
+uint64_t recomp_smulh(uint64_t a,uint64_t b){
+    uint64_t hi=recomp_umulh(a,b);
+    if((int64_t)a<0) hi-=b;
+    if((int64_t)b<0) hi-=a;
+    return hi;
+}
 
 void block_tls_svc(GuestContext* c) {
 )C";
@@ -883,6 +951,24 @@ void block_bench(GuestContext* c) {
     g_aot_compile.bench_c_bytes = bench_c;
     src << R"C(}
 )C";
+
+    const auto insn_blocks = suyu::recomp::insn_test::ReferenceBlocks();
+    for (size_t bi = 0; bi < insn_blocks.size(); ++bi) {
+        src << "void block_insn_" << bi << "(GuestContext* c) {\n";
+        u64 pc = insn_blocks[bi].offset;
+        for (u32 enc : insn_blocks[bi].insns) {
+            bool unhandled = false;
+            std::string body;
+            suyu::recomp::Translate(enc, pc, body, &unhandled);
+            if (unhandled) {
+                Fail(std::string("insn block ") + insn_blocks[bi].name +
+                     " Translate unhandled");
+            }
+            src << body;
+            pc += 4;
+        }
+        src << "}\n";
+    }
     return src.str();
 }
 
@@ -932,6 +1018,7 @@ bool BuildAndLoadAot(const fs::path& root) {
     const fs::path build = src_dir / "build";
     std::vector<std::string> cfg{SUYU_SMOKE_CMAKE, "-S", src_dir.string(), "-B", build.string(),
                                  "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_STANDARD=11"};
+    AppendSanitizerCmakeArgs(cfg);
     const std::string gen = SUYU_SMOKE_GENERATOR;
     if (!gen.empty()) {
         cfg.push_back("-G");
@@ -995,6 +1082,11 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
     g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
+    for (int i = 0; i < suyu::recomp::insn_test::kInsnBlockCount; ++i) {
+        const std::string sym = "block_insn_" + std::to_string(i);
+        g_block_insn[i] = reinterpret_cast<BlockFn>(dlsym(g_so, sym.c_str()));
+        ExpectTrue(("dlsym " + sym).c_str(), g_block_insn[i] != nullptr);
+    }
     g_hm_load_calls = static_cast<u64*>(dlsym(g_so, "g_recomp_hm_load_calls"));
     g_hm_store_calls = static_cast<u64*>(dlsym(g_so, "g_recomp_hm_store_calls"));
     ExpectTrue("dlsym recomp_set_module_base", g_set_base != nullptr);
@@ -1009,7 +1101,8 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym g_recomp_hm_store_calls", g_hm_store_calls != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
            g_block_plain && g_block_step_no_svc && g_block_bench && g_hm_load_calls &&
-           g_hm_store_calls;
+           g_hm_store_calls && g_block_insn[0] &&
+           g_block_insn[suyu::recomp::insn_test::kInsnBlockCount - 1];
 #endif
 }
 
@@ -1042,6 +1135,13 @@ void WriteGuestImage(std::vector<u8>& image) {
     put(kOffStepNoSvc, kMovzX0_7);
     for (const auto& [off, enc] : BenchInsns()) {
         put(off, enc);
+    }
+    for (const auto& blk : suyu::recomp::insn_test::ReferenceBlocks()) {
+        u64 off = blk.offset;
+        for (u32 enc : blk.insns) {
+            put(off, enc);
+            off += 4;
+        }
     }
 }
 
@@ -1478,6 +1578,209 @@ void ScenarioStepMiss(StackFixture& f) {
     ExpectEq("step-miss pc", out.pc, g_entry + kOffMiss + 4);
     ExpectTrue("step-miss HaltReason::StepThread", True(hr & Core::HaltReason::StepThread));
     ScenarioPass("StepThread force-miss of registered AOT uses Dynarmic step", before);
+}
+
+void FillThreadRegs(Kernel::Svc::ThreadContext& ctx, const u64 x[32]) {
+    ctx = {};
+    for (int i = 0; i < 29; ++i) {
+        ctx.r[static_cast<size_t>(i)] = x[i];
+    }
+    ctx.fp = x[29];
+    ctx.lr = x[30];
+    ctx.sp = x[31];
+    ctx.pstate = (1u << 29) | (1u << 28); // C=V=1; ANDS must clear them (A64/Dynarmic)
+}
+
+u32 Nzcv(const Kernel::Svc::ThreadContext& ctx) {
+    return ctx.pstate & 0xF0000000u;
+}
+
+u64 Gpr(const Kernel::Svc::ThreadContext& ctx, int i) {
+    if (i < 29) {
+        return ctx.r[static_cast<size_t>(i)];
+    }
+    if (i == 29) {
+        return ctx.fp;
+    }
+    if (i == 30) {
+        return ctx.lr;
+    }
+    return ctx.sp;
+}
+
+bool SameGprsNzcv(const Kernel::Svc::ThreadContext& a, const Kernel::Svc::ThreadContext& b,
+                  const char* tag) {
+    bool ok = true;
+    for (int i = 0; i < 32; ++i) {
+        if (Gpr(a, i) != Gpr(b, i)) {
+            Fail(std::string(tag) + " x" + std::to_string(i) + " aot=" +
+                 std::to_string(Gpr(a, i)) + " dyn=" + std::to_string(Gpr(b, i)));
+            ok = false;
+        }
+    }
+    if (a.pc != b.pc) {
+        Fail(std::string(tag) + " pc aot=" + std::to_string(a.pc) + " dyn=" + std::to_string(b.pc));
+        ok = false;
+    }
+    if (Nzcv(a) != Nzcv(b)) {
+        Fail(std::string(tag) + " nzcv aot=" + std::to_string(Nzcv(a)) +
+             " dyn=" + std::to_string(Nzcv(b)));
+        ok = false;
+    }
+    return ok;
+}
+
+struct InsnSnap {
+    Kernel::Svc::ThreadContext ctx{};
+    u32 svc{};
+    bool halt_svc{};
+    u64 mem0{};
+    u8 mem8{};
+};
+
+InsnSnap RunInsnBackend(StackFixture& f, u64 pc, bool aot, const Kernel::Svc::ThreadContext& init) {
+    g_force_miss_pc = aot ? 0 : pc;
+    auto& tctx = f.thread->GetContext();
+    tctx = init;
+    tctx.pc = pc;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto hr = f.arm->RunThread(f.thread);
+    g_force_miss_pc = 0;
+    InsnSnap s;
+    f.arm->GetContext(s.ctx);
+    s.svc = f.arm->GetSvcNumber();
+    s.halt_svc = True(hr & Core::HaltReason::SupervisorCall);
+    s.mem0 = f.system.ApplicationMemory().Read64(g_entry + kOffInsnScratch);
+    s.mem8 = static_cast<u8>(f.system.ApplicationMemory().Read8(g_entry + kOffInsnScratch + 8));
+    return s;
+}
+
+void SeedInsnScratch(StackFixture& f, u64 word, u8 b) {
+    f.system.ApplicationMemory().Write64(g_entry + kOffInsnScratch, word);
+    f.system.ApplicationMemory().Write8(g_entry + kOffInsnScratch + 8, b);
+}
+
+void ScenarioInsnCorrectness(StackFixture& f) {
+    const int before = g_fails;
+    const auto blocks = suyu::recomp::insn_test::ReferenceBlocks();
+    ExpectEq("insn block count", static_cast<u64>(blocks.size()),
+             static_cast<u64>(suyu::recomp::insn_test::kInsnBlockCount));
+
+    for (size_t bi = 0; bi < blocks.size(); ++bi) {
+        const u64 pc = g_entry + blocks[bi].offset;
+        ExpectEq(("guest RX insn " + std::string(blocks[bi].name)).c_str(),
+                 f.system.ApplicationMemory().Read32(pc), blocks[bi].insns.front());
+        ExpectTrue(("AOT registered " + std::string(blocks[bi].name)).c_str(),
+                   Lookup(pc) == g_block_insn[bi] && g_block_insn[bi] != nullptr);
+    }
+
+    suyu::recomp::insn_test::XorShift64 rng(suyu::recomp::insn_test::RandomSeed());
+    const int trials = suyu::recomp::insn_test::RandomTrials();
+
+    auto one = [&](const suyu::recomp::insn_test::RefBlock& blk, const u64 x[32], const char* tag) {
+        Kernel::Svc::ThreadContext init{};
+        FillThreadRegs(init, x);
+        init.pc = g_entry + blk.offset;
+        SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
+        const InsnSnap aot = RunInsnBackend(f, g_entry + blk.offset, true, init);
+        SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
+        const InsnSnap dyn = RunInsnBackend(f, g_entry + blk.offset, false, init);
+        if (!aot.halt_svc || !dyn.halt_svc) {
+            Fail(std::string(tag) + " missing SupervisorCall aot=" +
+                 std::to_string(aot.halt_svc) + " dyn=" + std::to_string(dyn.halt_svc));
+        }
+        if (aot.svc != suyu::recomp::insn_test::kInsnSvcImm ||
+            dyn.svc != suyu::recomp::insn_test::kInsnSvcImm) {
+            Fail(std::string(tag) + " svc aot=" + std::to_string(aot.svc) +
+                 " dyn=" + std::to_string(dyn.svc));
+        }
+        SameGprsNzcv(aot.ctx, dyn.ctx, tag);
+        if (std::string_view(blk.name) == "logic_flags") {
+            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS write C=V=0.
+            // This fails if AOT left those bits stale even when N/Z match.
+            if ((Nzcv(aot.ctx) & 0x30000000u) != 0) {
+                Fail(std::string(tag) + " AOT ANDS left C/V stale nzcv=" +
+                     std::to_string(Nzcv(aot.ctx)));
+            }
+            if ((Nzcv(dyn.ctx) & 0x30000000u) != 0) {
+                Fail(std::string(tag) + " Dynarmic ANDS C/V not 0 nzcv=" +
+                     std::to_string(Nzcv(dyn.ctx)));
+            }
+        }
+        if (aot.mem0 != dyn.mem0 || aot.mem8 != dyn.mem8) {
+            Fail(std::string(tag) + " mem mismatch");
+        }
+    };
+
+    for (const auto& blk : blocks) {
+        u64 edge[32]{};
+        if (std::string_view(blk.name) == "edge_sdiv") {
+            edge[1] = 0x8000000000000000ULL; // INT64_MIN
+            edge[2] = ~0ULL;                 // -1
+            edge[4] = 0xFFFFFFFF80000000ULL; // INT32_MIN in W4
+            edge[5] = ~0ULL;
+        } else if (std::string_view(blk.name) == "mem") {
+            edge[1] = g_entry + kOffInsnScratch;
+            edge[2] = 0xA1B2C3D4E5F60718ULL;
+            edge[3] = 0x9E; // STRB
+        } else {
+            edge[1] = ~0ULL;
+            edge[2] = 1;
+            edge[3] = 3;
+            edge[4] = 0xFFFFFFFFULL;
+            edge[5] = 1;
+            edge[13] = static_cast<u64>(static_cast<int32_t>(-5)); // BIC ASR#31
+        }
+        if (std::string_view(blk.name) == "shift_div") {
+            edge[1] = 0x8000000000000000ULL;
+            edge[2] = 1;
+        }
+        one(blk, edge, (std::string(blk.name) + " edge").c_str());
+
+        u64 wrap[32]{};
+        wrap[1] = 0xFFFFFFFFULL;
+        wrap[2] = 1;
+        wrap[3] = 7;
+        wrap[4] = 0xFFFFFFFFULL;
+        wrap[5] = 1;
+        if (std::string_view(blk.name) == "mem") {
+            wrap[1] = g_entry + kOffInsnScratch;
+            wrap[2] = ~0ULL;
+            wrap[3] = 0xFF;
+        }
+        one(blk, wrap, (std::string(blk.name) + " wrap").c_str());
+
+        for (int t = 0; t < trials; ++t) {
+            u64 rnd[32]{};
+            for (int r = 0; r < 16; ++r) {
+                rnd[r] = rng.next();
+            }
+            if (std::string_view(blk.name) == "mem") {
+                rnd[1] = g_entry + kOffInsnScratch;
+            }
+            if (std::string_view(blk.name) == "shift_div" ||
+                std::string_view(blk.name) == "edge_sdiv") {
+                // Keep divisors from exploding the comparison: still random, but
+                // include 0 often enough via the wrap/edge cases.
+                if (rnd[2] == 0) {
+                    rnd[2] = 3;
+                }
+                if ((rnd[5] & 0xFFFFFFFFULL) == 0) {
+                    rnd[5] = 5;
+                }
+            }
+            one(blk, rnd, (std::string(blk.name) + " rand" + std::to_string(t)).c_str());
+            if (g_fails != before) {
+                break;
+            }
+        }
+        if (g_fails != before) {
+            break;
+        }
+    }
+
+    ScenarioPass("Translate AOT vs Dynarmic instruction correctness (edge + random)", before);
+    Pass("ANDS C/V: AOT writes 0 (A64/Dynarmic); full NZCV vs Dynarmic; stale C/V fails");
 }
 
 void ExportExecutionJson(const fs::path& path) {
@@ -1927,7 +2230,7 @@ void PrintGaps() {
         << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
         << "  - AOT .so size includes non-bench integration blocks\n"
         << "  - Bench slice is ADD+STR+LDR (anti-fold), not a pure ALU stream\n"
-        << "  - #4 instruction correctness, #5 compatibility, #6 opts, #7 release-gate\n"
+        << "  - #5 compatibility, #6 opts, #7 release-gate\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
@@ -1936,7 +2239,8 @@ void PrintGaps() {
         << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json),\n"
         << "  JudgeAotBenchDump FAILs discriminating PLT dump (counts lock PLT vs loop);\n"
         << "  live gcc -O3 PASS; named store/load PLT not required; host_mem callbacks "
-           "512 x iters.\n";
+           "512 x iters.\n"
+        << "  #4 Translate AOT vs Dynarmic instruction correctness (edge + random inputs).\n";
 }
 
 } // namespace
@@ -1945,7 +2249,7 @@ int main() {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
     std::cout << "recomp_stack_harness: SetRecompLookup ArmRecomp + Translate AOT + Dynarmic\n";
-    std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark)\n";
+    std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark + insn correctness)\n";
 
     ScenarioFoldPinSelfCheck();
 
@@ -1969,6 +2273,7 @@ int main() {
     // Force-miss + unhandled need AllowsAot (registered Translate blocks).
     ScenarioForceMissRegistered(*fix);
     ScenarioUnhandledFallback(*fix);
+    ScenarioInsnCorrectness(*fix);
     // ClearInstructionCache permanently refuses AOT; run after the above.
     ScenarioInvalidation(*fix);
     ScenarioRestart(*fix);

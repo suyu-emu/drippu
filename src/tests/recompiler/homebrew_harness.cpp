@@ -22,6 +22,7 @@
 #include "core/arm/recomp/recomp_icache.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "smoke_config.h"
+#include "tests/recompiler/insn_correctness.h"
 
 #include <chrono>
 #include <cstdint>
@@ -153,10 +154,22 @@ bool WriteFile(const fs::path& path, std::string_view text) {
     return static_cast<bool>(out);
 }
 
+void AppendSanitizerCmakeArgs(std::vector<std::string>& cfg) {
+    const char* flags = SUYU_SMOKE_SANITIZER_FLAGS;
+    if (!flags || flags[0] == '\0') {
+        return;
+    }
+    cfg.push_back(std::string("-DCMAKE_C_FLAGS=") + flags);
+    cfg.push_back(std::string("-DCMAKE_CXX_FLAGS=") + flags);
+    cfg.push_back(std::string("-DCMAKE_EXE_LINKER_FLAGS=") + flags);
+    cfg.push_back(std::string("-DCMAKE_SHARED_LINKER_FLAGS=") + flags);
+}
+
 int CmakeBuild(const fs::path& src, const fs::path& build, const char* target) {
     std::vector<std::string> cfg{SUYU_SMOKE_CMAKE, "-S", src.string(), "-B", build.string(),
                                  "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_STANDARD=11",
                                  "-DCMAKE_C_EXTENSIONS=OFF"};
+    AppendSanitizerCmakeArgs(cfg);
     const std::string gen = SUYU_SMOKE_GENERATOR;
     if (!gen.empty()) {
         cfg.push_back("-G");
@@ -787,6 +800,354 @@ void TestHomebrewRuntimeProbe(const fs::path& root) {
     pass("homebrew runtime probe (SVC/TLS/mem/fallback/step/invalidate/relaunch)");
 }
 
+std::string BuildInsnProbeSource() {
+    using namespace suyu::recomp::insn_test;
+    const auto catalog = Catalog();
+
+    std::ostringstream src;
+    src << R"C(#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <limits.h>
+
+typedef struct GuestContext {
+    uint64_t x[32];
+    uint64_t pc;
+    uint8_t n, z, c, v;
+    uint8_t* mem;
+    uint64_t mem_size;
+    uint64_t mem_base_vaddr;
+    int halted;
+    uint64_t pending_svc;
+    uint64_t vreg[32][2];
+    uint64_t tpidr_el0;
+    const void* host_mem;
+    uint64_t tpidrro_el0;
+    uint64_t fpcr;
+    uint64_t fpsr;
+    int chain_budget;
+} GuestContext;
+
+uint64_t g_module_base = 0;
+static int g_fail = 0;
+
+static void expect_eq(const char* name, uint64_t got, uint64_t want) {
+    if (got != want) {
+        printf("FAIL %s: got=%llx want=%llx\n", name,
+               (unsigned long long)got, (unsigned long long)want);
+        g_fail = 1;
+    }
+}
+
+void recomp_svc(GuestContext* c, unsigned imm) { (void)c; (void)imm; }
+void recomp_unhandled(GuestContext* c, uint32_t insn, uint64_t pc) {
+    (void)insn;
+    c->pc = pc;
+    c->halted = 2;
+}
+static uint64_t memload(GuestContext* c, uint64_t a, unsigned sz) {
+    if (!c->mem || a < c->mem_base_vaddr ||
+        a + sz > c->mem_base_vaddr + c->mem_size) {
+        return 0;
+    }
+    uint64_t v = 0;
+    memcpy(&v, c->mem + (a - c->mem_base_vaddr), sz);
+    return v;
+}
+static void memstore(GuestContext* c, uint64_t a, unsigned sz, uint64_t v) {
+    if (!c->mem || a < c->mem_base_vaddr ||
+        a + sz > c->mem_base_vaddr + c->mem_size) {
+        return;
+    }
+    memcpy(c->mem + (a - c->mem_base_vaddr), &v, sz);
+}
+uint64_t recomp_load8(GuestContext* c, uint64_t a) { return memload(c, a, 1); }
+uint64_t recomp_load16(GuestContext* c, uint64_t a) { return memload(c, a, 2); }
+uint64_t recomp_load32(GuestContext* c, uint64_t a) { return memload(c, a, 4); }
+uint64_t recomp_load64(GuestContext* c, uint64_t a) { return memload(c, a, 8); }
+void recomp_store8(GuestContext* c, uint64_t a, uint64_t v) { memstore(c, a, 1, v); }
+void recomp_store16(GuestContext* c, uint64_t a, uint64_t v) { memstore(c, a, 2, v); }
+void recomp_store32(GuestContext* c, uint64_t a, uint64_t v) { memstore(c, a, 4, v); }
+void recomp_store64(GuestContext* c, uint64_t a, uint64_t v) { memstore(c, a, 8, v); }
+void recomp_set_flags(GuestContext* c, int is_sub, uint64_t a, uint64_t b, uint64_t r, int is64) {
+    uint64_t m = is64 ? ~0ULL : 0xFFFFFFFFULL;
+    r &= m; a &= m; b &= m;
+    uint64_t s = is64 ? 0x8000000000000000ULL : 0x80000000ULL;
+    c->z = (r == 0); c->n = (r & s) ? 1 : 0;
+    if (is_sub) { c->c = (a >= b); c->v = (((a ^ b) & (a ^ r)) & s) ? 1 : 0; }
+    else { c->c = (r < a); c->v = ((~(a ^ b) & (a ^ r)) & s) ? 1 : 0; }
+}
+uint64_t recomp_umulh(uint64_t a, uint64_t b) {
+    uint64_t al = a & 0xFFFFFFFFULL, ah = a >> 32, bl = b & 0xFFFFFFFFULL, bh = b >> 32;
+    uint64_t ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+    uint64_t mid = (ll >> 32) + (lh & 0xFFFFFFFFULL) + (hl & 0xFFFFFFFFULL);
+    return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+uint64_t recomp_smulh(uint64_t a, uint64_t b) {
+    uint64_t hi = recomp_umulh(a, b);
+    if ((int64_t)a < 0) hi -= b;
+    if ((int64_t)b < 0) hi -= a;
+    return hi;
+}
+
+typedef void (*InsnFn)(GuestContext*);
+)C";
+
+    for (size_t i = 0; i < catalog.size(); ++i) {
+        std::string body;
+        if (!TranslateOk(catalog[i].encoding, 0x1000 + 4 * i, &body)) {
+            fail(std::string("catalog Translate unhandled: ") + catalog[i].name);
+            continue;
+        }
+        src << "static void insn_" << i << "(GuestContext* c) {\n" << body << "}\n";
+    }
+
+    src << "typedef enum {\n";
+    src << "    K_Add64 = 1, K_Add32, K_Sub64, K_Sub32, K_Adds64, K_Subs64,\n";
+    src << "    K_And64, K_Orr64, K_Eor64, K_Ands64, K_BicAsr31W, K_AddImm64,\n";
+    src << "    K_Movz64, K_Movk64, K_Movn64, K_Udiv64, K_Sdiv64, K_Udiv32, K_Sdiv32,\n";
+    src << "    K_Lslv64, K_Lsrv64, K_Asrv64, K_Rorv64, K_Lslv32, K_Asrv32, K_Madd64,\n";
+    src << "    K_Str64, K_Ldr64, K_Strb, K_Ldrb, K_Ldrsb64\n";
+    src << "} Kind;\n";
+
+    src << "typedef struct { const char* name; Kind kind; InsnFn fn; } Case;\n";
+    src << "static const Case kCases[] = {\n";
+    for (size_t i = 0; i < catalog.size(); ++i) {
+        src << "    {\"" << catalog[i].name << "\", (Kind)" << static_cast<int>(catalog[i].kind)
+            << ", insn_" << i << "},\n";
+    }
+    src << "};\n";
+    src << "static const int kNCases = (int)(sizeof kCases / sizeof kCases[0]);\n";
+
+    src << R"C(
+static uint64_t xs_state;
+static uint64_t xs_next(void) {
+    uint64_t x = xs_state;
+    x ^= x << 7; x ^= x >> 9; x ^= x << 8;
+    xs_state = x;
+    return x;
+}
+
+/* Independent ARM-spec expected values (not copied from Translate output). */
+static uint64_t expect_result(Kind k, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
+    switch (k) {
+    case K_Add64: return x1 + x2;
+    case K_Add32: return (uint64_t)(uint32_t)((uint32_t)x1 + (uint32_t)x2);
+    case K_Sub64: return x1 - x2;
+    case K_Sub32: return (uint64_t)(uint32_t)((uint32_t)x1 - (uint32_t)x2);
+    case K_Adds64: return x1 + x2;
+    case K_Subs64: return x1 - x2;
+    case K_And64: return x1 & x2;
+    case K_Orr64: return x1 | x2;
+    case K_Eor64: return x1 ^ x2;
+    case K_Ands64: return x1 & x2;
+    case K_BicAsr31W: {
+        uint32_t a = (uint32_t)x0;
+        uint32_t sh = (uint32_t)((int32_t)a >> 31);
+        return (uint64_t)(uint32_t)(a & ~sh);
+    }
+    case K_AddImm64: return x1 + 1;
+    case K_Movz64: return 0x1234;
+    case K_Movk64: return (x0 & ~(0xFFFFULL << 16)) | (0xABCDULL << 16);
+    case K_Movn64: return ~0ULL;
+    case K_Udiv64: return x2 ? x1 / x2 : 0;
+    case K_Sdiv64: {
+        int64_t a = (int64_t)x1, b = (int64_t)x2;
+        if (!b) return 0;
+        if (a == INT64_MIN && b == -1) return (uint64_t)a;
+        return (uint64_t)(a / b);
+    }
+    case K_Udiv32: {
+        uint32_t a = (uint32_t)x1, b = (uint32_t)x2;
+        return b ? (uint64_t)(a / b) : 0;
+    }
+    case K_Sdiv32: {
+        int32_t a = (int32_t)(uint32_t)x1, b = (int32_t)(uint32_t)x2;
+        if (!b) return 0;
+        if (a == INT32_MIN && b == -1) return (uint64_t)(uint32_t)a;
+        return (uint64_t)(uint32_t)(a / b);
+    }
+    case K_Lslv64: return x1 << (x2 & 63);
+    case K_Lsrv64: return x1 >> (x2 & 63);
+    case K_Asrv64: return (uint64_t)((int64_t)x1 >> (x2 & 63));
+    case K_Rorv64: {
+        uint64_t s = x2 & 63;
+        return s ? ((x1 >> s) | (x1 << (64 - s))) : x1;
+    }
+    case K_Lslv32: return (uint64_t)(uint32_t)((uint32_t)x1 << (x2 & 31));
+    case K_Asrv32: return (uint64_t)(uint32_t)((int32_t)(uint32_t)x1 >> (x2 & 31));
+    case K_Madd64: return x3 + x1 * x2;
+    default: return 0;
+    }
+}
+
+static int is_mem(Kind k) {
+    return k == K_Str64 || k == K_Ldr64 || k == K_Strb || k == K_Ldrb || k == K_Ldrsb64;
+}
+
+static void reset_ctx(GuestContext* c, uint8_t* mem, uint64_t memsz) {
+    memset(c, 0, sizeof *c);
+    c->mem = mem;
+    c->mem_base_vaddr = 0x8000;
+    c->mem_size = memsz;
+    c->pending_svc = ~0ULL;
+}
+
+static void apply_mem_expect(Kind k, GuestContext* c, uint64_t x0, uint64_t addr) {
+    uint64_t off = addr - c->mem_base_vaddr;
+    if (k == K_Str64) {
+        uint64_t got = 0;
+        memcpy(&got, c->mem + off, 8);
+        expect_eq("str64_mem", got, x0);
+    } else if (k == K_Ldr64) {
+        uint64_t want = 0;
+        memcpy(&want, c->mem + off, 8);
+        expect_eq("ldr64_x0", c->x[0], want);
+    } else if (k == K_Strb) {
+        expect_eq("strb_mem", (uint64_t)c->mem[off], x0 & 0xFF);
+    } else if (k == K_Ldrb) {
+        expect_eq("ldrb_x0", c->x[0], (uint64_t)c->mem[off]);
+    } else if (k == K_Ldrsb64) {
+        expect_eq("ldrsb_x0", c->x[0], (uint64_t)(int64_t)(int8_t)c->mem[off]);
+    }
+}
+
+static void run_one(const Case* cs, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
+                    uint8_t preset_c) {
+    uint8_t mem[256];
+    memset(mem, 0xA5, sizeof mem);
+    mem[0] = 0x80; /* for LDRSB: -128 */
+    GuestContext c;
+    reset_ctx(&c, mem, sizeof mem);
+    c.x[0] = x0; c.x[1] = x1; c.x[2] = x2; c.x[3] = x3;
+    c.c = preset_c; c.n = 1; c.z = 0; c.v = 1;
+    if (is_mem(cs->kind)) {
+        c.x[1] = c.mem_base_vaddr;
+    }
+    cs->fn(&c);
+    if (c.halted) {
+        expect_eq(cs->name, 1, 0);
+        return;
+    }
+    if (is_mem(cs->kind)) {
+        apply_mem_expect(cs->kind, &c, x0, c.mem_base_vaddr);
+        return;
+    }
+    uint64_t want = expect_result(cs->kind, x0, x1, x2, x3);
+    expect_eq(cs->name, c.x[0], want);
+    if (cs->kind == K_Adds64 || cs->kind == K_Subs64) {
+        int is_sub = cs->kind == K_Subs64;
+        uint64_t r = want, a = x1, b = x2, s = 0x8000000000000000ULL;
+        uint8_t ez = (r == 0), en = (r & s) ? 1 : 0;
+        uint8_t ec = is_sub ? (a >= b) : (r < a);
+        uint8_t ev = is_sub ? ((((a ^ b) & (a ^ r)) & s) ? 1 : 0)
+                            : (((~(a ^ b) & (a ^ r)) & s) ? 1 : 0);
+        expect_eq("nzcv.n", c.n, en);
+        expect_eq("nzcv.z", c.z, ez);
+        expect_eq("nzcv.c", c.c, ec);
+        expect_eq("nzcv.v", c.v, ev);
+    }
+    if (cs->kind == K_Ands64) {
+        expect_eq("ands.z", c.z, (want == 0));
+        expect_eq("ands.n", c.n, (want >> 63) & 1);
+        /* A64/Dynarmic write C=V=0. preset_c/v start 1 on most trials so a
+           stale leave-C/V-alone emit fails these. */
+        expect_eq("ands.c_cleared", c.c, 0);
+        expect_eq("ands.v_cleared", c.v, 0);
+    }
+}
+
+static void edge_inputs(const Case* cs) {
+    /* wrap / overflow / div0 / INT_MIN / -1 / shifts at width */
+    run_one(cs, 0, 0, 0, 0, 1);
+    run_one(cs, 7, 1, 2, 3, 1);
+    run_one(cs, 0, ~0ULL, 1, 0, 1);
+    run_one(cs, 0, 0xFFFFFFFFULL, 1, 0, 0);
+    run_one(cs, 0, (uint64_t)INT64_MIN, (uint64_t)-1, 0, 1);
+    run_one(cs, 0, (uint64_t)INT32_MIN, (uint64_t)-1, 0, 1);
+    run_one(cs, 0, 100, 0, 0, 1);          /* div0 */
+    run_one(cs, 0, 0x8000000000000000ULL, 63, 0, 1);
+    run_one(cs, 0xFFFFFFF0ULL, 0xFFFFFFF0ULL, 31, 0, 1); /* 32-bit ASR */
+    run_one(cs, (uint64_t)(int32_t)-5, (uint64_t)(int32_t)-5, 0, 0, 1); /* BIC idiom */
+}
+
+int main(void) {
+    printf("instruction correctness probe (hosted Translate C vs ARM arithmetic)\n");
+    int i, t, trials;
+    const char* trials_env = getenv("SUYU_INSN_RANDOM_TRIALS");
+    trials = trials_env && trials_env[0] ? atoi(trials_env) : 32;
+    if (trials < 4) trials = 4;
+    if (trials > 256) trials = 256;
+    {
+        const char* seed_env = getenv("SUYU_INSN_SEED");
+        xs_state = seed_env && seed_env[0] ? strtoull(seed_env, 0, 0) : 1;
+        if (!xs_state) xs_state = 1;
+    }
+    for (i = 0; i < kNCases; ++i) {
+        edge_inputs(&kCases[i]);
+        if (g_fail) {
+            printf("failed on edge %s\n", kCases[i].name);
+            return 1;
+        }
+        for (t = 0; t < trials; ++t) {
+            uint64_t a = xs_next(), b = xs_next(), c = xs_next(), d = xs_next();
+            run_one(&kCases[i], a, b, c, d, (uint8_t)(t & 1));
+            if (g_fail) {
+                printf("failed on random %s trial %d\n", kCases[i].name, t);
+                return 1;
+            }
+        }
+    }
+    printf("ok %d encodings x (edges + %d random) seed=%llu\n",
+           kNCases, trials, (unsigned long long)xs_state);
+    printf("INSN PROBE PASS\n");
+    return 0;
+}
+)C";
+    return src.str();
+}
+
+void TestInstructionCorrectness(const fs::path& root) {
+    const auto catalog = suyu::recomp::insn_test::Catalog();
+    for (size_t i = 0; i < catalog.size(); ++i) {
+        if (!suyu::recomp::insn_test::TranslateOk(catalog[i].encoding,
+                                                 0x1000 + 4 * static_cast<u64>(i))) {
+            fail(std::string("Translate unhandled catalog insn ") + catalog[i].name);
+            return;
+        }
+    }
+    pass("catalog encodings all Translate");
+
+    const fs::path probe_src = root / "insn_probe";
+    fs::create_directories(probe_src);
+    if (!WriteFile(probe_src / "probe.c", BuildInsnProbeSource())) {
+        return;
+    }
+    if (!WriteFile(probe_src / "CMakeLists.txt",
+                   "cmake_minimum_required(VERSION 3.13)\n"
+                   "project(suyu_insn_probe C)\n"
+                   "set(CMAKE_C_STANDARD 11)\n"
+                   "set(CMAKE_C_EXTENSIONS OFF)\n"
+                   "add_executable(insn_probe probe.c)\n")) {
+        return;
+    }
+    const fs::path probe_build = probe_src / "build";
+    if (CmakeBuild(probe_src, probe_build, "insn_probe") != 0) {
+        return;
+    }
+    const fs::path exe = FindExe(probe_build, "insn_probe");
+    if (exe.empty()) {
+        fail("insn_probe executable not found under " + probe_build.string());
+        return;
+    }
+    if (RunArgs({exe.string()}) != 0) {
+        fail("insn_probe execution");
+        return;
+    }
+    pass("instruction correctness (edge + random vs independent ARM arithmetic)");
+}
+
 void PrintGaps() {
     std::cout
         << "GAPS (this harness is stub-only; see recomp_stack_harness for real stack):\n"
@@ -795,7 +1156,9 @@ void PrintGaps() {
         << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
         << "  - Debugger gdbstub StepThread against a live guest process\n"
         << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
-        << "This harness covers ArmRecomp dispatch contracts with hosted stubs.\n";
+        << "Pinned here: hosted Translate C vs independent ARM arithmetic (#4),\n"
+        << "  edge cases + randomized inputs (SUYU_INSN_RANDOM_TRIALS / SUYU_INSN_SEED).\n"
+        << "  Dynarmic comparison is recomp_stack_harness ScenarioInsnCorrectness.\n";
 }
 
 } // namespace
@@ -815,6 +1178,7 @@ int main() {
     TestSessionStopRelaunch();
     TestIcacheRejectsAot();
     TestHomebrewRuntimeProbe(root);
+    TestInstructionCorrectness(root);
     PrintGaps();
 
     if (const char* ev = std::getenv("SUYU_SMOKE_EVIDENCE_DIR")) {
@@ -823,6 +1187,10 @@ int main() {
         const fs::path probe = root / "homebrew_probe" / "probe.c";
         if (fs::exists(probe)) {
             fs::copy_file(probe, dest / "homebrew_probe.c", fs::copy_options::overwrite_existing);
+        }
+        const fs::path insn = root / "insn_probe" / "probe.c";
+        if (fs::exists(insn)) {
+            fs::copy_file(insn, dest / "insn_probe.c", fs::copy_options::overwrite_existing);
         }
     }
 

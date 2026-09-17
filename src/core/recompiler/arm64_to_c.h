@@ -481,7 +481,12 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         std::string s = "{ uint64_t _r = " + expr + "; ";
         if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
         if (rd != 31) s += "c->x[" + std::to_string(rd) + "] = _r; ";
-        if (opc == 3) s += "recomp_set_flags(c,0,_r,0,_r," + std::string(sf ? "1" : "0") + "); ";
+        if (opc == 3) {
+            // ANDS/BICS/TST: N/Z from the result. A64 (and Dynarmic on x86-64)
+            // write C=V=0; recomp_set_flags(add, _r, 0, _r) is that write.
+            // Leaving C/V stale disagrees with the JIT oracle.
+            s += "recomp_set_flags(c,0,_r,0,_r," + std::string(sf ? "1" : "0") + "); ";
+        }
         s += "}";
         put(s);
         return true;
@@ -674,7 +679,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // for ANDS (opc==3). Treating it as XZR everywhere silently
             // dropped every "and sp, xN, #imm" stack realignment.
             if (!(rd == 31 && opc == 3)) s += "c->x[" + std::to_string(rd) + "] = _r; ";
-            if (opc == 3) s += "recomp_set_flags(c,0,_r,0,_r," + std::string(sf ? "1" : "0") + "); ";
+            if (opc == 3) {
+                // Same A64/Dynarmic C=V=0 write as shifted-register ANDS.
+                s += "recomp_set_flags(c,0,_r,0,_r," + std::string(sf ? "1" : "0") + "); ";
+            }
             s += "}";
             put(s);
             return true;

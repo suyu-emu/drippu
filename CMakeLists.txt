@@ -237,6 +237,18 @@ cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" OFF 
 
 option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")
 
+# ASan+UBSan. Intended for x86-64 (see .github/workflows/tests.yml
+# linux-x64-sanitizers). ARM64 sanitizer CI is not wired — no ARM64 runner.
+option(YUZU_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if (YUZU_ENABLE_SANITIZERS)
+    if (MSVC)
+        message(WARNING "YUZU_ENABLE_SANITIZERS uses GCC/Clang -fsanitize=; ignoring on MSVC")
+    else()
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address,undefined)
+    endif()
+endif()
+
 # Install udev rules on Linux (mainly for gyros)
 # Only acts on joysticks and nothing else.
 cmake_dependent_option(YUZU_INSTALL_UDEV_RULES "Install udev rules for gyro access" OFF "PLATFORM_LINUX" OFF)
