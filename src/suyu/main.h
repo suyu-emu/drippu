@@ -39,7 +39,6 @@ class GRenderWindow;
 class LoadingScreen;
 class MicroProfileDialog;
 class OverlayDialog;
-class ProfilerWidget;
 class ControllerDialog;
 class QLabel;
 class MultiplayerState;
@@ -67,7 +66,6 @@ class HackerEnvironment;
 class McpServer;
 class GamerEnvironment;
 class ProgrammerEnvironment;
-class SocialSidebar;
 class UserManualWidget;
 class GameExportDialog;
 class SteamIntegration;
@@ -630,7 +628,6 @@ private:
     std::unique_ptr<FileSys::ManualContentProvider> provider;
 
     // Debugger panes
-    ProfilerWidget* profilerWidget{};
     // Only assigned under #if MICROPROFILE_ENABLED, which is off on Linux. Without
     // the initializer the null guards in ApplyAppMode test uninitialized memory and
     // the setVisible call through the garbage pointer segfaults at startup.
@@ -643,8 +640,6 @@ private:
     QDockWidget* programmer_env_dock_{};
     HackerEnvironment* hacker_env_{};
     QDockWidget* hacker_env_dock_{};
-    QDockWidget* social_sidebar_dock_{};
-    SocialSidebar* social_sidebar_{};
     GamerEnvironment* gamer_env_{};
     UserManualWidget* user_manual_widget_{};
     McpServer* mcp_server_{};

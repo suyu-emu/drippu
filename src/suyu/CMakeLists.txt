@@ -17,13 +17,6 @@ add_executable(suyu
     about_dialog.cpp
     about_dialog.h
     aboutdialog.ui
-    data_dialog.cpp
-    data_dialog.h
-    data_dialog.ui
-    data_widget.ui
-    deps_dialog.cpp
-    deps_dialog.h
-    deps_dialog.ui
     applets/qt_amiibo_settings.cpp
     applets/qt_amiibo_settings.h
     applets/qt_amiibo_settings.ui
@@ -187,10 +180,6 @@ add_executable(suyu
     main.cpp
     main.h
     main.ui
-    migration_dialog.cpp
-    migration_dialog.h
-    migration_worker.cpp
-    migration_worker.h
     multiplayer/chat_room.cpp
     multiplayer/chat_room.h
     multiplayer/chat_room.ui
@@ -220,10 +209,6 @@ add_executable(suyu
     precompiled_headers.h
     qt_common.cpp
     qt_common.h
-    qt_common_compat.cpp
-    ryujinx_dialog.cpp
-    ryujinx_dialog.h
-    ryujinx_dialog.ui
     set_play_time_dialog.cpp
     set_play_time_dialog.h
     set_play_time_dialog.ui
@@ -231,8 +216,6 @@ add_executable(suyu
     startup_checks.h
     uisettings.cpp
     uisettings.h
-    user_data_migration.cpp
-    user_data_migration.h
     util/clickable_label.cpp
     util/clickable_label.h
     util/controller_navigation.cpp
@@ -270,8 +253,6 @@ add_executable(suyu
     programmer_environment.h
     hacker_environment.cpp
     hacker_environment.h
-    social_sidebar.cpp
-    social_sidebar.h
     mods_browser_dialog.cpp
     mods_browser_dialog.h
     nintendo_account.cpp
@@ -282,10 +263,6 @@ add_executable(suyu
     setup_dialog.h
     gamer_environment.cpp
     gamer_environment.h
-    game_library.cpp
-    game_library.h
-    game_card.cpp
-    game_card.h
     suyu.qrc
     suyu.rc
 )

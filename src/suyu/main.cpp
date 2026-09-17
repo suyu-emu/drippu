@@ -194,7 +194,6 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "suyu/setup_dialog.h"
 #include "suyu/gamer_environment.h"
 #include "suyu/nintendo_account.h"
-#include "suyu/social_sidebar.h"
 #include "suyu/external_decryption_tool.h"
 #include "suyu/mods_browser_dialog.h"
 #include "suyu/steam_integration.h"
@@ -5037,9 +5036,6 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
             game_list->show();
         }
     }
-
-    // --- Social Sidebar dock (suppressed - social is inside GamerEnvironment now) ---
-    if (social_sidebar_dock_) social_sidebar_dock_->setVisible(false);
 
     // --- MCP Server (available in all modes) ---
     const bool allow_runtime_mcp = !emulation_running;

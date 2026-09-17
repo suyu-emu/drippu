@@ -23,10 +23,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <qresource prefix="/icons">
         <file alias="play.svg">icons/play.svg</file>
         <file alias="settings.svg">icons/settings.svg</file>
-        <file alias="grid_view.svg">icons/grid_view.svg</file>
-        <file alias="list_view.svg">icons/list_view.svg</file>
         <file alias="search.svg">icons/search.svg</file>
         <file alias="folder.svg">icons/folder.svg</file>
-        <file alias="game_placeholder.svg">icons/game_placeholder.svg</file>
     </qresource>
 </RCC>
