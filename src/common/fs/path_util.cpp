@@ -118,14 +118,6 @@ public:
         }
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;
-#define LEGACY_PATH(titleName, upperName) GenerateLegacyPath(EmuPath::titleName##Dir, GetAppDataRoamingDirectory() / upperName##_DIR); \
-        GenerateLegacyPath(EmuPath::titleName##ConfigDir, GetAppDataRoamingDirectory() / upperName##_DIR / CONFIG_DIR); \
-        GenerateLegacyPath(EmuPath::titleName##CacheDir, GetAppDataRoamingDirectory() / upperName##_DIR / CACHE_DIR);
-        LEGACY_PATH(Citron, CITRON)
-        LEGACY_PATH(Sudachi, SUDACHI)
-        LEGACY_PATH(Yuzu, YUZU)
-        LEGACY_PATH(Suyu, SUYU)
-#undef LEGACY_PATH
 #elif __ANDROID__
         ASSERT(!eden_path.empty());
         eden_path_cache = eden_path / CACHE_DIR;
@@ -140,14 +132,6 @@ public:
             eden_path_cache = eden_path / CACHE_DIR;
             eden_path_config = eden_path / CONFIG_DIR;
         }
-#define LEGACY_PATH(titleName, upperName) GenerateLegacyPath(EmuPath::titleName##Dir, GetDataDirectory("XDG_DATA_HOME") / upperName##_DIR); \
-        GenerateLegacyPath(EmuPath::titleName##ConfigDir, GetDataDirectory("XDG_CONFIG_HOME") / upperName##_DIR); \
-        GenerateLegacyPath(EmuPath::titleName##CacheDir, GetDataDirectory("XDG_CACHE_HOME") / upperName##_DIR);
-        LEGACY_PATH(Citron, CITRON)
-        LEGACY_PATH(Sudachi, SUDACHI)
-        LEGACY_PATH(Yuzu, YUZU)
-        LEGACY_PATH(Suyu, SUYU)
-#undef LEGACY_PATH
 #endif
         // data
         GenerateEdenPath(SuyuPath::EdenDir, eden_path);
@@ -173,8 +157,7 @@ public:
 #ifdef _WIN32
         GenerateLegacyPath(EmuPath::RyujinxDir, GetAppDataRoamingDirectory() / RYUJINX_DIR);
 #else
-        // In Ryujinx's infinite wisdom, it places EVERYTHING in the config directory on UNIX
-        // This is incredibly stupid and violates a million XDG standards, but whatever
+        // Ryujinx stores all data under XDG_CONFIG_HOME on UNIX.
         GenerateLegacyPath(EmuPath::RyujinxDir, GetDataDirectory("XDG_CONFIG_HOME") / RYUJINX_DIR);
 #endif
 
@@ -291,10 +274,6 @@ const std::filesystem::path& GetLegacyPath(EmuPath legacy_path) {
 
 std::string GetSuyuPathString(SuyuPath eden_path) {
     return PathToUTF8String(GetSuyuPath(eden_path));
-}
-
-std::string GetLegacyPathString(EmuPath legacy_path) {
-    return PathToUTF8String(GetLegacyPath(legacy_path));
 }
 
 void SetSuyuPath(SuyuPath eden_path, const fs::path& new_path) {

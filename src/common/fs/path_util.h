@@ -14,7 +14,7 @@
 namespace Common::FS {
 
 enum class SuyuPath {
-    EdenDir,        // Where yuzu stores its data.
+    EdenDir,        // Where suyu stores its data.
     AmiiboDir,      // Where Amiibo backups are stored.
     CacheDir,       // Where cached filesystem data is stored.
     ConfigDir,      // Where config files are stored.
@@ -26,7 +26,7 @@ enum class SuyuPath {
     NANDDir,        // Where the emulated NAND is stored.
     PlayTimeDir,    // Where play time data is stored.
     SaveDir,        // Where save data is stored.
-    ScreenshotsDir, // Where yuzu screenshots are stored.
+    ScreenshotsDir, // Where suyu screenshots are stored.
     SDMCDir,        // Where the emulated SDMC is stored.
     ShaderDir,      // Where shaders are stored.
     TASDir,         // Where TAS scripts are stored.
@@ -38,24 +38,8 @@ enum class SuyuPath {
     UserDir = EdenDir,
 };
 
-// migration/compat dirs
+// migration/compat dirs used by live callers of GetLegacyPath
 enum EmuPath {
-    CitronDir,
-    CitronConfigDir,
-    CitronCacheDir,
-
-    SudachiDir,
-    SudachiConfigDir,
-    SudachiCacheDir,
-
-    YuzuDir,
-    YuzuConfigDir,
-    YuzuCacheDir,
-
-    SuyuDir,
-    SuyuConfigDir,
-    SuyuCacheDir,
-
     // used exclusively for save data linking
     RyujinxDir,
 };
@@ -251,15 +235,6 @@ void SetAppDirectory(const std::string& app_directory);
 [[nodiscard]] std::string GetSuyuPathString(SuyuPath eden_path);
 
 /**
- * Gets the filesystem path associated with the LegacyPath enum as a UTF-8 encoded std::string.
- *
- * @param legacy_path LegacyPath enum
- *
- * @returns The filesystem path associated with the LegacyPath enum as a UTF-8 encoded std::string.
- */
-[[nodiscard]] std::string GetLegacyPathString(EmuPath legacy_path);
-
-/**
  * Sets a new filesystem path associated with the SuyuPath enum.
  * If the filesystem object at new_path is not a directory, this function will not do anything.
  *
@@ -311,14 +286,14 @@ void SetSuyuPath(SuyuPath eden_path, const Path& new_path) {
 [[nodiscard]] std::filesystem::path GetHomeDirectory();
 
 /**
- * Gets the relevant paths for yuzu to store its data based on the given XDG environment variable.
+ * Gets the relevant paths for suyu to store its data based on the given XDG environment variable.
  * See https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
  * Defaults to $HOME/.local/share for main application data,
  * $HOME/.cache for cached data, and $HOME/.config for configuration files.
  *
  * @param env_name XDG environment variable name
  *
- * @returns The path where yuzu should store its data.
+ * @returns The path where suyu should store its data.
  */
 [[nodiscard]] std::filesystem::path GetDataDirectory(const std::string& env_name);
 

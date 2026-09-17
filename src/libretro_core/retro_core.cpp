@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Real libretro core entry points for suyu (RetroArch loads this .dll as a
-// core, in contrast to core/libretro_wrapper.cpp which is suyu acting as a
-// libretro *frontend* loading other cores - the two are separate features).
+// Real libretro core entry points for suyu (RetroArch loads this as a core).
 //
 // STATUS: boots and runs a game headlessly via Core::System, exactly like
 // suyu_cmd (src/suyu_cmd/suyu.cpp) does without Qt. System info, environment

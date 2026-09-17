@@ -23,7 +23,7 @@ fs::path GetKvdbPath(const fs::path& path) {
 }
 
 fs::path GetRyuPathFromSavePath(const fs::path& path) {
-    // This is a horrible hack, but I cba to find something better
+    // Ryujinx saves live at <root>/bis/user/save/<hex>/0; walk five parents to the root.
     return path.parent_path().parent_path().parent_path().parent_path().parent_path();
 }
 
@@ -35,7 +35,6 @@ fs::path GetRyuSavePath(const u64 &save_id)
 std::filesystem::path GetRyuSavePath(const std::filesystem::path& path, const u64& save_id) {
     std::string hex = fmt::format("{:016x}", save_id);
 
-           // TODO: what's the difference between 0 and 1?
     return path / "bis" / "user" / "save" / hex / "0";
 }
 
@@ -54,7 +53,6 @@ IMENReadResult ReadKvdb(const fs::path &path, std::vector<IMEN> &imens)
         return IMENReadResult::NoHeader;
     }
 
-    // magic (not the wizard kind)
     kvdb.seekg(0, std::ios::beg);
     char header[12];
     kvdb.read(header, 12);
@@ -67,7 +65,7 @@ IMENReadResult ReadKvdb(const fs::path &path, std::vector<IMEN> &imens)
     std::size_t remaining = (file_size - 12);
     std::size_t num_imens = remaining / IMEN_SIZE;
 
-    // File is misaligned and probably corrupt (rip)
+    // File is misaligned and probably corrupt.
     if (remaining % IMEN_SIZE != 0) {
         return IMENReadResult::Misaligned;
     }
@@ -79,8 +77,8 @@ IMENReadResult ReadKvdb(const fs::path &path, std::vector<IMEN> &imens)
 
     imens.reserve(num_imens);
 
-    // initially I wanted to do a struct, but imkvdb is 140 bytes
-    // while the compiler will murder you if you try to align u64 to 4 bytes
+    // IMKV records are 140 bytes with u64 fields at 4-byte offsets, so they
+    // cannot be overlaid as a packed struct.
     for (std::size_t i = 0; i < num_imens; ++i) {
         char magic[4];
         u64 title_id = 0;
