@@ -38,10 +38,14 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     const std::string window_title = fmt::format("drippu {} | {}-{} (Vulkan)", Common::g_build_name,
                                                  Common::g_scm_branch, Common::g_scm_desc);
 #endif
+    auto window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#if defined(SDL_PLATFORM_MACOS)
+    window_flags |= SDL_WINDOW_METAL;
+#endif
     render_window =
         SDL_CreateWindow(window_title.c_str(),
                          Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height,
-                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                         window_flags);
 
     if (render_window == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to create SDL3 window: {}", SDL_GetError());
@@ -87,7 +91,14 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     }
 #elif defined(SDL_PLATFORM_MACOS)
     window_info.type = Core::Frontend::WindowSystemType::Cocoa;
-    window_info.render_surface = SDL_Metal_CreateView(render_window);
+    // VK_EXT_metal_surface takes a CAMetalLayer. The view SDL_Metal_CreateView returns is an
+    // NSView, and MoltenVK raises an Objective-C exception for anything that is not a layer.
+    metal_view = SDL_Metal_CreateView(render_window);
+    window_info.render_surface = metal_view ? SDL_Metal_GetLayer(metal_view) : nullptr;
+    if (window_info.render_surface == nullptr) {
+        LOG_CRITICAL(Frontend, "Failed to get the CAMetalLayer for the window: {}", SDL_GetError());
+        std::exit(EXIT_FAILURE);
+    }
 #elif defined(SDL_PLATFORM_ANDROID)
     window_info.type = Core::Frontend::WindowSystemType::Android;
     window_info.render_surface = SDL_GetPointerProperty(
@@ -106,7 +117,14 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
              Common::g_scm_branch, Common::g_scm_desc);
 }
 
-EmuWindow_SDL2_VK::~EmuWindow_SDL2_VK() = default;
+EmuWindow_SDL2_VK::~EmuWindow_SDL2_VK() {
+#if defined(SDL_PLATFORM_MACOS)
+    if (metal_view) {
+        SDL_Metal_DestroyView(metal_view);
+        metal_view = nullptr;
+    }
+#endif
+}
 
 std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL2_VK::CreateSharedContext() const {
     return std::make_unique<DummyContext>();

@@ -149,7 +149,7 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl);$(brew --prefix ffmpeg)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
-            -DUSE_SYSTEM_MOLTENVK=ON 2>&1 | tee cmake_configure.log
+            -DYUZU_USE_BUNDLED_MOLTENVK=OFF 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()

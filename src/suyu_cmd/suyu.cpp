@@ -664,13 +664,16 @@ int main(int argc, char** argv) {
     }
 
     using suyu::recomp::ApplyModuleBase;
+    using suyu::recomp::RecompModuleMap;
+    static RecompModuleMap s_recomp_modules;
+    bool recomp_map_failed = false;
+
+    // place_one is only called from the static-recomp and Win32 DLL loaders.
+#if defined(SUYU_CMD_STATIC_RECOMP) || defined(_WIN32)
     using suyu::recomp::ImageReject;
     using suyu::recomp::ImageRejectName;
     using suyu::recomp::PlaceLoadedModule;
     using suyu::recomp::RecompImageExports;
-    using suyu::recomp::RecompModuleMap;
-    static RecompModuleMap s_recomp_modules;
-    bool recomp_map_failed = false;
 
     auto place_one = [&](const RecompImageExports& ex, const char* origin) {
         const ImageReject rejected = PlaceLoadedModule(s_recomp_modules, ex);
@@ -682,6 +685,7 @@ int main(int argc, char** argv) {
         }
         return true;
     };
+#endif
 
 #ifdef SUYU_CMD_STATIC_RECOMP
     {
