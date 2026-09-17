@@ -8,18 +8,35 @@
 // shared library (SUYU_HOSTED_RECOMP helpers). Matching AArch64 bytes are
 // written into guest RX so Dynarmic fallback executes the same sites.
 //
+// Backlog #3: after the integration scenarios, the same guest fixture (same
+// encodings / same PCs) is raced under hybrid AOT (lookup hit) vs JIT
+// (force-miss → Dynarmic). Slice times are host RunThread durations (no GPU
+// frames in this harness). Results: recomp_benchmark.json.
+//
+// The bench ADD chain is punctuated with STR/LDR of x0 through the opaque
+// host_mem callbacks so Release (-O3) cannot strength-reduce 512 ADDs to
+// `x1 << 9`. JudgeAotBenchDump: a PLT jmp is not a loop (discriminating dump:
+// store+load + 1 add + PLT jmp + no shl/imul must FAIL, with count asserts).
+// Named `recomp_store64@plt` is a gcc PIC accident — clang/aarch64 `bl` may
+// have store=0; that is not a fold. Live pin is: not shl/imul, plus runtime
+// host_mem callback counts (512 × iters).
+//
 // Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
 // safe live HLE). Does not load copyrighted titles or keys.
 
+#include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <cstdint>
+#include <cctype>
+#include <cstdio>
+#include <regex>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -28,6 +45,8 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
+
+#include <nlohmann/json.hpp>
 
 #include "common/common_types.h"
 #include "common/settings.h"
@@ -145,8 +164,14 @@ constexpr u64 kOffAotProof = 0x1400;
 constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
 constexpr u64 kOffStepNoSvc = 0x1C00; // MOVZ #7 only — leftover pending_svc pin
 constexpr u64 kOffCrossPage = 0x1FFC;
-constexpr u64 kCodeBytes = 3 * Kernel::PageSize;
-constexpr u64 kImageBytes = 4 * Kernel::PageSize;
+// Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003).
+// 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
+constexpr u64 kOffBench = 0x2400;
+constexpr int kBenchAdds = 512;
+constexpr u32 kBenchSvcImm = 3;
+constexpr u64 kCodeBytes = 4 * Kernel::PageSize;
+constexpr u64 kImageBytes = 5 * Kernel::PageSize;
+constexpr u64 kOffBenchScratch = kCodeBytes; // data-segment word STR/LDR bounce
 
 // AArch64 encodings (also written into guest RX).
 constexpr u32 kMovzX0_1234 = 0xD2824680u;
@@ -163,6 +188,11 @@ constexpr u32 kMovzX0Cafe = 0xD2800000u | (0xCAFEu << 5);
 constexpr u32 kSvc77 = 0xD40009A1u;
 constexpr u32 kMovzX0_7 = 0xD28000E0u;
 constexpr u32 kSvc1 = 0xD4000021u;
+constexpr u32 kMovzX0_0 = 0xD2800000u;
+constexpr u32 kAddX0X0X1 = 0x8B010000u; // ADD X0, X0, X1
+constexpr u32 kStrX0X3 = 0xF9000060u;   // STR X0, [X3] — opaque store breaks x0 recurrence
+constexpr u32 kLdrX0X3 = 0xF9400060u;   // LDR X0, [X3]
+constexpr u32 kSvc3 = 0xD4000061u;      // SVC #3
 
 u64 g_entry = 0;
 u64 g_force_miss_pc = 0;
@@ -179,8 +209,495 @@ BlockFn g_block_miss_park = nullptr;
 BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
 BlockFn g_block_step_no_svc = nullptr;
+BlockFn g_block_bench = nullptr;
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
+
+struct AotCompileCosts {
+    u64 translate_ns{};
+    u64 bench_translate_ns{};
+    u64 cmake_configure_ns{};
+    u64 cmake_build_ns{};
+    u64 dlopen_ns{};
+    u64 so_bytes{};
+    u64 bench_c_bytes{};
+    std::string so_path;
+    u64 disasm_add_count{};
+    u64 disasm_shl9_count{};
+    u64 disasm_imul512_count{};
+    u64 disasm_backward_jumps{};
+    u64 disasm_plt_jumps{};
+    u64 disasm_store64_calls{}; // named PLT in objdump (gcc PIC; may be 0 on clang)
+    u64 disasm_load64_calls{};
+    bool not_single_shift{};
+    std::string disasm_excerpt;
+    u64 clang_disasm_add{};
+    u64 clang_disasm_store64{};
+    u64 clang_disasm_load64{};
+    bool clang_not_reported_folded{true};
+    std::string clang_dump_reason;
+};
+AotCompileCosts g_aot_compile;
+
+u64* g_hm_load_calls = nullptr;
+u64* g_hm_store_calls = nullptr;
+
+u64 HmLoadCalls() {
+    return g_hm_load_calls ? *g_hm_load_calls : 0;
+}
+u64 HmStoreCalls() {
+    return g_hm_store_calls ? *g_hm_store_calls : 0;
+}
+
+u64 NsSince(std::chrono::steady_clock::time_point t0) {
+    const auto raw =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    return raw > 0 ? static_cast<u64>(raw) : 0;
+}
+
+std::vector<std::pair<u64, u32>> BenchInsns() {
+    std::vector<std::pair<u64, u32>> v;
+    v.reserve(static_cast<size_t>(kBenchAdds) * 3 + 2);
+    u64 off = kOffBench;
+    v.emplace_back(off, kMovzX0_0);
+    off += 4;
+    for (int i = 0; i < kBenchAdds; ++i) {
+        // STR/LDR of x0 through recomp_store/load (function pointers) so -O3
+        // cannot treat the ADD chain as a loop-invariant `x1 << 9`.
+        v.emplace_back(off, kStrX0X3);
+        off += 4;
+        v.emplace_back(off, kLdrX0X3);
+        off += 4;
+        v.emplace_back(off, kAddX0X0X1);
+        off += 4;
+    }
+    v.emplace_back(off, kSvc3);
+    return v;
+}
+
+int BenchIters() {
+    int n = 32;
+    if (const char* env = std::getenv("SUYU_RECOMP_BENCH_ITERS"); env && env[0] != '\0') {
+        n = std::atoi(env);
+    }
+    return n < 4 ? 4 : n;
+}
+
+struct MemSnap {
+    u64 vmrss_kb{};
+    u64 vmhwm_kb{};
+    u64 vmsize_kb{};
+};
+
+MemSnap ReadMem() {
+    MemSnap m;
+#ifndef _WIN32
+    std::ifstream in("/proc/self/status");
+    std::string line;
+    while (std::getline(in, line)) {
+        auto take = [&](const char* key, u64& dest) {
+            if (line.rfind(key, 0) != 0) {
+                return;
+            }
+            dest = static_cast<u64>(std::strtoull(line.c_str() + std::strlen(key), nullptr, 10));
+        };
+        take("VmRSS:", m.vmrss_kb);
+        take("VmHWM:", m.vmhwm_kb);
+        take("VmSize:", m.vmsize_kb);
+    }
+#endif
+    return m;
+}
+
+std::string HostCpu() {
+#ifndef _WIN32
+    std::ifstream in("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto pos = line.find("model name");
+        if (pos == 0) {
+            const auto colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string name = line.substr(colon + 1);
+                while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) {
+                    name.erase(name.begin());
+                }
+                return name;
+            }
+        }
+    }
+#endif
+    return {};
+}
+
+struct DisasmCounts {
+    u64 add{};
+    u64 shl9{};
+    u64 imul512{};
+    u64 backward_jumps{}; // in-function backedges only (not jmp to a lower PLT)
+    u64 plt_jumps{};
+    u64 call{};
+    u64 store64{};
+    u64 load64{};
+};
+
+struct BenchDumpVerdict {
+    bool ok{};
+    const char* reason = "";
+};
+
+// "$0x9" must not match "$0x90". Next char is end, comma, or whitespace.
+bool HasImmToken(const std::string& args, std::string_view imm) {
+    size_t p = 0;
+    while ((p = args.find(imm.data(), p, imm.size())) != std::string::npos) {
+        const size_t after = p + imm.size();
+        const char c = after < args.size() ? args[after] : '\0';
+        if (c == '\0' || c == ',' || std::isspace(static_cast<unsigned char>(c))) {
+            return true;
+        }
+        ++p;
+    }
+    return false;
+}
+
+DisasmCounts CountBlockBenchOps(const std::string& fn) {
+    DisasmCounts c;
+    std::vector<std::pair<u64, u64>> jumps;
+    u64 fn_lo = ~u64{0};
+    u64 fn_hi = 0;
+    std::istringstream in(fn);
+    std::string line;
+    while (std::getline(in, line)) {
+        u64 addr = std::strtoull(line.c_str(), nullptr, 16);
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const auto tab = line.rfind('\t');
+        if (tab == std::string::npos) {
+            continue;
+        }
+        if (addr != 0) {
+            fn_lo = std::min(fn_lo, addr);
+            fn_hi = std::max(fn_hi, addr);
+        }
+        std::string rest = line.substr(tab + 1);
+        while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front()))) {
+            rest.erase(rest.begin());
+        }
+        const auto first = rest.find(' ');
+        const std::string mnem = first == std::string::npos ? rest : rest.substr(0, first);
+        const std::string args = first == std::string::npos ? std::string{} : rest.substr(first);
+        if (mnem == "add" || mnem == "addq") {
+            if (args.find("%rsp") == std::string::npos && args.find("%rbp") == std::string::npos) {
+                ++c.add;
+            }
+        } else if (mnem == "shl" || mnem == "shlq" || mnem == "sal" || mnem == "salq") {
+            if (HasImmToken(args, "$0x9") || HasImmToken(args, "$9")) {
+                ++c.shl9;
+            }
+        } else if (mnem == "imul" || mnem == "imulq") {
+            if (HasImmToken(args, "$0x200") || HasImmToken(args, "$512")) {
+                ++c.imul512;
+            }
+        } else if (mnem == "call" || mnem == "callq") {
+            ++c.call;
+            if (line.find("recomp_store64") != std::string::npos) {
+                ++c.store64;
+            }
+            if (line.find("recomp_load64") != std::string::npos) {
+                ++c.load64;
+            }
+        } else if (!mnem.empty() && mnem[0] == 'j') {
+            size_t t = 0;
+            while (t < args.size() && std::isspace(static_cast<unsigned char>(args[t]))) {
+                ++t;
+            }
+            u64 target = 0;
+            if (t < args.size()) {
+                target = std::strtoull(args.c_str() + t, nullptr, 16);
+            }
+            if (addr != 0 && target != 0) {
+                jumps.emplace_back(addr, target);
+            }
+        }
+    }
+    for (const auto& [from, to] : jumps) {
+        const bool in_fn = fn_lo != ~u64{0} && to >= fn_lo && to <= fn_hi;
+        if (in_fn && to < from) {
+            ++c.backward_jumps;
+        } else if (!in_fn && to < from) {
+            ++c.plt_jumps;
+        }
+    }
+    return c;
+}
+
+// Folded x1<<9 must lose. A PLT jmp is not an in-function loop: store+load +
+// 1 add + PLT jmp + no shl/imul is FAIL. Named recomp_store64 in the dump is
+// not required for PASS (clang PIC / aarch64 bl may omit it).
+BenchDumpVerdict JudgeAotBenchDump(const DisasmCounts& n) {
+    if (n.shl9 > 0 || n.imul512 > 0) {
+        return {false, "host fold: shl $0x9 / imul $512"};
+    }
+    if (n.add >= static_cast<u64>(kBenchAdds)) {
+        return {true, "unrolled >=512 adds (named store/load PLT not required)"};
+    }
+    if (n.backward_jumps >= 1 && n.add >= 1) {
+        return {true, "in-function add loop"};
+    }
+    return {false, "too few adds and no in-function loop"};
+}
+
+void RecordBenchDump(const DisasmCounts& n, const std::string& fn) {
+    g_aot_compile.disasm_add_count = n.add;
+    g_aot_compile.disasm_shl9_count = n.shl9;
+    g_aot_compile.disasm_imul512_count = n.imul512;
+    g_aot_compile.disasm_backward_jumps = n.backward_jumps;
+    g_aot_compile.disasm_plt_jumps = n.plt_jumps;
+    g_aot_compile.disasm_store64_calls = n.store64;
+    g_aot_compile.disasm_load64_calls = n.load64;
+    std::istringstream lines(fn);
+    std::string line;
+    int kept = 0;
+    std::ostringstream excerpt;
+    while (std::getline(lines, line) && kept < 40) {
+        excerpt << line << '\n';
+        ++kept;
+    }
+    g_aot_compile.disasm_excerpt = excerpt.str();
+    const auto v = JudgeAotBenchDump(n);
+    g_aot_compile.not_single_shift = v.ok;
+    std::cout << "AOT block_bench objdump: add=" << n.add << " shl9=" << n.shl9
+              << " imul512=" << n.imul512 << " in_fn_back_jcc=" << n.backward_jumps
+              << " plt_jmp=" << n.plt_jumps << " store64=" << n.store64
+              << " load64=" << n.load64 << " call=" << n.call << " -> " << v.reason << "\n";
+}
+
+void ExpectDumpVerdict(const char* name, const std::string& dump, bool want_ok) {
+    const DisasmCounts n = CountBlockBenchOps(dump);
+    const auto v = JudgeAotBenchDump(n);
+    if (v.ok != want_ok) {
+        Fail(std::string(name) + ": verdict=" + (v.ok ? "PASS" : "FAIL") + " (" + v.reason +
+             ") want " + (want_ok ? "PASS" : "FAIL") + " add=" + std::to_string(n.add) +
+             " shl9=" + std::to_string(n.shl9) + " back=" + std::to_string(n.backward_jumps) +
+             " plt_jmp=" + std::to_string(n.plt_jumps) + " store=" + std::to_string(n.store64) +
+             " load=" + std::to_string(n.load64));
+    } else {
+        Pass(std::string(name) + " (" + v.reason + ")");
+    }
+}
+
+void ExpectDumpCounts(const char* name, const DisasmCounts& n, u64 add, u64 shl9, u64 imul512,
+                      u64 backward_jumps, u64 plt_jumps, u64 store64, u64 load64) {
+    auto chk = [&](const char* field, u64 got, u64 want) {
+        if (got != want) {
+            Fail(std::string(name) + " " + field + ": got=" + std::to_string(got) +
+                 " want=" + std::to_string(want));
+        } else {
+            Pass(std::string(name) + " " + field + "=" + std::to_string(got));
+        }
+    };
+    chk("add", n.add, add);
+    chk("shl9", n.shl9, shl9);
+    chk("imul512", n.imul512, imul512);
+    chk("backward_jumps", n.backward_jumps, backward_jumps);
+    chk("plt_jumps", n.plt_jumps, plt_jumps);
+    chk("store64", n.store64, store64);
+    chk("load64", n.load64, load64);
+}
+
+void ScenarioFoldPinSelfCheck() {
+    const int before = g_fails;
+    // Tabs match GNU objdump. PLT is at a lower address than block_bench, so a
+    // naive "target < addr" count treats SVC jmp as a loop. Must still FAIL.
+    const std::string folded_shl_svc_jmp =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 8b 77 08         \tmov    0x8(%rdi),%rsi\n"
+        "    1414:\t48 c1 e6 09         \tshl    $0x9,%rsi\n"
+        "    1418:\t48 01 37            \tadd    %rsi,(%rdi)\n"
+        "    141b:\te9 a0 fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("folded shl $0x9 + SVC jmp is rejected", folded_shl_svc_jmp, false);
+
+    // Store/load calls must not rescue a shift-fold (shl9 is fatal).
+    const std::string folded_shl_named_plt =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 c1 e6 09         \tshl    $0x9,%rsi\n"
+        "    1414:\te8 87 fc ff ff      \tcall   10a0 <recomp_store64@plt>\n"
+        "    1419:\te8 92 fc ff ff      \tcall   10b0 <recomp_load64@plt>\n"
+        "    141e:\te9 9d fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("folded shl $0x9 still rejected with store/load calls",
+                      folded_shl_named_plt, false);
+
+    const std::string folded_imul =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 69 f6 00 02 00 00\timul   $0x200,%rsi,%rsi\n"
+        "    1417:\t48 01 37            \tadd    %rsi,(%rdi)\n"
+        "    141a:\te8 a1 fc ff ff      \tcall   10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("folded imul $512 + SVC call is rejected", folded_imul, false);
+
+    const std::string add_only =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 03 47 08         \tadd    0x8(%rdi),%rax\n"
+        "    1414:\t48 03 47 08         \tadd    0x8(%rdi),%rax\n"
+        "    1418:\te9 a3 fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("add-only dump (no store/load) is rejected", add_only, false);
+
+    // Discriminating dump: store+load + 1 add + PLT jmp + no shl/imul.
+    // If fn_lo/fn_hi is reverted, plt_jmp is counted as backward_jumps and
+    // this dump wrongly PASSes as an in-function loop.
+    const std::string plt_not_loop =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\te8 8b fc ff ff      \tcall   10a0 <recomp_store64@plt>\n"
+        "    1415:\te8 96 fc ff ff      \tcall   10b0 <recomp_load64@plt>\n"
+        "    141a:\t48 03 43 08         \tadd    0x8(%rbx),%rax\n"
+        "    141e:\te9 9d fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    {
+        const DisasmCounts n = CountBlockBenchOps(plt_not_loop);
+        ExpectDumpCounts("discriminating PLT dump", n, /*add=*/1, /*shl9=*/0, /*imul512=*/0,
+                         /*backward_jumps=*/0, /*plt_jumps=*/1, /*store64=*/1, /*load64=*/1);
+        ExpectDumpVerdict("discriminating store+load+1 add+PLT jmp (no shl) is rejected",
+                          plt_not_loop, false);
+    }
+
+    const std::string honest_loop =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 c7 07 00 00 00 00\tmovq   $0x0,(%rdi)\n"
+        "    1417:\te8 84 fc ff ff      \tcall   10a0 <recomp_store64@plt>\n"
+        "    141c:\te8 8f fc ff ff      \tcall   10b0 <recomp_load64@plt>\n"
+        "    1421:\t48 03 43 08         \tadd    0x8(%rbx),%rax\n"
+        "    1425:\t75 f0               \tjne    1417 <block_bench+0x7>\n"
+        "    1427:\tc3                  \tret\n";
+    ExpectDumpVerdict("in-function add+store+load loop is accepted", honest_loop, true);
+
+    // clang 18 PIC: 512 adds, many calls, no named recomp_store64/load64.
+    // Must PASS (not reported as folded). AArch64 `bl` looks the same to this pin.
+    std::ostringstream clang_like;
+    clang_like << "0000000000001410 <block_bench>:\n";
+    u64 addr = 0x1410;
+    for (int i = 0; i < kBenchAdds; ++i) {
+        clang_like << "    " << std::hex << addr
+                   << ":\t48 03 43 08          \tadd    0x8(%rbx),%rax\n";
+        addr += 4;
+    }
+    clang_like << "    " << std::hex << addr << ":\te9 00 fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    {
+        const std::string dump = clang_like.str();
+        const DisasmCounts n = CountBlockBenchOps(dump);
+        ExpectDumpCounts("clang-like unnamed dump", n, static_cast<u64>(kBenchAdds), 0, 0, 0, 1, 0,
+                         0);
+        ExpectDumpVerdict("clang-like 512 adds with no named store/load is not folded", dump, true);
+    }
+
+    ScenarioPass("objdump fold pin rejects shl $0x9 + SVC jmp; PLT is not a loop", before);
+}
+
+#ifndef _WIN32
+std::string PopenDump(const std::string& cmd) {
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) {
+        return {};
+    }
+    std::string out;
+    char buf[4096];
+    while (std::fgets(buf, sizeof buf, p)) {
+        out.append(buf);
+    }
+    pclose(p);
+    return out;
+}
+
+std::string ExtractObjdumpFn(const std::string& dump, const char* name) {
+    const std::string tag = std::string("<") + name + ">:";
+    const auto tag_at = dump.find(tag);
+    if (tag_at == std::string::npos) {
+        return {};
+    }
+    const auto line_start = dump.rfind('\n', tag_at);
+    const auto from = line_start == std::string::npos ? 0 : line_start + 1;
+    static const std::regex next_fn("\n[0-9A-Fa-f]+ <[^>]+>:");
+    std::smatch m;
+    const std::string rest = dump.substr(tag_at + tag.size());
+    if (std::regex_search(rest, m, next_fn)) {
+        return dump.substr(from, (tag_at + tag.size() + static_cast<size_t>(m.position())) - from);
+    }
+    return dump.substr(from);
+}
+
+void PinAotBenchNotFolded(const fs::path& so) {
+    const std::string cmd = "objdump -d " + Quote(so.string()) + " 2>/dev/null";
+    const std::string dump = PopenDump(cmd);
+    if (dump.empty()) {
+        Fail("objdump -d of AOT .so produced no output (objdump required to pin no x1<<9 fold)");
+        return;
+    }
+    const std::string fn = ExtractObjdumpFn(dump, "block_bench");
+    if (fn.empty()) {
+        Fail("objdump missing <block_bench> in " + so.string());
+        return;
+    }
+    const DisasmCounts n = CountBlockBenchOps(fn);
+    RecordBenchDump(n, fn);
+    if (n.shl9 > 0 || n.imul512 > 0) {
+        Fail("AOT block_bench was host-folded (x1<<9 / imul 512), not 512 adds; dump:\n" + fn);
+        return;
+    }
+    if (!g_aot_compile.not_single_shift) {
+        Fail("AOT block_bench dump is not 512 adds and not an in-function loop; dump:\n" + fn);
+        return;
+    }
+    ExpectTrue("AOT block_bench is not a single x1<<9", g_aot_compile.not_single_shift);
+    // Named recomp_store64@plt is gcc PIC, not the pin. clang / aarch64 bl may
+    // have store64=0; that must not be reported as a fold. Runtime host_mem
+    // callback counts (512 × iters) pin that the memory ops actually ran.
+}
+
+void PinClangDumpNotFalseFolded(const fs::path& blocks_c) {
+    const char* clang = "/usr/bin/clang-18";
+    if (!fs::exists(clang)) {
+        clang = "/usr/bin/clang";
+    }
+    if (!fs::exists(clang)) {
+        std::cout << "clang not found; host_mem callback counts still pin store/load\n";
+        g_aot_compile.clang_dump_reason = "clang not found";
+        return;
+    }
+    const fs::path out = blocks_c.parent_path() / "libstack_aot_clang.so";
+    const int rc = RunArgs({clang, "-O3", "-fPIC", "-shared", "-std=c11", "-o", out.string(),
+                            blocks_c.string()});
+    if (rc != 0 || !fs::exists(out)) {
+        Fail(std::string("clang -O3 AOT .so failed rc=") + std::to_string(rc));
+        g_aot_compile.clang_dump_reason = "clang compile failed";
+        return;
+    }
+    const std::string dump = PopenDump("objdump -d " + Quote(out.string()) + " 2>/dev/null");
+    const std::string fn = ExtractObjdumpFn(dump, "block_bench");
+    if (fn.empty()) {
+        Fail("clang objdump missing <block_bench>");
+        return;
+    }
+    const DisasmCounts n = CountBlockBenchOps(fn);
+    g_aot_compile.clang_disasm_add = n.add;
+    g_aot_compile.clang_disasm_store64 = n.store64;
+    g_aot_compile.clang_disasm_load64 = n.load64;
+    const auto v = JudgeAotBenchDump(n);
+    g_aot_compile.clang_not_reported_folded = v.ok && n.shl9 == 0 && n.imul512 == 0;
+    g_aot_compile.clang_dump_reason = v.reason;
+    std::cout << "clang -O3 block_bench objdump: add=" << n.add << " shl9=" << n.shl9
+              << " imul512=" << n.imul512 << " store64=" << n.store64 << " load64=" << n.load64
+              << " call=" << n.call << " in_fn_back=" << n.backward_jumps
+              << " plt_jmp=" << n.plt_jumps << " -> " << v.reason << "\n";
+    if (n.shl9 > 0 || n.imul512 > 0) {
+        Fail("clang -O3 folded bench to shl/imul (unexpected with STR/LDR fixture)");
+        return;
+    }
+    ExpectTrue("clang -O3 dump is not reported as folded", g_aot_compile.clang_not_reported_folded);
+    if (n.store64 == 0 && n.load64 == 0) {
+        Pass("clang -O3 has no named recomp_store64/load64 (PIC accident, not a fold)");
+    }
+}
+#endif
 
 Core::ArmRecomp* AsRecomp(Core::ArmInterface* iface) {
     if (!iface || !iface->IsRecompBackend()) {
@@ -218,6 +735,9 @@ Core::RecompBlockFn Lookup(u64 pc) {
     }
     if (pc == g_entry + kOffStepNoSvc) {
         return g_block_step_no_svc;
+    }
+    if (pc == g_entry + kOffBench) {
+        return g_block_bench;
     }
     return nullptr;
 }
@@ -274,6 +794,8 @@ typedef struct RecompHostMem {
 } RecompHostMem;
 
 uint64_t g_module_base = 0;
+uint64_t g_recomp_hm_load_calls = 0;
+uint64_t g_recomp_hm_store_calls = 0;
 
 void recomp_set_module_base(uint64_t b) { g_module_base = b; }
 
@@ -284,11 +806,13 @@ void recomp_unhandled(GuestContext* c, uint32_t insn, uint64_t pc) {
     c->halted = RECOMP_HALT_UNHANDLED;
 }
 uint64_t recomp_load64(GuestContext* c, uint64_t a) {
+    ++g_recomp_hm_load_calls;
     const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
     if (hm && hm->load) return hm->load(hm->user, a, 8);
     return 0;
 }
 void recomp_store64(GuestContext* c, uint64_t a, uint64_t v) {
+    ++g_recomp_hm_store_calls;
     const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
     if (hm && hm->store) hm->store(hm->user, a, 8, v);
 }
@@ -334,6 +858,30 @@ void block_step_no_svc(GuestContext* c) {
     src << "    c->pc = g_module_base + 0x" << std::hex << (kOffStepNoSvc + 4) << std::dec
         << "ULL;\n";
     src << R"C(}
+
+void block_bench(GuestContext* c) {
+)C";
+    const auto bench_insns = BenchInsns();
+    const auto t_bench = std::chrono::steady_clock::now();
+    u64 bench_c = 0;
+    for (const auto& [off, enc] : bench_insns) {
+        bool unhandled = false;
+        std::string body;
+        suyu::recomp::Translate(enc, off, body, &unhandled);
+        if (unhandled) {
+            Fail("bench Translate unhandled encoding 0x" +
+                 [&] {
+                     std::ostringstream h;
+                     h << std::hex << enc;
+                     return h.str();
+                 }());
+        }
+        src << body;
+        bench_c += body.size();
+    }
+    g_aot_compile.bench_translate_ns = NsSince(t_bench);
+    g_aot_compile.bench_c_bytes = bench_c;
+    src << R"C(}
 )C";
     return src.str();
 }
@@ -345,7 +893,24 @@ bool BuildAndLoadAot(const fs::path& root) {
 #else
     const fs::path src_dir = root / "aot_blocks";
     fs::create_directories(src_dir);
-    if (!WriteFile(src_dir / "blocks.c", BuildAotSource())) {
+    const auto t_translate = std::chrono::steady_clock::now();
+    const std::string aot_src = BuildAotSource();
+    g_aot_compile.translate_ns = NsSince(t_translate);
+    {
+        const auto count = [&](std::string_view needle) {
+            u64 n = 0;
+            for (size_t p = 0; (p = aot_src.find(needle, p)) != std::string::npos;
+                 p += needle.size()) {
+                ++n;
+            }
+            return n;
+        };
+        ExpectTrue("bench C emits 512 recomp_store64 (not add-only)",
+                   count("recomp_store64") >= static_cast<u64>(kBenchAdds));
+        ExpectTrue("bench C emits 512 recomp_load64 (x0 reload)",
+                   count("recomp_load64") >= static_cast<u64>(kBenchAdds));
+    }
+    if (!WriteFile(src_dir / "blocks.c", aot_src)) {
         return false;
     }
     if (!WriteFile(src_dir / "CMakeLists.txt",
@@ -356,7 +921,11 @@ bool BuildAndLoadAot(const fs::path& root) {
                    "add_library(stack_aot SHARED blocks.c)\n"
                    "set_target_properties(stack_aot PROPERTIES\n"
                    "  POSITION_INDEPENDENT_CODE ON\n"
-                   "  C_VISIBILITY_PRESET default)\n")) {
+                   "  C_VISIBILITY_PRESET default)\n"
+                   "if (CMAKE_C_COMPILER_ID MATCHES \"GNU|Clang\")\n"
+                   "  target_compile_options(stack_aot PRIVATE\n"
+                   "    $<$<CONFIG:Release>:-O3>)\n"
+                   "endif()\n")) {
         return false;
     }
 
@@ -372,15 +941,19 @@ bool BuildAndLoadAot(const fs::path& root) {
     if (!cc.empty()) {
         cfg.push_back(std::string("-DCMAKE_C_COMPILER=") + cc);
     }
+    const auto t_cfg = std::chrono::steady_clock::now();
     if (RunArgs(cfg) != 0) {
         Fail("cmake configure aot blocks");
         return false;
     }
+    g_aot_compile.cmake_configure_ns = NsSince(t_cfg);
+    const auto t_build = std::chrono::steady_clock::now();
     if (RunArgs({SUYU_SMOKE_CMAKE, "--build", build.string(), "--config", "Release", "--target",
                  "stack_aot"}) != 0) {
         Fail("cmake build aot blocks");
         return false;
     }
+    g_aot_compile.cmake_build_ns = NsSince(t_build);
 
     fs::path so;
     for (const auto& p :
@@ -394,8 +967,20 @@ bool BuildAndLoadAot(const fs::path& root) {
         Fail("libstack_aot.so not found");
         return false;
     }
+    std::error_code ec;
+    const auto sz = fs::file_size(so, ec);
+    if (ec) {
+        Fail("file_size " + so.string() + ": " + ec.message());
+        return false;
+    }
+    g_aot_compile.so_bytes = static_cast<u64>(sz);
+    g_aot_compile.so_path = so.string();
+    PinAotBenchNotFolded(so);
+    PinClangDumpNotFalseFolded(src_dir / "blocks.c");
 
+    const auto t_dl = std::chrono::steady_clock::now();
     g_so = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+    g_aot_compile.dlopen_ns = NsSince(t_dl);
     if (!g_so) {
         Fail(std::string("dlopen: ") + dlerror());
         return false;
@@ -409,6 +994,9 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_aot_proof = reinterpret_cast<BlockFn>(dlsym(g_so, "block_aot_proof"));
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
+    g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
+    g_hm_load_calls = static_cast<u64*>(dlsym(g_so, "g_recomp_hm_load_calls"));
+    g_hm_store_calls = static_cast<u64*>(dlsym(g_so, "g_recomp_hm_store_calls"));
     ExpectTrue("dlsym recomp_set_module_base", g_set_base != nullptr);
     ExpectTrue("dlsym block_tls_svc", g_block_tls != nullptr);
     ExpectTrue("dlsym block_unhandled", g_block_unhandled != nullptr);
@@ -416,8 +1004,12 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym block_aot_proof", g_block_aot_proof != nullptr);
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
     ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
+    ExpectTrue("dlsym block_bench", g_block_bench != nullptr);
+    ExpectTrue("dlsym g_recomp_hm_load_calls", g_hm_load_calls != nullptr);
+    ExpectTrue("dlsym g_recomp_hm_store_calls", g_hm_store_calls != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
-           g_block_plain && g_block_step_no_svc;
+           g_block_plain && g_block_step_no_svc && g_block_bench && g_hm_load_calls &&
+           g_hm_store_calls;
 #endif
 }
 
@@ -448,6 +1040,9 @@ void WriteGuestImage(std::vector<u8>& image) {
     put(kOffPlain, kMovzX0_7);
     put(kOffPlain + 4, kSvc1);
     put(kOffStepNoSvc, kMovzX0_7);
+    for (const auto& [off, enc] : BenchInsns()) {
+        put(off, enc);
+    }
 }
 
 struct StackFixture {
@@ -931,6 +1526,396 @@ void ExportExecutionJson(const fs::path& path) {
     ScenarioPass("AOT/JIT execution JSON from live ArmRecomp stack", before);
 }
 
+nlohmann::json MetricsToJson(const Core::RecompExecutionMetrics& m) {
+    return {
+        {"backends",
+         {{"aot", {{"block_executions", m.aot_block_executions}, {"time_ns", m.aot_time_ns}}},
+          {"dynarmic",
+           {{"run_slices", m.dynarmic_run_slices},
+            {"step_slices", m.dynarmic_step_slices},
+            {"time_ns", m.dynarmic_time_ns}}}}},
+        {"transitions",
+         {{"aot_to_dynarmic", m.aot_to_dynarmic}, {"dynarmic_to_aot", m.dynarmic_to_aot}}},
+        {"fallback_reasons",
+         {{"lookup_miss", m.fallback_lookup_miss},
+          {"unhandled_opcode", m.fallback_unhandled_opcode},
+          {"icache_rejected", m.fallback_icache_rejected},
+          {"no_fallback_available", m.fallback_no_backend}}},
+        {"svc_calls", m.svc_calls},
+    };
+}
+
+Core::RecompExecutionMetrics MetricsDelta(const Core::RecompExecutionMetrics& after,
+                                         const Core::RecompExecutionMetrics& before) {
+    Core::RecompExecutionMetrics d;
+    const auto sub = [](u64 a, u64 b) { return a >= b ? a - b : 0; };
+    d.aot_block_executions = sub(after.aot_block_executions, before.aot_block_executions);
+    d.aot_time_ns = sub(after.aot_time_ns, before.aot_time_ns);
+    d.dynarmic_run_slices = sub(after.dynarmic_run_slices, before.dynarmic_run_slices);
+    d.dynarmic_step_slices = sub(after.dynarmic_step_slices, before.dynarmic_step_slices);
+    d.dynarmic_time_ns = sub(after.dynarmic_time_ns, before.dynarmic_time_ns);
+    d.aot_to_dynarmic = sub(after.aot_to_dynarmic, before.aot_to_dynarmic);
+    d.dynarmic_to_aot = sub(after.dynarmic_to_aot, before.dynarmic_to_aot);
+    d.fallback_lookup_miss = sub(after.fallback_lookup_miss, before.fallback_lookup_miss);
+    d.fallback_unhandled_opcode =
+        sub(after.fallback_unhandled_opcode, before.fallback_unhandled_opcode);
+    d.fallback_icache_rejected =
+        sub(after.fallback_icache_rejected, before.fallback_icache_rejected);
+    d.fallback_no_backend = sub(after.fallback_no_backend, before.fallback_no_backend);
+    d.svc_calls = sub(after.svc_calls, before.svc_calls);
+    return d;
+}
+
+struct SliceStats {
+    u64 count{};
+    u64 first_ns{};
+    u64 min_ns{};
+    u64 max_ns{};
+    u64 sum_ns{};
+    u64 mean_ns{};
+    u64 median_ns{};
+    u64 p95_ns{};
+};
+
+SliceStats SummarizeSlices(std::vector<u64> samples) {
+    SliceStats s;
+    if (samples.empty()) {
+        return s;
+    }
+    s.count = samples.size();
+    s.first_ns = samples.front();
+    s.sum_ns = std::accumulate(samples.begin(), samples.end(), u64{0});
+    s.mean_ns = s.sum_ns / s.count;
+    s.min_ns = *std::min_element(samples.begin(), samples.end());
+    s.max_ns = *std::max_element(samples.begin(), samples.end());
+    std::sort(samples.begin(), samples.end());
+    s.median_ns = samples[samples.size() / 2];
+    const size_t p95_i = (samples.size() * 95) / 100;
+    s.p95_ns = samples[std::min(p95_i, samples.size() - 1)];
+    return s;
+}
+
+nlohmann::json SliceStatsToJson(const SliceStats& s) {
+    return {
+        {"count", s.count},
+        {"first_ns", s.first_ns},
+        {"min_ns", s.min_ns},
+        {"median_ns", s.median_ns},
+        {"mean_ns", s.mean_ns},
+        {"p95_ns", s.p95_ns},
+        {"max_ns", s.max_ns},
+        {"sum_ns", s.sum_ns},
+        {"unit", "host_steady_clock_ns_per_RunThread"},
+        {"note", "No GPU frames in this harness; one RunThread until SVC is one slice/tick."},
+    };
+}
+
+struct ModeResult {
+    const char* id = "";
+    const char* description = "";
+    SliceStats slices{};
+    u64 startup_ns{};
+    u64 compile_ns{};
+    MemSnap mem_before{};
+    MemSnap mem_after_first{};
+    MemSnap mem_after{};
+    u64 x0{};
+    u32 svc{};
+    bool halt_svc{false};
+    Core::RecompExecutionMetrics exec{};
+    u64 hm_load_calls{};
+    u64 hm_store_calls{};
+};
+
+ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
+    ModeResult r;
+    r.id = hybrid_aot ? "hybrid_aot" : "jit";
+    r.description = hybrid_aot
+                        ? "ArmRecomp Translate AOT lookup hit; Dynarmic fallback must not run"
+                        : "ArmRecomp force-miss of the same PC; Dynarmic executes guest RX";
+    g_force_miss_pc = hybrid_aot ? 0 : (g_entry + kOffBench);
+
+    const u64 hm_load0 = HmLoadCalls();
+    const u64 hm_store0 = HmStoreCalls();
+    const auto before = Core::GetRecompExecutionMetrics();
+    r.mem_before = ReadMem();
+
+    std::vector<u64> times;
+    times.reserve(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
+        auto& ctx = f.thread->GetContext();
+        ctx = {};
+        ctx.pc = g_entry + kOffBench;
+        ctx.r[1] = 1;
+        ctx.r[3] = g_entry + kOffBenchScratch;
+        f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto hr = f.arm->RunThread(f.thread);
+        const u64 ns = NsSince(t0);
+        times.push_back(ns);
+        if (i == 0) {
+            r.mem_after_first = ReadMem();
+        }
+
+        const bool svc_halt = True(hr & Core::HaltReason::SupervisorCall);
+        r.halt_svc = r.halt_svc || svc_halt;
+        r.svc = f.arm->GetSvcNumber();
+        Kernel::Svc::ThreadContext out{};
+        f.arm->GetContext(out);
+        r.x0 = out.r[0];
+        if (!svc_halt) {
+            Fail(std::string(r.id) + " slice " + std::to_string(i) + " not SupervisorCall");
+        }
+        if (r.svc != kBenchSvcImm) {
+            Fail(std::string(r.id) + " svc got=" + std::to_string(r.svc) +
+                 " want=" + std::to_string(kBenchSvcImm));
+        }
+        if (r.x0 != static_cast<u64>(kBenchAdds)) {
+            Fail(std::string(r.id) + " x0 got=" + std::to_string(r.x0) +
+                 " want=" + std::to_string(kBenchAdds));
+        }
+    }
+    g_force_miss_pc = 0;
+    r.mem_after = ReadMem();
+    r.slices = SummarizeSlices(std::move(times));
+    r.startup_ns = r.slices.first_ns;
+    r.exec = MetricsDelta(Core::GetRecompExecutionMetrics(), before);
+    r.hm_load_calls = HmLoadCalls() - hm_load0;
+    r.hm_store_calls = HmStoreCalls() - hm_store0;
+    if (hybrid_aot) {
+        r.compile_ns = g_aot_compile.translate_ns + g_aot_compile.cmake_configure_ns +
+                       g_aot_compile.cmake_build_ns + g_aot_compile.dlopen_ns;
+    } else {
+        const u64 steady = r.slices.median_ns;
+        r.compile_ns = r.slices.first_ns > steady ? r.slices.first_ns - steady : 0;
+    }
+    return r;
+}
+
+nlohmann::json ModeToJson(const ModeResult& r) {
+    const std::int64_t rss_delta =
+        static_cast<std::int64_t>(r.mem_after.vmrss_kb) - static_cast<std::int64_t>(r.mem_before.vmrss_kb);
+    const std::int64_t rss_first_delta = static_cast<std::int64_t>(r.mem_after_first.vmrss_kb) -
+                                static_cast<std::int64_t>(r.mem_before.vmrss_kb);
+    nlohmann::json generated;
+    if (std::string_view(r.id) == "hybrid_aot") {
+        generated = {
+            {"aot_so_bytes", g_aot_compile.so_bytes},
+            {"aot_so_path", g_aot_compile.so_path},
+            {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes},
+            {"note", "so includes integration blocks as well as the bench block"},
+        };
+    } else {
+        generated = {
+            {"jit_rss_delta_after_first_slice_bytes", rss_first_delta * 1024},
+            {"jit_rss_delta_after_all_slices_bytes", rss_delta * 1024},
+            {"note", "RSS delta around first Dynarmic slice (code-cache commit + this block). "
+                     "Dynarmic reserves up to 128MiB code cache; RSS is committed pages."},
+        };
+    }
+    return {
+        {"backend", r.id},
+        {"description", r.description},
+        {"slices", SliceStatsToJson(r.slices)},
+        {"startup_ns", r.startup_ns},
+        {"compile_ns", r.compile_ns},
+        {"compile_ns_meaning",
+         std::string_view(r.id) == "hybrid_aot"
+             ? "AOT Translate + cmake configure/build of libstack_aot.so + dlopen"
+             : "approx first-JIT compile: first_slice_ns - median_ns"},
+        {"memory",
+         {{"sampler", "/proc/self/status"},
+          {"rss_kb_before", r.mem_before.vmrss_kb},
+          {"rss_kb_after_first_slice", r.mem_after_first.vmrss_kb},
+          {"rss_kb_after", r.mem_after.vmrss_kb},
+          {"rss_kb_delta", rss_delta},
+          {"hwm_kb_after", r.mem_after.vmhwm_kb},
+          {"vmsize_kb_after", r.mem_after.vmsize_kb}}},
+        {"generated_binary", std::move(generated)},
+        {"correctness",
+         {{"x0", r.x0},
+          {"svc", r.svc},
+          {"halt_supervisor_call", r.halt_svc},
+          {"expected_x0", kBenchAdds},
+          {"expected_svc", kBenchSvcImm}}},
+        {"execution_metrics_delta", MetricsToJson(r.exec)},
+        {"host_mem_callbacks",
+         {{"load", r.hm_load_calls},
+          {"store", r.hm_store_calls},
+          {"note", "recomp_load64/store64 increments around host_mem function-pointer "
+                   "calls; AOT bench must be 512 x iters; JIT must be 0"}}},
+    };
+}
+
+void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const ModeResult& jit,
+                         int iters) {
+    const int before = g_fails;
+    std::ostringstream entry_pc;
+    entry_pc << "0x" << std::hex << (g_entry + kOffBench);
+    const nlohmann::json doc{
+        {"schema_version", 1},
+        {"kind", "recomp_benchmark"},
+        {"clock", "steady_clock"},
+        {"related",
+         {{"recomp_execution", "schema_version 1 kind=recomp_execution from ArmRecomp (#2)"},
+          {"note", "Per-mode execution_metrics_delta is a GetRecompExecutionMetrics() window "
+                   "around that mode's slices, not the mixed-scenario recomp_execution.json."}}},
+        {"host", {{"cpu", HostCpu()}, {"rss_sampler", "/proc/self/status VmRSS/VmHWM/VmSize (kB)"}}},
+        {"workload",
+         {{"name", "alu_add_reload_svc"},
+          {"identical_across_backends", true},
+          {"anti_fold",
+           "each ADD is preceded by STR/LDR of x0 through host_mem function pointers "
+           "so -O3 cannot reduce 512 ADDs to x1<<9; JudgeAotBenchDump FAILs a "
+           "discriminating store+load+1 add+PLT jmp dump (PLT is not a loop); "
+           "named recomp_store64@plt is not the live pin; host_mem callbacks "
+           "must be 512 x iters"},
+          {"guest_pc_offset", "0x2400"},
+          {"entry_pc", entry_pc.str()},
+          {"guest_instruction_count", kBenchAdds * 3 + 2},
+          {"encodings",
+           nlohmann::json::array({
+               {{"asm", "movz x0, #0"}, {"encoding", "0xD2800000"}},
+               {{"asm", "str x0, [x3]"}, {"encoding", "0xF9000060"}, {"repeat", kBenchAdds}},
+               {{"asm", "ldr x0, [x3]"}, {"encoding", "0xF9400060"}, {"repeat", kBenchAdds}},
+               {{"asm", "add x0, x0, x1"},
+                {"encoding", "0x8B010000"},
+                {"repeat", kBenchAdds},
+                {"x1", 1}},
+               {{"asm", "svc #3"}, {"encoding", "0xD4000061"}},
+           })},
+          {"expected_x0", kBenchAdds},
+          {"expected_svc", kBenchSvcImm},
+          {"iters", iters}}},
+        {"aot_compile",
+         {{"translate_ns", g_aot_compile.translate_ns},
+          {"bench_translate_ns", g_aot_compile.bench_translate_ns},
+          {"cmake_configure_ns", g_aot_compile.cmake_configure_ns},
+          {"cmake_build_ns", g_aot_compile.cmake_build_ns},
+          {"dlopen_ns", g_aot_compile.dlopen_ns},
+          {"so_bytes", g_aot_compile.so_bytes},
+          {"so_path", g_aot_compile.so_path},
+          {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes},
+          {"host_opt_check",
+           {{"method", "objdump -d <block_bench> + JudgeAotBenchDump + host_mem callback counts"},
+            {"pin",
+             "FAIL dump if shl $0x9 / imul $512, or if too few adds and no in-function "
+             "loop. A jmp to a lower recomp_svc@plt is plt_jumps not a loop "
+             "(discriminating dump: store+load + 1 add + PLT jmp + no shl/imul). "
+             "Named recomp_store64@plt is gcc PIC, not required for PASS. Live "
+             "store/load pin is host_mem_callbacks == 512 * iters."},
+            {"add_mnemonics", g_aot_compile.disasm_add_count},
+            {"shift_by_9", g_aot_compile.disasm_shl9_count},
+            {"imul_512", g_aot_compile.disasm_imul512_count},
+            {"backward_jumps", g_aot_compile.disasm_backward_jumps},
+            {"plt_jumps", g_aot_compile.disasm_plt_jumps},
+            {"named_store64_plt", g_aot_compile.disasm_store64_calls},
+            {"named_load64_plt", g_aot_compile.disasm_load64_calls},
+            {"not_single_shift", g_aot_compile.not_single_shift},
+            {"clang_o3",
+             {{"add_mnemonics", g_aot_compile.clang_disasm_add},
+              {"named_store64_plt", g_aot_compile.clang_disasm_store64},
+              {"named_load64_plt", g_aot_compile.clang_disasm_load64},
+              {"not_reported_folded", g_aot_compile.clang_not_reported_folded},
+              {"reason", g_aot_compile.clang_dump_reason}}},
+            {"excerpt", g_aot_compile.disasm_excerpt}}}}},
+        {"modes", {{"hybrid_aot", ModeToJson(aot)}, {"jit", ModeToJson(jit)}}},
+    };
+
+    if (path.has_parent_path()) {
+        fs::create_directories(path.parent_path());
+    }
+    {
+        std::ofstream out(path);
+        if (!out) {
+            Fail("write " + path.string());
+            return;
+        }
+        out << doc.dump(2) << '\n';
+        if (!out) {
+            Fail("flush " + path.string());
+            return;
+        }
+    }
+    Pass("wrote " + path.string());
+
+    std::ifstream in(path);
+    std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ExpectTrue("bench JSON kind recomp_benchmark",
+               json.find("\"kind\": \"recomp_benchmark\"") != std::string::npos);
+    ExpectTrue("bench JSON schema_version 1",
+               json.find("\"schema_version\": 1") != std::string::npos);
+    ExpectTrue("bench JSON hybrid_aot mode", json.find("\"hybrid_aot\"") != std::string::npos);
+    ExpectTrue("bench JSON jit mode", json.find("\"jit\"") != std::string::npos);
+    ExpectTrue("bench JSON not_single_shift",
+               json.find("\"not_single_shift\": true") != std::string::npos);
+    ExpectTrue("bench JSON host_mem_callbacks",
+               json.find("\"host_mem_callbacks\"") != std::string::npos);
+    std::cout << "recomp_benchmark.json path: " << path << "\n";
+    std::cout << "=== recomp_benchmark.json ===\n" << json << std::endl;
+    ScenarioPass("JIT vs hybrid AOT benchmark JSON from identical guest fixture", before);
+}
+
+void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
+    const int before = g_fails;
+    // Fresh application process: AllowsAot, lookup still set, Dynarmic not yet
+    // constructed. Hybrid AOT runs first so JIT compile is isolated to the jit mode.
+    if (!f.BootstrapSecondProcess()) {
+        return;
+    }
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("bench ArmRecomp", recomp != nullptr);
+    ExpectTrue("bench AllowsAot", recomp && recomp->AllowsAot());
+    ExpectTrue("bench lookup registered",
+               Lookup(g_entry + kOffBench) == g_block_bench && g_block_bench != nullptr);
+    ExpectEq("bench guest RX movz", f.system.ApplicationMemory().Read32(g_entry + kOffBench),
+             kMovzX0_0);
+    ExpectEq("bench guest RX str", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 4),
+             kStrX0X3);
+    ExpectEq("bench guest RX ldr", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 8),
+             kLdrX0X3);
+    ExpectEq("bench guest RX add", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 12),
+             kAddX0X0X1);
+    ExpectEq("bench guest RX svc",
+             f.system.ApplicationMemory().Read32(g_entry + kOffBench + 4ull +
+                                                 12ull * static_cast<u64>(kBenchAdds)),
+             kSvc3);
+    ExpectTrue("AOT .so not_single_shift (objdump pin)", g_aot_compile.not_single_shift);
+
+    const int iters = BenchIters();
+    std::cout << "bench iters=" << iters << " adds=" << kBenchAdds << " pc=" << std::hex
+              << (g_entry + kOffBench) << std::dec << "\n";
+
+    const ModeResult aot = RunIdenticalWorkload(f, true, iters);
+    ExpectTrue("hybrid AOT stayed on AOT", aot.exec.aot_block_executions >= static_cast<u64>(iters));
+    ExpectTrue("hybrid AOT time_ns > 0", aot.exec.aot_time_ns > 0);
+    ExpectEq("hybrid AOT no Dynarmic fallback", aot.exec.dynarmic_run_slices, 0);
+    ExpectEq("hybrid AOT no lookup miss", aot.exec.fallback_lookup_miss, 0);
+    ExpectTrue("hybrid AOT slice times real", aot.slices.median_ns > 0 && aot.slices.first_ns > 0);
+    ExpectTrue("AOT so_bytes > 0", g_aot_compile.so_bytes > 0);
+    ExpectTrue("AOT compile_ns > 0", aot.compile_ns > 0);
+    ExpectEq("AOT host_mem store callbacks", aot.hm_store_calls,
+             static_cast<u64>(kBenchAdds) * static_cast<u64>(iters));
+    ExpectEq("AOT host_mem load callbacks", aot.hm_load_calls,
+             static_cast<u64>(kBenchAdds) * static_cast<u64>(iters));
+
+    const ModeResult jit = RunIdenticalWorkload(f, false, iters);
+    ExpectTrue("JIT Dynarmic slices", jit.exec.dynarmic_run_slices >= static_cast<u64>(iters));
+    ExpectTrue("JIT Dynarmic time_ns > 0", jit.exec.dynarmic_time_ns > 0);
+    ExpectTrue("JIT lookup miss recorded", jit.exec.fallback_lookup_miss > 0);
+    ExpectEq("JIT did not execute AOT blocks", jit.exec.aot_block_executions, 0);
+    ExpectTrue("JIT slice times real", jit.slices.median_ns > 0 && jit.slices.first_ns > 0);
+    ExpectEq("JIT host_mem store callbacks (AOT helpers unused)", jit.hm_store_calls, 0);
+    ExpectEq("JIT host_mem load callbacks (AOT helpers unused)", jit.hm_load_calls, 0);
+    ExpectEq("both modes x0", aot.x0, jit.x0);
+    ExpectEq("both modes svc", static_cast<u64>(aot.svc), static_cast<u64>(jit.svc));
+
+    ExportBenchmarkJson(json_path, aot, jit, iters);
+    ScenarioPass("identical JIT vs hybrid AOT workload (slice/startup/compile/memory/size)",
+                 before);
+}
+
 void PrintGaps() {
     std::cout
         << "GAPS (honest / out of scope):\n"
@@ -938,12 +1923,20 @@ void PrintGaps() {
         << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
         << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
         << "  - gdbstub StepThread against a live title\n"
-        << "  - JIT vs hybrid AOT benchmarks (backlog #3) — JSON is the input, not the race\n"
+        << "  - GPU frame times (this harness has no renderer; slice = RunThread until SVC)\n"
+        << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
+        << "  - AOT .so size includes non-bench integration blocks\n"
+        << "  - Bench slice is ADD+STR+LDR (anti-fold), not a pure ALU stream\n"
+        << "  - #4 instruction correctness, #5 compatibility, #6 opts, #7 release-gate\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
         << "  leftover pending_svc cleared on StepThread, live AOT/Dynarmic timers +\n"
-        << "  fallback reasons + icache JSON export (path-safe tmp+rename).\n";
+        << "  fallback reasons + icache JSON export (path-safe tmp+rename),\n"
+        << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json),\n"
+        << "  JudgeAotBenchDump FAILs discriminating PLT dump (counts lock PLT vs loop);\n"
+        << "  live gcc -O3 PASS; named store/load PLT not required; host_mem callbacks "
+           "512 x iters.\n";
 }
 
 } // namespace
@@ -952,6 +1945,9 @@ int main() {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
     std::cout << "recomp_stack_harness: SetRecompLookup ArmRecomp + Translate AOT + Dynarmic\n";
+    std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark)\n";
+
+    ScenarioFoldPinSelfCheck();
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const fs::path root =
@@ -985,6 +1981,14 @@ int main() {
         return work / "recomp_execution.json";
     }(root);
     ExportExecutionJson(json_path);
+
+    const fs::path bench_path = [](const fs::path& work) {
+        if (const char* env = std::getenv("SUYU_RECOMP_BENCHMARK_JSON"); env && env[0] != '\0') {
+            return fs::path(env);
+        }
+        return work / "recomp_benchmark.json";
+    }(root);
+    ScenarioBenchmark(*fix, bench_path);
     PrintGaps();
 
     if (g_fails == 0) {
