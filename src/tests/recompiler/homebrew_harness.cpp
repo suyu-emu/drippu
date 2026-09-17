@@ -878,6 +878,19 @@ void recomp_set_flags(GuestContext* c, int is_sub, uint64_t a, uint64_t b, uint6
     if (is_sub) { c->c = (a >= b); c->v = (((a ^ b) & (a ^ r)) & s) ? 1 : 0; }
     else { c->c = (r < a); c->v = ((~(a ^ b) & (a ^ r)) & s) ? 1 : 0; }
 }
+/* Same condition table the runtime translator uses (for CCMN/CCMP). */
+int recomp_cond(GuestContext* c, unsigned cond) {
+    switch (cond >> 1) {
+    case 0: return cond & 1 ? !c->z : c->z;
+    case 1: return cond & 1 ? !c->c : c->c;
+    case 2: return cond & 1 ? !c->n : c->n;
+    case 3: return cond & 1 ? !c->v : c->v;
+    case 4: return (cond & 1 ? !(c->c && !c->z) : (c->c && !c->z));
+    case 5: return (cond & 1 ? !(c->n == c->v) : (c->n == c->v));
+    case 6: return (cond & 1 ? !(!c->z && c->n == c->v) : (!c->z && c->n == c->v));
+    default: return 1;
+    }
+}
 uint64_t recomp_umulh(uint64_t a, uint64_t b) {
     uint64_t al = a & 0xFFFFFFFFULL, ah = a >> 32, bl = b & 0xFFFFFFFFULL, bh = b >> 32;
     uint64_t ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
@@ -908,7 +921,11 @@ typedef void (*InsnFn)(GuestContext*);
     src << "    K_And64, K_Orr64, K_Eor64, K_Ands64, K_BicAsr31W, K_AddImm64,\n";
     src << "    K_Movz64, K_Movk64, K_Movn64, K_Udiv64, K_Sdiv64, K_Udiv32, K_Sdiv32,\n";
     src << "    K_Lslv64, K_Lsrv64, K_Asrv64, K_Rorv64, K_Lslv32, K_Asrv32, K_Madd64,\n";
-    src << "    K_Str64, K_Ldr64, K_Strb, K_Ldrb, K_Ldrsb64\n";
+    src << "    K_Str64, K_Ldr64, K_Strb, K_Ldrb, K_Ldrsb64,\\\n";
+    src << "    K_Adds64Lsl1, K_Adds64Lsl63, K_Subs64Asr31, K_Adds32Lsl2,\\\n";
+    src << "    K_Ands64Lsr7, K_Ands32Asr5, K_Bics64Ror13, K_Tst64Lsl3,\\\n";
+    src << "    K_Adc64, K_Sbc64, K_Adcs64, K_Sbcs64, K_Adcs32,\\\n";
+    src << "    K_Ccmn64, K_Ccmp64, K_CcmpImm64\n";
     src << "} Kind;\n";
 
     src << "typedef struct { const char* name; Kind kind; InsnFn fn; } Case;\n";
@@ -930,7 +947,8 @@ static uint64_t xs_next(void) {
 }
 
 /* Independent ARM-spec expected values (not copied from Translate output). */
-static uint64_t expect_result(Kind k, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
+static uint64_t expect_result(Kind k, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
+                              unsigned c_in) {
     switch (k) {
     case K_Add64: return x1 + x2;
     case K_Add32: return (uint64_t)(uint32_t)((uint32_t)x1 + (uint32_t)x2);
@@ -978,7 +996,41 @@ static uint64_t expect_result(Kind k, uint64_t x0, uint64_t x1, uint64_t x2, uin
     case K_Lslv32: return (uint64_t)(uint32_t)((uint32_t)x1 << (x2 & 31));
     case K_Asrv32: return (uint64_t)(uint32_t)((int32_t)(uint32_t)x1 >> (x2 & 31));
     case K_Madd64: return x3 + x1 * x2;
+    case K_Adds64Lsl1: return x1 + (x2 << 1);
+    case K_Adds64Lsl63: return x1 + (x2 << 63);
+    case K_Subs64Asr31: return x1 - (uint64_t)((int64_t)x2 >> 31);
+    case K_Adds32Lsl2: return (uint64_t)(uint32_t)((uint32_t)x1 + (uint32_t)((uint32_t)x2 << 2));
+    case K_Ands64Lsr7: return x1 & (x2 >> 7);
+    case K_Ands32Asr5:
+        return (uint64_t)(uint32_t)((uint32_t)x1 & (uint32_t)((int32_t)(uint32_t)x2 >> 5));
+    case K_Bics64Ror13: return x1 & ~((x2 >> 13) | (x2 << 51));
+    case K_Tst64Lsl3: return x0; /* TST writes no register */
+    case K_Adc64: return x1 + x2 + c_in;
+    case K_Sbc64: return x1 + ~x2 + c_in;
+    case K_Adcs64: return x1 + x2 + c_in;
+    case K_Sbcs64: return x1 + ~x2 + c_in;
+    case K_Adcs32: return (uint64_t)(uint32_t)((uint32_t)x1 + (uint32_t)x2 + c_in);
+    case K_Ccmn64: return x0; /* conditional compare writes no register */
+    case K_Ccmp64: return x0;
+    case K_CcmpImm64: return x0;
     default: return 0;
+    }
+}
+
+/* Expected NZCV for a plain add/sub (no carry-in), mirroring recomp_set_flags. */
+static void expect_addsub_nzcv(GuestContext* c, uint64_t a, uint64_t b, uint64_t r, int is_sub,
+                               int is64) {
+    uint64_t m = is64 ? ~0ULL : 0xFFFFFFFFULL;
+    r &= m; a &= m; b &= m;
+    uint64_t s = is64 ? 0x8000000000000000ULL : 0x80000000ULL;
+    expect_eq("addsub.n", c->n, (r & s) ? 1 : 0);
+    expect_eq("addsub.z", c->z, (r == 0));
+    if (is_sub) {
+        expect_eq("addsub.c", c->c, (a >= b) ? 1 : 0);
+        expect_eq("addsub.v", c->v, (((a ^ b) & (a ^ r)) & s) ? 1 : 0);
+    } else {
+        expect_eq("addsub.c", c->c, (r < a) ? 1 : 0);
+        expect_eq("addsub.v", c->v, ((~(a ^ b) & (a ^ r)) & s) ? 1 : 0);
     }
 }
 
@@ -1034,7 +1086,7 @@ static void run_one(const Case* cs, uint64_t x0, uint64_t x1, uint64_t x2, uint6
         apply_mem_expect(cs->kind, &c, x0, c.mem_base_vaddr);
         return;
     }
-    uint64_t want = expect_result(cs->kind, x0, x1, x2, x3);
+    uint64_t want = expect_result(cs->kind, x0, x1, x2, x3, preset_c);
     expect_eq(cs->name, c.x[0], want);
     if (cs->kind == K_Adds64 || cs->kind == K_Subs64) {
         int is_sub = cs->kind == K_Subs64;
@@ -1048,13 +1100,71 @@ static void run_one(const Case* cs, uint64_t x0, uint64_t x1, uint64_t x2, uint6
         expect_eq("nzcv.c", c.c, ec);
         expect_eq("nzcv.v", c.v, ev);
     }
-    if (cs->kind == K_Ands64) {
-        expect_eq("ands.z", c.z, (want == 0));
-        expect_eq("ands.n", c.n, (want >> 63) & 1);
-        /* A64/Dynarmic write C=V=0. preset_c/v start 1 on most trials so a
-           stale leave-C/V-alone emit fails these. */
+    if (cs->kind == K_Adds64Lsl1 || cs->kind == K_Adds64Lsl63 || cs->kind == K_Subs64Asr31) {
+        uint64_t a = x1, b;
+        if (cs->kind == K_Adds64Lsl1) b = x2 << 1;
+        else if (cs->kind == K_Adds64Lsl63) b = x2 << 63;
+        else b = (uint64_t)((int64_t)x2 >> 31);
+        expect_addsub_nzcv(&c, a, b, want, cs->kind == K_Subs64Asr31, 1);
+    }
+    if (cs->kind == K_Adds32Lsl2) {
+        uint64_t a = (uint32_t)x1, b = (uint64_t)(uint32_t)((uint32_t)x2 << 2);
+        expect_addsub_nzcv(&c, a, b, want, 0, 0);
+    }
+    if (cs->kind == K_Ands64 || cs->kind == K_Ands64Lsr7 || cs->kind == K_Ands32Asr5 ||
+        cs->kind == K_Bics64Ror13 || cs->kind == K_Tst64Lsl3) {
+        /* A64/Dynarmic compute N/Z from the result and clear C/V. TST writes
+           no register, so derive the flags from the logical result instead. */
+        uint64_t lr = (cs->kind == K_Tst64Lsl3) ? (x1 & (x2 << 3)) : want;
+        uint64_t s = (cs->kind == K_Ands32Asr5) ? 0x80000000ULL : 0x8000000000000000ULL;
+        expect_eq("ands.z", c.z, (lr == 0));
+        expect_eq("ands.n", c.n, (lr & s) ? 1 : 0);
+        /* preset_c/v start 1 on most trials so a stale leave-C/V-alone emit
+           fails these. */
         expect_eq("ands.c_cleared", c.c, 0);
         expect_eq("ands.v_cleared", c.v, 0);
+    }
+    if (cs->kind == K_Adc64 || cs->kind == K_Sbc64) {
+        /* The non-S variants must leave the flags alone. */
+        expect_eq("adc.n_kept", c.n, 1);
+        expect_eq("adc.z_kept", c.z, 0);
+        expect_eq("adc.c_kept", c.c, preset_c);
+        expect_eq("adc.v_kept", c.v, 1);
+    }
+    if (cs->kind == K_Adcs64 || cs->kind == K_Sbcs64) {
+        uint64_t a = x1, b = (cs->kind == K_Sbcs64) ? ~x2 : x2;
+        uint64_t r = a + b + preset_c;
+        uint64_t s = 0x8000000000000000ULL;
+        expect_eq("adcs.n", c.n, (r & s) ? 1 : 0);
+        expect_eq("adcs.z", c.z, (r == 0));
+        expect_eq("adcs.c", c.c, ((r < a) || (preset_c && r == a)) ? 1 : 0);
+        expect_eq("adcs.v", c.v, ((~(a ^ b) & (a ^ r)) & s) ? 1 : 0);
+    }
+    if (cs->kind == K_Adcs32) {
+        uint64_t a = (uint32_t)x1, b = (uint32_t)x2;
+        uint64_t r = (a + b + preset_c) & 0xFFFFFFFFULL;
+        uint64_t s = 0x80000000ULL;
+        expect_eq("adcs32.n", c.n, (r & s) ? 1 : 0);
+        expect_eq("adcs32.z", c.z, (r == 0));
+        expect_eq("adcs32.c", c.c, ((a + b + preset_c) > 0xFFFFFFFFULL) ? 1 : 0);
+        expect_eq("adcs32.v", c.v, ((~(a ^ b) & (a ^ r)) & s) ? 1 : 0);
+    }
+    if (cs->kind == K_Ccmn64 || cs->kind == K_Ccmp64 || cs->kind == K_CcmpImm64) {
+        unsigned cond = (cs->kind == K_Ccmn64) ? 1 : (cs->kind == K_Ccmp64) ? 0 : 2;
+        uint64_t b = (cs->kind == K_CcmpImm64) ? 7 : x2;
+        int is_sub = (cs->kind != K_Ccmn64);
+        uint64_t else_nzcv = (cs->kind == K_Ccmn64) ? 0xA : (cs->kind == K_Ccmp64) ? 0x5 : 0x3;
+        GuestContext tc;
+        memset(&tc, 0, sizeof tc);
+        tc.n = 1; tc.z = 0; tc.c = preset_c; tc.v = 1;
+        if (recomp_cond(&tc, cond)) {
+            expect_addsub_nzcv(&c, x1, b, is_sub ? x1 - b : x1 + b, is_sub, 1);
+        } else {
+            expect_eq("ccmp.n", c.n, (else_nzcv >> 3) & 1);
+            expect_eq("ccmp.z", c.z, (else_nzcv >> 2) & 1);
+            expect_eq("ccmp.c", c.c, (else_nzcv >> 1) & 1);
+            expect_eq("ccmp.v", c.v, else_nzcv & 1);
+        }
     }
 }
 
