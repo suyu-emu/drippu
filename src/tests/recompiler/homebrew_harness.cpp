@@ -12,7 +12,8 @@
 //   - I-cache invalidation refusing stale AOT
 //   - Stop/relaunch (session detach/attach + new ASLR bases)
 //   - StepThread policy audit (miss / unhandled must use the same fallback
-//     entry as RunThread; production ArmRecomp::StepThread is fixed to match)
+//     entry as RunThread; leftover pending_svc is cleared at step entry so a
+//     non-SVC AOT block is not reported as SupervisorCall)
 //
 // Standalone: no System/Kernel/Dynarmic. Real ArmRecomp+Dynarmic+kernel coverage
 // lives in recomp_stack_harness (full-tree build only).
@@ -244,6 +245,8 @@ StepPolicyOutcome ClassifyStep(bool has_lookup, bool aot_hit, bool after_unhandl
         return fallback_available ? StepPolicyOutcome::EnterFallbackUnhandled
                                   : StepPolicyOutcome::PrefetchAbortNoFallback;
     }
+    // pending_svc here is "this step's AOT block parked an SVC", not leftover
+    // from a prior halt. StepThread clears leftover at entry (see C probe).
     if (pending_svc) {
         return StepPolicyOutcome::SupervisorCall;
     }
@@ -273,7 +276,7 @@ void TestStepThreadPolicy() {
     if (ClassifyStep(true, true, false, true, true) != StepPolicyOutcome::SupervisorCall) {
         fail("StepThread policy: pending SVC should surface");
     } else {
-        pass("StepThread policy: pending SVC surfaces");
+        pass("StepThread policy: this-step pending SVC surfaces");
     }
 
     // Document the pre-fix defect the review called out: miss returned
@@ -510,6 +513,9 @@ static HaltReason run_thread(GuestContext* c, int max_blocks) {
 
 /* Fixed StepThread policy (matches production after arm_recomp.cpp fix). */
 static HaltReason step_thread(GuestContext* c) {
+    if (c->pending_svc != NO_SVC) {
+        c->pending_svc = NO_SVC;
+    }
     BlockFn block = lookup_aot(c->pc);
     if (!block) {
         ++g_fallback_entries;
@@ -688,6 +694,25 @@ static int scenario_step_miss_and_unhandled(void) {
     HaltReason s = step_thread(&c);
     expect_eq("step_ok", (uint64_t)s, (uint64_t)HR_StepThread);
     expect_eq("step_ok_x0", c.x[0], 7);
+
+    /* Leftover pending_svc from a prior SVC halt must not make a non-SVC AOT
+       step report SupervisorCall (production ArmRecomp::StepThread used to). */
+    reset_ctx(&c, mem, 0, sizeof mem);
+    c.pc = 0x3000;
+    c.pending_svc = 99;
+    HaltReason leftover = step_thread(&c);
+    expect_eq("step_leftover_hr", (uint64_t)leftover, (uint64_t)HR_StepThread);
+    expect_eq("step_leftover_cleared", c.pending_svc, NO_SVC);
+    expect_eq("step_leftover_x0", c.x[0], 7);
+
+    /* Leftover is cleared, then this step's own SVC still surfaces. */
+    reset_ctx(&c, mem, 0, sizeof mem);
+    c.pc = 0x1000;
+    c.x[4] = 0x10;
+    c.pending_svc = 99;
+    HaltReason this_svc = step_thread(&c);
+    expect_eq("step_this_svc_hr", (uint64_t)this_svc, (uint64_t)HR_SupervisorCall);
+    expect_eq("step_this_svc_imm", c.pending_svc, 42);
     return g_fail;
 }
 

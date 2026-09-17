@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -142,6 +143,7 @@ constexpr u64 kOffMissPark = 0x1008;
 // AOT proof: Translate MOVZ #7 / SVC #1, but guest RX is BEEF/99 (Dynarmic twin differs).
 constexpr u64 kOffAotProof = 0x1400;
 constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
+constexpr u64 kOffStepNoSvc = 0x1C00; // MOVZ #7 only — leftover pending_svc pin
 constexpr u64 kOffCrossPage = 0x1FFC;
 constexpr u64 kCodeBytes = 3 * Kernel::PageSize;
 constexpr u64 kImageBytes = 4 * Kernel::PageSize;
@@ -176,6 +178,7 @@ BlockFn g_block_miss = nullptr;
 BlockFn g_block_miss_park = nullptr;
 BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
+BlockFn g_block_step_no_svc = nullptr;
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
 
@@ -213,6 +216,9 @@ Core::RecompBlockFn Lookup(u64 pc) {
     if (pc == g_entry + kOffPlain) {
         return g_block_plain;
     }
+    if (pc == g_entry + kOffStepNoSvc) {
+        return g_block_step_no_svc;
+    }
     return nullptr;
 }
 
@@ -235,6 +241,7 @@ std::string BuildAotSource() {
     const std::string t_proof_svc = TranslateInsn(kSvc1, kOffAotProof + 4);
     const std::string t_mov7 = TranslateInsn(kMovzX0_7, kOffPlain);
     const std::string t_svc1 = TranslateInsn(kSvc1, kOffPlain + 4);
+    const std::string t_step_mov7 = TranslateInsn(kMovzX0_7, kOffStepNoSvc);
 
     std::ostringstream src;
     src << R"C(#include <stdint.h>
@@ -320,6 +327,13 @@ void block_plain(GuestContext* c) {
 )C";
     src << t_mov7 << t_svc1;
     src << R"C(}
+
+void block_step_no_svc(GuestContext* c) {
+)C";
+    src << t_step_mov7;
+    src << "    c->pc = g_module_base + 0x" << std::hex << (kOffStepNoSvc + 4) << std::dec
+        << "ULL;\n";
+    src << R"C(}
 )C";
     return src.str();
 }
@@ -394,14 +408,16 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_miss_park = reinterpret_cast<BlockFn>(dlsym(g_so, "block_miss_park"));
     g_block_aot_proof = reinterpret_cast<BlockFn>(dlsym(g_so, "block_aot_proof"));
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
+    g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
     ExpectTrue("dlsym recomp_set_module_base", g_set_base != nullptr);
     ExpectTrue("dlsym block_tls_svc", g_block_tls != nullptr);
     ExpectTrue("dlsym block_unhandled", g_block_unhandled != nullptr);
     ExpectTrue("dlsym block_miss", g_block_miss != nullptr);
     ExpectTrue("dlsym block_aot_proof", g_block_aot_proof != nullptr);
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
+    ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
-           g_block_plain;
+           g_block_plain && g_block_step_no_svc;
 #endif
 }
 
@@ -431,6 +447,7 @@ void WriteGuestImage(std::vector<u8>& image) {
     // Plain / icache site (guest RX matches Translate).
     put(kOffPlain, kMovzX0_7);
     put(kOffPlain + 4, kSvc1);
+    put(kOffStepNoSvc, kMovzX0_7);
 }
 
 struct StackFixture {
@@ -695,6 +712,30 @@ void ScenarioSvcTlsCrossPage(StackFixture& f) {
     ScenarioPass("Translate AOT SVC/TLS/cross-page via ApplicationMemory", before);
 }
 
+void ScenarioLeftoverSvcStep(StackFixture& f) {
+    const int before = g_fails;
+    // ScenarioSvcTlsCrossPage left pending_svc=42. LoadContext does not clear it.
+    ExpectEq("leftover svc still parked", f.arm->GetSvcNumber(), 42);
+
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffStepNoSvc;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+
+    const auto hr = f.arm->StepThread(f.thread);
+    ExpectTrue("leftover-svc step is StepThread, not SupervisorCall",
+               True(hr & Core::HaltReason::StepThread));
+    ExpectTrue("leftover-svc step is not SupervisorCall",
+               !True(hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("leftover svc cleared (not this step)", f.arm->GetSvcNumber(),
+             static_cast<u32>(~0u));
+    Kernel::Svc::ThreadContext out{};
+    f.arm->GetContext(out);
+    ExpectEq("leftover-svc step x0", out.r[0], 7);
+    ExpectEq("leftover-svc step pc", out.pc, g_entry + kOffStepNoSvc + 4);
+    ScenarioPass("StepThread clears leftover pending_svc before a non-SVC AOT block", before);
+}
+
 void ScenarioLoadContextTls(StackFixture& f) {
     const int before = g_fails;
     auto& core0 = f.system.Kernel().PhysicalCore(0);
@@ -844,6 +885,52 @@ void ScenarioStepMiss(StackFixture& f) {
     ScenarioPass("StepThread force-miss of registered AOT uses Dynarmic step", before);
 }
 
+void ExportExecutionJson(const fs::path& path) {
+    const int before = g_fails;
+    if (!Core::WriteRecompExecutionJson(path)) {
+        Fail("WriteRecompExecutionJson " + path.string());
+        return;
+    }
+    Pass("wrote " + path.string());
+    ExpectTrue("JSON overwrite via tmp+rename", Core::WriteRecompExecutionJson(path));
+    const fs::path def = Core::DefaultRecompExecutionJsonPath();
+    if (def != path) {
+        ExpectTrue("also wrote default LogDir JSON", Core::WriteRecompExecutionJson({}));
+    }
+
+    std::ifstream in(path);
+    std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ExpectTrue("JSON file not empty", !json.empty());
+    ExpectTrue("JSON schema_version 1", json.find("\"schema_version\": 1") != std::string::npos);
+    ExpectTrue("JSON kind recomp_execution", json.find("\"kind\": \"recomp_execution\"") != std::string::npos);
+    ExpectTrue("JSON clock steady_clock", json.find("\"clock\": \"steady_clock\"") != std::string::npos);
+    ExpectTrue("JSON backends.aot", json.find("\"aot\"") != std::string::npos);
+    ExpectTrue("JSON backends.dynarmic", json.find("\"dynarmic\"") != std::string::npos);
+    ExpectTrue("JSON fallback_reasons", json.find("\"fallback_reasons\"") != std::string::npos);
+    ExpectTrue("JSON icache", json.find("\"icache\"") != std::string::npos);
+
+    const auto m = Core::GetRecompExecutionMetrics();
+    ExpectEq("metrics schema", static_cast<u64>(Core::RecompExecutionMetrics::kSchemaVersion), 1);
+    ExpectTrue("AOT block_executions > 0", m.aot_block_executions > 0);
+    ExpectTrue("AOT time_ns > 0", m.aot_time_ns > 0);
+    ExpectTrue("Dynarmic run+step slices > 0",
+               (m.dynarmic_run_slices + m.dynarmic_step_slices) > 0);
+    ExpectTrue("Dynarmic time_ns > 0", m.dynarmic_time_ns > 0);
+    ExpectTrue("aot_to_dynarmic > 0", m.aot_to_dynarmic > 0);
+    ExpectTrue("fallback lookup_miss > 0", m.fallback_lookup_miss > 0);
+    ExpectTrue("fallback unhandled_opcode > 0", m.fallback_unhandled_opcode > 0);
+    ExpectTrue("fallback icache_rejected > 0", m.fallback_icache_rejected > 0);
+    ExpectTrue("ClearInstructionCache recorded", m.clear_instruction_cache_calls > 0);
+    ExpectTrue("InvalidateCacheRange recorded (not a permanent reject)",
+               m.invalidate_cache_range_calls > 0);
+    ExpectTrue("permanent AOT reject recorded", m.permanent_aot_reject_events > 0);
+
+    std::cout << "recomp_execution.json path: " << path << "\n";
+    std::cout << "also: " << Core::DefaultRecompExecutionJsonPath() << "\n";
+    std::cout << "=== recomp_execution.json ===\n" << json << std::endl;
+    ScenarioPass("AOT/JIT execution JSON from live ArmRecomp stack", before);
+}
+
 void PrintGaps() {
     std::cout
         << "GAPS (honest / out of scope):\n"
@@ -851,9 +938,12 @@ void PrintGaps() {
         << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
         << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
         << "  - gdbstub StepThread against a live title\n"
+        << "  - JIT vs hybrid AOT benchmarks (backlog #3) — JSON is the input, not the race\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
-        << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread.\n";
+        << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
+        << "  leftover pending_svc cleared on StepThread, live AOT/Dynarmic timers +\n"
+        << "  fallback reasons + icache JSON export (path-safe tmp+rename).\n";
 }
 
 } // namespace
@@ -878,6 +968,7 @@ int main() {
 
     ScenarioAotLiveProof(*fix); // before Clear: proves Lookup + AOT != Dynarmic twin
     ScenarioSvcTlsCrossPage(*fix);
+    ScenarioLeftoverSvcStep(*fix);
     ScenarioLoadContextTls(*fix);
     // Force-miss + unhandled need AllowsAot (registered Translate blocks).
     ScenarioForceMissRegistered(*fix);
@@ -886,6 +977,14 @@ int main() {
     ScenarioInvalidation(*fix);
     ScenarioRestart(*fix);
     ScenarioStepMiss(*fix);
+
+    const fs::path json_path = [](const fs::path& work) {
+        if (const char* env = std::getenv("SUYU_RECOMP_EXECUTION_JSON"); env && env[0] != '\0') {
+            return fs::path(env);
+        }
+        return work / "recomp_execution.json";
+    }(root);
+    ExportExecutionJson(json_path);
     PrintGaps();
 
     if (g_fails == 0) {

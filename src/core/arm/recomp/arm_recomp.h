@@ -4,7 +4,9 @@
 #pragma once
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
+#include <string>
 
 #include "core/arm/arm_interface.h"
 
@@ -62,6 +64,52 @@ void SetRecompBaseSetter(RecompBaseFn setter);
 /// Returns the registered lookup, or nullptr when no recompiled image is
 /// loaded and the JIT should be used.
 RecompLookupFn GetRecompLookup();
+
+/// schema_version 1 AOT vs Dynarmic execution snapshot.
+///
+/// Totals are run-lifetime: they survive ArmRecomp attaching a new application
+/// process (the stack-harness restart path). Times are host steady_clock
+/// nanoseconds around real AOT block entry and Dynarmic RunThread/StepThread,
+/// not simulated stubs.
+///
+/// JSON (FormatRecompExecutionJson): kind=recomp_execution, clock=steady_clock,
+/// backends.{aot,dynarmic}.{block_executions|run_slices,step_slices,time_ns},
+/// transitions.{aot_to_dynarmic,dynarmic_to_aot},
+/// fallback_reasons.{lookup_miss,unhandled_opcode,icache_rejected,no_fallback_available},
+/// icache.{clear_instruction_cache_calls,invalidate_cache_range_calls,
+///         permanent_aot_reject_events,jit_halt_cache_invalidation},
+/// plus svc_calls, unresolved_import_traps, and histograms.
+/// Default path: $SUYU_RECOMP_EXECUTION_JSON, else `{LogDir}/recomp_execution.json`
+/// (Linux: ~/.local/share/suyu/log/recomp_execution.json unless portable `user/`).
+/// WriteRecompExecutionJson keeps `std::filesystem::path` (no narrow `.string()`
+/// ofstream) and publishes via dest+".tmp" then rename so a reader never sees a
+/// torn file; an existing dest is replaced (RenameFile refuses overwrite).
+struct RecompExecutionMetrics {
+    static constexpr int kSchemaVersion = 1;
+
+    u64 aot_block_executions{};
+    u64 aot_time_ns{};
+    u64 dynarmic_run_slices{};
+    u64 dynarmic_step_slices{};
+    u64 dynarmic_time_ns{};
+    u64 aot_to_dynarmic{};
+    u64 dynarmic_to_aot{};
+    u64 fallback_lookup_miss{};
+    u64 fallback_unhandled_opcode{};
+    u64 fallback_icache_rejected{};
+    u64 fallback_no_backend{};
+    u64 unresolved_import_traps{};
+    u64 svc_calls{};
+    u64 clear_instruction_cache_calls{};
+    u64 invalidate_cache_range_calls{};
+    u64 permanent_aot_reject_events{};
+    u64 jit_halt_cache_invalidation{};
+};
+
+RecompExecutionMetrics GetRecompExecutionMetrics();
+std::string FormatRecompExecutionJson();
+std::filesystem::path DefaultRecompExecutionJsonPath();
+bool WriteRecompExecutionJson(const std::filesystem::path& path = {});
 
 /**
  * CPU backend that executes statically recompiled AArch64 rather than JITing

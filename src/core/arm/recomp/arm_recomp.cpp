@@ -3,17 +3,24 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <mutex>
 #include <map>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "common/fs/file.h"
+#include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_icache.h"
@@ -162,7 +169,8 @@ namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
 
-/// Execution coverage for the AOT path (mk8-recomp #13).
+/// Execution coverage for the AOT path (mk8-recomp #13) plus wall-clock time
+/// in each backend (drippu backlog #2).
 ///
 /// The exporter's static coverage says what fraction of the *image* translates.
 /// It cannot say what fraction of *execution* stays on the recompiled path,
@@ -174,12 +182,22 @@ std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
 /// rank the missing opcodes by what actually executes.
 struct RecompCounters {
     std::atomic<u64> static_blocks{0};
+    std::atomic<u64> aot_time_ns{0};
+    std::atomic<u64> dynarmic_time_ns{0};
+    std::atomic<u64> dynarmic_run_slices{0};
+    std::atomic<u64> dynarmic_step_slices{0};
     std::atomic<u64> svc_calls{0};
     std::atomic<u64> fallback_from_miss{0};
     std::atomic<u64> fallback_from_unhandled{0};
+    std::atomic<u64> fallback_from_icache_reject{0};
+    std::atomic<u64> aot_to_dynarmic{0};
     std::atomic<u64> jit_to_static{0};
     std::atomic<u64> unresolved_import_traps{0};
     std::atomic<u64> no_fallback_available{0};
+    std::atomic<u64> clear_instruction_cache{0};
+    std::atomic<u64> invalidate_cache_range{0};
+    std::atomic<u64> permanent_aot_reject{0};
+    std::atomic<u64> jit_halt_cache_invalidation{0};
 
     // Guarded rather than atomic: these are touched only on a transition, which
     // is by definition already the slow path.
@@ -212,24 +230,96 @@ struct RecompCounters {
         ++miss_pc[pc];
     }
 
-    void Reset() {
+    void AddAtomicsFrom(const RecompCounters& src) {
+        const auto add = [](std::atomic<u64>& dst, const std::atomic<u64>& s) {
+            dst.fetch_add(s.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        };
+        add(static_blocks, src.static_blocks);
+        add(aot_time_ns, src.aot_time_ns);
+        add(dynarmic_time_ns, src.dynarmic_time_ns);
+        add(dynarmic_run_slices, src.dynarmic_run_slices);
+        add(dynarmic_step_slices, src.dynarmic_step_slices);
+        add(svc_calls, src.svc_calls);
+        add(fallback_from_miss, src.fallback_from_miss);
+        add(fallback_from_unhandled, src.fallback_from_unhandled);
+        add(fallback_from_icache_reject, src.fallback_from_icache_reject);
+        add(aot_to_dynarmic, src.aot_to_dynarmic);
+        add(jit_to_static, src.jit_to_static);
+        add(unresolved_import_traps, src.unresolved_import_traps);
+        add(no_fallback_available, src.no_fallback_available);
+        add(clear_instruction_cache, src.clear_instruction_cache);
+        add(invalidate_cache_range, src.invalidate_cache_range);
+        add(permanent_aot_reject, src.permanent_aot_reject);
+        add(jit_halt_cache_invalidation, src.jit_halt_cache_invalidation);
+    }
+
+    void ZeroAtomics() {
         static_blocks.store(0, std::memory_order_relaxed);
+        aot_time_ns.store(0, std::memory_order_relaxed);
+        dynarmic_time_ns.store(0, std::memory_order_relaxed);
+        dynarmic_run_slices.store(0, std::memory_order_relaxed);
+        dynarmic_step_slices.store(0, std::memory_order_relaxed);
         svc_calls.store(0, std::memory_order_relaxed);
         fallback_from_miss.store(0, std::memory_order_relaxed);
         fallback_from_unhandled.store(0, std::memory_order_relaxed);
+        fallback_from_icache_reject.store(0, std::memory_order_relaxed);
+        aot_to_dynarmic.store(0, std::memory_order_relaxed);
         jit_to_static.store(0, std::memory_order_relaxed);
         unresolved_import_traps.store(0, std::memory_order_relaxed);
         no_fallback_available.store(0, std::memory_order_relaxed);
-        std::scoped_lock lk{hist_lock};
-        unhandled_insn.clear();
-        miss_pc.clear();
-        svc_numbers.clear();
-        modules.clear();
+        clear_instruction_cache.store(0, std::memory_order_relaxed);
+        invalidate_cache_range.store(0, std::memory_order_relaxed);
+        permanent_aot_reject.store(0, std::memory_order_relaxed);
+        jit_halt_cache_invalidation.store(0, std::memory_order_relaxed);
     }
 };
 
 RecompCounters g_counters;
+RecompCounters g_lifetime;
 std::atomic<bool> g_coverage_reported{false};
+
+void FoldCurrentIntoLifetime() {
+    g_lifetime.AddAtomicsFrom(g_counters);
+    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
+    for (const auto& [insn, count] : g_counters.unhandled_insn) {
+        g_lifetime.unhandled_insn[insn] += count;
+    }
+    for (const auto& [pc, count] : g_counters.miss_pc) {
+        g_lifetime.miss_pc[pc] += count;
+    }
+    for (const auto& [num, count] : g_counters.svc_numbers) {
+        g_lifetime.svc_numbers[num] += count;
+    }
+    for (const auto& [base, name] : g_counters.modules) {
+        g_lifetime.modules[base] = name;
+    }
+    g_counters.unhandled_insn.clear();
+    g_counters.miss_pc.clear();
+    g_counters.svc_numbers.clear();
+    g_counters.modules.clear();
+}
+
+void ResetCurrentCounters() {
+    FoldCurrentIntoLifetime();
+    g_counters.ZeroAtomics();
+}
+
+struct ScopedNs {
+    std::atomic<u64>& dest;
+    std::chrono::steady_clock::time_point start;
+    explicit ScopedNs(std::atomic<u64>& dest_)
+        : dest{dest_}, start{std::chrono::steady_clock::now()} {}
+    ~ScopedNs() {
+        const auto raw = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+        if (raw > 0) {
+            dest.fetch_add(static_cast<u64>(raw), std::memory_order_relaxed);
+        }
+    }
+};
+
+enum class AotLookup : u8 { Hit, Miss, IcacheReject };
 
 suyu::recomp::RecompSession& HostRecompSession() {
     static suyu::recomp::RecompSession session;
@@ -268,11 +358,21 @@ std::string FormatRecompCoverage() {
     }
 
     std::string o = "=== RECOMP EXECUTION COVERAGE ===\n";
+    const u64 icache_reject = g_counters.fallback_from_icache_reject.load();
+    const u64 aot_to_jit = g_counters.aot_to_dynarmic.load();
     o += fmt::format("  static blocks executed : {}\n", blocks);
+    o += fmt::format("  AOT time               : {} ns\n", g_counters.aot_time_ns.load());
+    o += fmt::format("  Dynarmic time          : {} ns\n", g_counters.dynarmic_time_ns.load());
     o += fmt::format("  SVCs to HLE            : {}\n", g_counters.svc_calls.load());
-    o += fmt::format("  static -> JIT          : {} ({} lookup miss, {} unimplemented opcode)\n",
-                     transitions, miss, unh);
+    o += fmt::format(
+        "  static -> JIT          : {} ({} lookup miss, {} unimplemented opcode, {} icache reject)\n",
+        aot_to_jit ? aot_to_jit : (transitions + icache_reject), miss, unh, icache_reject);
     o += fmt::format("  JIT -> static          : {}\n", g_counters.jit_to_static.load());
+    o += fmt::format("  ClearInstructionCache  : {} (permanent reject events {})\n",
+                     g_counters.clear_instruction_cache.load(),
+                     g_counters.permanent_aot_reject.load());
+    o += fmt::format("  InvalidateCacheRange   : {} (does not reject AOT)\n",
+                     g_counters.invalidate_cache_range.load());
     o += fmt::format("  unresolved import traps: {}\n", g_counters.unresolved_import_traps.load());
     if (const u64 nofb = g_counters.no_fallback_available.load(); nofb) {
         o += fmt::format("  threads killed with no JIT fallback: {}\n", nofb);
@@ -350,27 +450,84 @@ void WriteRecompCoverageFile(const std::string& text) {
     }
 }
 
+u64 SumCounter(const std::atomic<u64>& a, const std::atomic<u64>& b) {
+    return a.load(std::memory_order_relaxed) + b.load(std::memory_order_relaxed);
+}
+
+std::map<u32, u64> MergedU32Hist(std::map<u32, u64> RecompCounters::* member) {
+    std::map<u32, u64> out;
+    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
+    out = g_lifetime.*member;
+    for (const auto& [k, v] : g_counters.*member) {
+        out[k] += v;
+    }
+    return out;
+}
+
+std::map<u64, u64> MergedU64Hist(std::map<u64, u64> RecompCounters::* member) {
+    std::map<u64, u64> out;
+    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
+    out = g_lifetime.*member;
+    for (const auto& [k, v] : g_counters.*member) {
+        out[k] += v;
+    }
+    return out;
+}
+
+std::map<u64, std::string> MergedModules() {
+    std::map<u64, std::string> out;
+    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
+    out = g_lifetime.modules;
+    for (const auto& [k, v] : g_counters.modules) {
+        out[k] = v;
+    }
+    return out;
+}
+
+nlohmann::json JsonTopU32(const std::map<u32, u64>& m, const char* key, size_t n) {
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& [id, count] : TopN(m, n)) {
+        arr.push_back({
+            {key, fmt::format("0x{:08X}", id)},
+            {"count", count},
+        });
+    }
+    return {{"top", arr}, {"distinct", m.size()}};
+}
+
+std::string ResolvePc(u64 pc, const std::map<u64, std::string>& modules) {
+    u64 best = 0;
+    const std::string* name = nullptr;
+    for (const auto& [base, module_name] : modules) {
+        if (pc >= base && base >= best) {
+            best = base;
+            name = &module_name;
+        }
+    }
+    return name ? fmt::format("{}+{:#x}", *name, pc - best) : std::string{};
+}
+
 void ReportRecompCoverage() {
     const std::string report = FormatRecompCoverage();
-    if (report.empty()) {
-        return;
-    }
-    WriteRecompCoverageFile(report);
-    // Split by hand: the report is already newline-delimited and the logger
-    // takes one line at a time.
-    size_t pos = 0;
-    while (pos < report.size()) {
-        const size_t nl = report.find('\n', pos);
-        const std::string_view line{report.data() + pos,
-                                    (nl == std::string::npos ? report.size() : nl) - pos};
-        if (!line.empty()) {
-            LOG_INFO(Core_ARM, "{}", line);
+    if (!report.empty()) {
+        WriteRecompCoverageFile(report);
+        // Split by hand: the report is already newline-delimited and the logger
+        // takes one line at a time.
+        size_t pos = 0;
+        while (pos < report.size()) {
+            const size_t nl = report.find('\n', pos);
+            const std::string_view line{report.data() + pos,
+                                        (nl == std::string::npos ? report.size() : nl) - pos};
+            if (!line.empty()) {
+                LOG_INFO(Core_ARM, "{}", line);
+            }
+            if (nl == std::string::npos) {
+                break;
+            }
+            pos = nl + 1;
         }
-        if (nl == std::string::npos) {
-            break;
-        }
-        pos = nl + 1;
     }
+    WriteRecompExecutionJson({});
 }
 
 } // namespace
@@ -385,6 +542,146 @@ void SetRecompBaseSetter(RecompBaseFn setter) {
 
 RecompLookupFn GetRecompLookup() {
     return g_recomp_lookup.load(std::memory_order_acquire);
+}
+
+RecompExecutionMetrics GetRecompExecutionMetrics() {
+    RecompExecutionMetrics m;
+    m.aot_block_executions = SumCounter(g_lifetime.static_blocks, g_counters.static_blocks);
+    m.aot_time_ns = SumCounter(g_lifetime.aot_time_ns, g_counters.aot_time_ns);
+    m.dynarmic_run_slices =
+        SumCounter(g_lifetime.dynarmic_run_slices, g_counters.dynarmic_run_slices);
+    m.dynarmic_step_slices =
+        SumCounter(g_lifetime.dynarmic_step_slices, g_counters.dynarmic_step_slices);
+    m.dynarmic_time_ns = SumCounter(g_lifetime.dynarmic_time_ns, g_counters.dynarmic_time_ns);
+    m.aot_to_dynarmic = SumCounter(g_lifetime.aot_to_dynarmic, g_counters.aot_to_dynarmic);
+    m.dynarmic_to_aot = SumCounter(g_lifetime.jit_to_static, g_counters.jit_to_static);
+    m.fallback_lookup_miss = SumCounter(g_lifetime.fallback_from_miss, g_counters.fallback_from_miss);
+    m.fallback_unhandled_opcode =
+        SumCounter(g_lifetime.fallback_from_unhandled, g_counters.fallback_from_unhandled);
+    m.fallback_icache_rejected =
+        SumCounter(g_lifetime.fallback_from_icache_reject, g_counters.fallback_from_icache_reject);
+    m.fallback_no_backend =
+        SumCounter(g_lifetime.no_fallback_available, g_counters.no_fallback_available);
+    m.unresolved_import_traps =
+        SumCounter(g_lifetime.unresolved_import_traps, g_counters.unresolved_import_traps);
+    m.svc_calls = SumCounter(g_lifetime.svc_calls, g_counters.svc_calls);
+    m.clear_instruction_cache_calls =
+        SumCounter(g_lifetime.clear_instruction_cache, g_counters.clear_instruction_cache);
+    m.invalidate_cache_range_calls =
+        SumCounter(g_lifetime.invalidate_cache_range, g_counters.invalidate_cache_range);
+    m.permanent_aot_reject_events =
+        SumCounter(g_lifetime.permanent_aot_reject, g_counters.permanent_aot_reject);
+    m.jit_halt_cache_invalidation =
+        SumCounter(g_lifetime.jit_halt_cache_invalidation, g_counters.jit_halt_cache_invalidation);
+    return m;
+}
+
+std::filesystem::path DefaultRecompExecutionJsonPath() {
+    if (const char* env = std::getenv("SUYU_RECOMP_EXECUTION_JSON"); env && env[0] != '\0') {
+        return std::filesystem::path{env};
+    }
+    return Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_execution.json";
+}
+
+std::string FormatRecompExecutionJson() {
+    const RecompExecutionMetrics m = GetRecompExecutionMetrics();
+    const auto modules = MergedModules();
+    const auto unhandled = MergedU32Hist(&RecompCounters::unhandled_insn);
+    const auto svcs = MergedU32Hist(&RecompCounters::svc_numbers);
+    const auto misses = MergedU64Hist(&RecompCounters::miss_pc);
+
+    nlohmann::json miss_arr = nlohmann::json::array();
+    for (const auto& [pc, count] : TopN(misses, 64)) {
+        nlohmann::json row{
+            {"pc", fmt::format("{:#018x}", pc)},
+            {"count", count},
+        };
+        if (const std::string resolved = ResolvePc(pc, modules); !resolved.empty()) {
+            row["module"] = resolved;
+        }
+        miss_arr.push_back(std::move(row));
+    }
+
+    nlohmann::json module_arr = nlohmann::json::array();
+    for (const auto& [base, name] : modules) {
+        module_arr.push_back({
+            {"base", fmt::format("{:#018x}", base)},
+            {"name", name},
+        });
+    }
+
+    nlohmann::json svc_arr = nlohmann::json::array();
+    for (const auto& [num, count] : TopN(svcs, 16)) {
+        svc_arr.push_back({
+            {"imm", fmt::format("0x{:02X}", num)},
+            {"count", count},
+        });
+    }
+
+    const nlohmann::json doc{
+        {"schema_version", RecompExecutionMetrics::kSchemaVersion},
+        {"kind", "recomp_execution"},
+        {"clock", "steady_clock"},
+        {"backends",
+         {{"aot",
+           {{"block_executions", m.aot_block_executions}, {"time_ns", m.aot_time_ns}}},
+          {"dynarmic",
+           {{"run_slices", m.dynarmic_run_slices},
+            {"step_slices", m.dynarmic_step_slices},
+            {"time_ns", m.dynarmic_time_ns}}}}},
+        {"transitions",
+         {{"aot_to_dynarmic", m.aot_to_dynarmic}, {"dynarmic_to_aot", m.dynarmic_to_aot}}},
+        {"fallback_reasons",
+         {{"lookup_miss", m.fallback_lookup_miss},
+          {"unhandled_opcode", m.fallback_unhandled_opcode},
+          {"icache_rejected", m.fallback_icache_rejected},
+          {"no_fallback_available", m.fallback_no_backend}}},
+        {"icache",
+         {{"clear_instruction_cache_calls", m.clear_instruction_cache_calls},
+          {"invalidate_cache_range_calls", m.invalidate_cache_range_calls},
+          {"permanent_aot_reject_events", m.permanent_aot_reject_events},
+          {"jit_halt_cache_invalidation", m.jit_halt_cache_invalidation}}},
+        {"svc_calls", m.svc_calls},
+        {"unresolved_import_traps", m.unresolved_import_traps},
+        {"unhandled_opcodes", JsonTopU32(unhandled, "insn", 64)},
+        {"svc_numbers", {{"top", svc_arr}, {"distinct", svcs.size()}}},
+        {"miss_pcs", {{"top", miss_arr}, {"distinct", misses.size()}}},
+        {"modules", module_arr},
+    };
+    return doc.dump(2);
+}
+
+bool WriteRecompExecutionJson(const std::filesystem::path& path) {
+    const std::filesystem::path dest = path.empty() ? DefaultRecompExecutionJsonPath() : path;
+    if (!Common::FS::CreateParentDirs(dest)) {
+        return false;
+    }
+    std::filesystem::path tmp = dest;
+    tmp += ".tmp";
+    {
+        std::ofstream out;
+        Common::FS::OpenFileStream(out, tmp, std::ios_base::out | std::ios_base::trunc);
+        if (!out) {
+            return false;
+        }
+        out << FormatRecompExecutionJson();
+        out.flush();
+        if (!out) {
+            out.close();
+            Common::FS::RemoveFile(tmp);
+            return false;
+        }
+    }
+    // RenameFile refuses an existing dest; drop the previous snapshot first.
+    if (!Common::FS::RemoveFile(dest)) {
+        Common::FS::RemoveFile(tmp);
+        return false;
+    }
+    if (!Common::FS::RenameFile(tmp, dest)) {
+        Common::FS::RemoveFile(tmp);
+        return false;
+    }
+    return true;
 }
 
 struct ArmRecomp::Impl {
@@ -889,17 +1186,37 @@ struct ArmRecomp::Impl {
     bool fallback_unavailable{false};
     suyu::recomp::RecompICache icache{};
 
-        RecompBlockFn LookupAot(u64 pc) {
+    AotLookup LookupAot(u64 pc, RecompBlockFn* out = nullptr) {
         const RecompBlockFn block = lookup ? lookup(pc) : nullptr;
-        if (!block || icache.AllowsAot()) {
-            return block;
+        if (out) {
+            *out = block;
+        }
+        if (!block) {
+            return AotLookup::Miss;
+        }
+        if (icache.AllowsAot()) {
+            return AotLookup::Hit;
+        }
+        if (out) {
+            *out = nullptr;
         }
         static std::atomic<int> refused{0};
         if (refused.fetch_add(1, std::memory_order_relaxed) < 16) {
             LOG_WARNING(Core_ARM,
                         "recomp: refusing stale AOT at {:#x} after icache invalidate", pc);
         }
-        return nullptr;
+        return AotLookup::IcacheReject;
+    }
+
+    void NoteIcacheClear(bool from_jit_halt) {
+        const bool was_allowed = icache.AllowsAot();
+        icache.Clear();
+        if (from_jit_halt) {
+            g_counters.jit_halt_cache_invalidation.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (was_allowed) {
+            g_counters.permanent_aot_reject.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 };
 
@@ -912,7 +1229,7 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
     impl->core_index = core_index;
     impl->uses_wall_clock = uses_wall_clock;
     if (HostRecompSession().AttachProcess(process)) {
-        g_counters.Reset();
+        ResetCurrentCounters();
         g_coverage_reported.store(false, std::memory_order_relaxed);
     }
 }
@@ -939,6 +1256,9 @@ bool ArmRecomp::EnterFallback() {
                                                          impl->core_index);
         LOG_WARNING(Core_ARM, "recomp: created JIT fallback for uncovered code");
     }
+    if (!impl->in_fallback) {
+        g_counters.aot_to_dynarmic.fetch_add(1, std::memory_order_relaxed);
+    }
     impl->in_fallback = true;
     return true;
 }
@@ -957,7 +1277,12 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
     impl->fallback->SetContext(tctx);
     impl->fallback->SetTpidrroEl0(impl->ctx.tpidrro_el0);
 
-    const HaltReason hr = impl->fallback->RunThread(thread);
+    HaltReason hr;
+    {
+        ScopedNs timer{g_counters.dynarmic_time_ns};
+        hr = impl->fallback->RunThread(thread);
+    }
+    g_counters.dynarmic_run_slices.fetch_add(1, std::memory_order_relaxed);
 
     impl->fallback->GetContext(tctx);
     this->SetContext(tctx);
@@ -965,7 +1290,7 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
         return HaltReason::PrefetchAbort;
     }
     if (True(hr & HaltReason::CacheInvalidation)) {
-        impl->icache.Clear();
+        impl->NoteIcacheClear(true);
         impl->ctx.chain_budget = 0;
     }
     if (True(hr & HaltReason::SupervisorCall)) {
@@ -978,7 +1303,7 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
 
     // Return to recompiled execution as soon as the PC is covered again, so a
     // single uncovered function costs only the time spent inside it.
-    if (impl->LookupAot(impl->ctx.pc)) {
+    if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
         impl->in_fallback = false;
         g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
     }
@@ -995,7 +1320,12 @@ HaltReason ArmRecomp::StepFallback(Kernel::KThread* thread) {
     impl->fallback->SetContext(tctx);
     impl->fallback->SetTpidrroEl0(impl->ctx.tpidrro_el0);
 
-    const HaltReason hr = impl->fallback->StepThread(thread);
+    HaltReason hr;
+    {
+        ScopedNs timer{g_counters.dynarmic_time_ns};
+        hr = impl->fallback->StepThread(thread);
+    }
+    g_counters.dynarmic_step_slices.fetch_add(1, std::memory_order_relaxed);
 
     impl->fallback->GetContext(tctx);
     this->SetContext(tctx);
@@ -1003,14 +1333,14 @@ HaltReason ArmRecomp::StepFallback(Kernel::KThread* thread) {
         return HaltReason::PrefetchAbort;
     }
     if (True(hr & HaltReason::CacheInvalidation)) {
-        impl->icache.Clear();
+        impl->NoteIcacheClear(true);
         impl->ctx.chain_budget = 0;
     }
     if (True(hr & HaltReason::SupervisorCall)) {
         impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
         g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
     }
-    if (impl->LookupAot(impl->ctx.pc)) {
+    if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
         impl->in_fallback = false;
         g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1050,7 +1380,15 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         return HaltReason::PrefetchAbort;
     }
     if (impl->in_fallback) {
-        return RunFallback(thread);
+        // PC may have moved (new scheduling slice, harness scenario, SVC
+        // resume) onto covered AOT since we last ran the JIT. Check before
+        // spending another Dynarmic slice.
+        if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
+            impl->in_fallback = false;
+            g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            return RunFallback(thread);
+        }
     }
 
     impl->interrupted.store(false, std::memory_order_relaxed);
@@ -1089,7 +1427,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             return HaltReason::PrefetchAbort;
         }
 
-        RecompBlockFn block = impl->LookupAot(impl->ctx.pc);
+        RecompBlockFn block = nullptr;
+        const AotLookup look = impl->LookupAot(impl->ctx.pc, &block);
         // Test hook: forces every lookup past the Nth to miss, so the JIT
         // fallback below can be exercised on a title that would otherwise never
         // hit a gap. Unset in normal runs.
@@ -1110,14 +1449,13 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 }
             }
         }
-        if (block && !impl->icache.AllowsAot()) {
-            block = nullptr;
-        }
         // A miss is now recoverable, so it can happen many times per second;
         // the full diagnostic dump is kept for the first few only, where it is
         // still useful for finding which indirect call went uncovered.
         static std::atomic<int> miss_count{0};
-        const int miss_index = block ? 0 : miss_count.fetch_add(1, std::memory_order_relaxed);
+        const bool is_icache_reject = !block && look == AotLookup::IcacheReject;
+        const int miss_index =
+            block || is_icache_reject ? 0 : miss_count.fetch_add(1, std::memory_order_relaxed);
         if (!block && impl->icache.AllowsAot() && miss_index < 8) {
             std::string trail;
             const size_t count = std::min<size_t>(impl->trail_pos, Impl::kTrail);
@@ -1176,21 +1514,22 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             }
         }
         if (!block) {
-            // No recompiled block covers this address: an indirect branch into
-            // code the static pass never reached. The guest's own instructions
-            // are still mapped in guest memory, so hand the thread to a JIT and
-            // keep going instead of returning PrefetchAbort - that halt reason
-            // makes the kernel suspend the thread for a debugger that is not
-            // attached, which is a permanent, silent black-screen hang.
-            if (miss_index < 64) {
-                LOG_ERROR(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
-                          impl->ctx.pc);
+            // No recompiled block covers this address, or AOT was permanently
+            // refused after ClearInstructionCache. Guest bytes are still mapped,
+            // so hand the thread to Dynarmic instead of PrefetchAbort.
+            if (is_icache_reject) {
+                g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
             } else {
-                LOG_DEBUG(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
-                          impl->ctx.pc);
+                if (miss_index < 64) {
+                    LOG_ERROR(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
+                              impl->ctx.pc);
+                } else {
+                    LOG_DEBUG(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
+                              impl->ctx.pc);
+                }
+                g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
+                g_counters.RecordMiss(impl->ctx.pc);
             }
-            g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
-            g_counters.RecordMiss(impl->ctx.pc);
             if (!EnterFallback()) {
                 g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
                 LOG_CRITICAL(Core_ARM,
@@ -1208,6 +1547,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         if ((g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed) &
              0x3FFFFULL) == 0x3FFFFULL) {
             WriteRecompCoverageFile(FormatRecompCoverage());
+            WriteRecompExecutionJson({});
         }
         // Generated code calls a direct branch's target itself rather than
         // coming back here, so one call below can run a whole chain of blocks.
@@ -1215,7 +1555,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // how many blocks actually ran - without which every count here would
         // report chains rather than blocks.
         impl->ctx.chain_budget = impl->icache.AllowsAot() ? kChainBudget : 0;
-        block(&impl->ctx);
+        {
+            ScopedNs timer{g_counters.aot_time_ns};
+            block(&impl->ctx);
+        }
         {
             const int spent = kChainBudget - impl->ctx.chain_budget;
             if (spent > 1) {
@@ -1280,14 +1623,30 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
+    // Same resume contract as RunThread: leftover pending_svc is from a prior
+    // halt the kernel already serviced. A debugger step of a non-SVC AOT block
+    // must not report SupervisorCall because that field was still set.
+    if (impl->ctx.pending_svc != kNoPendingSvc) {
+        impl->ctx.pending_svc = kNoPendingSvc;
+    }
     if (impl->in_fallback) {
-        return StepFallback(thread);
+        if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
+            impl->in_fallback = false;
+            g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            return StepFallback(thread);
+        }
     }
 
-    const RecompBlockFn block = impl->LookupAot(impl->ctx.pc);
+    RecompBlockFn block = nullptr;
+    const AotLookup look = impl->LookupAot(impl->ctx.pc, &block);
     if (!block) {
-        g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
-        g_counters.RecordMiss(impl->ctx.pc);
+        if (look == AotLookup::IcacheReject) {
+            g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
+            g_counters.RecordMiss(impl->ctx.pc);
+        }
         if (!EnterFallback()) {
             g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
             return HaltReason::PrefetchAbort;
@@ -1298,7 +1657,11 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     // Do not honour a leftover chain budget from RunThread: a debugger step
     // must not race through a direct-call chain.
     impl->ctx.chain_budget = 0;
-    block(&impl->ctx);
+    g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
+    {
+        ScopedNs timer{g_counters.aot_time_ns};
+        block(&impl->ctx);
+    }
 
     if (impl->ctx.halted == kHaltUnhandled) {
         impl->ctx.halted = 0;
@@ -1326,7 +1689,8 @@ bool ArmRecomp::AllowsAot() const {
 void ArmRecomp::ClearInstructionCache() {
     // Permanent AOT reject: guest code may have changed under the image the
     // static pass translated. Further RunThread/StepThread must use the JIT.
-    impl->icache.Clear();
+    g_counters.clear_instruction_cache.fetch_add(1, std::memory_order_relaxed);
+    impl->NoteIcacheClear(false);
     impl->ctx.chain_budget = 0;
     if (impl->fallback) {
         impl->fallback->ClearInstructionCache();
@@ -1340,6 +1704,7 @@ void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
     // ClearInstructionCache would kill ArmRecomp before the first guest insn.
     // Guest IC ops that mean bytes changed under us arrive as CacheInvalidation
     // halt reasons and call icache.Clear() from RunFallback/StepFallback.
+    g_counters.invalidate_cache_range.fetch_add(1, std::memory_order_relaxed);
     impl->ctx.chain_budget = 0;
     if (impl->fallback) {
         impl->fallback->InvalidateCacheRange(addr, size);
