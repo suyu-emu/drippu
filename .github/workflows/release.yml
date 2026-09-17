@@ -56,10 +56,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force _pkg
-          Copy-Item build/bin/suyu.exe _pkg/
-          Copy-Item build/bin/suyu-cmd.exe _pkg/
-          windeployqt --release --no-translations _pkg/suyu.exe
-          Compress-Archive -Path _pkg/* -DestinationPath suyu-windows-x64.zip
+          Copy-Item build/bin/suyu.exe _pkg/drippu.exe
+          Copy-Item build/bin/suyu-cmd.exe _pkg/drippu-cmd.exe
+          windeployqt --release --no-translations _pkg/drippu.exe
+          Compress-Archive -Path _pkg/* -DestinationPath drippu-windows-x64.zip
       - name: Record toolchain
         shell: bash
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
@@ -67,7 +67,7 @@ jobs:
         with:
           name: windows
           path: |
-            suyu-windows-x64.zip
+            drippu-windows-x64.zip
             toolchain.txt
 
   build-linux:
@@ -115,16 +115,16 @@ jobs:
       - name: Package
         run: |
           rm -rf _pkg && mkdir _pkg
-          cp build/bin/suyu _pkg/
-          cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
-          tar -czf suyu-linux-x64.tar.gz -C _pkg .
+          cp build/bin/suyu _pkg/drippu
+          cp build/bin/suyu-cmd _pkg/drippu-cmd 2>/dev/null || true
+          tar -czf drippu-linux-x64.tar.gz -C _pkg .
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: linux
           path: |
-            suyu-linux-x64.tar.gz
+            drippu-linux-x64.tar.gz
             toolchain.txt
 
   build-macos:
@@ -162,16 +162,16 @@ jobs:
       - name: Package
         run: |
           rm -rf _pkg && mkdir _pkg
-          cp -r build/bin/suyu.app _pkg/ 2>/dev/null || cp build/bin/suyu _pkg/
-          cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
-          tar -czf suyu-macos-arm64.tar.gz -C _pkg .
+          cp -r build/bin/suyu.app _pkg/drippu.app 2>/dev/null || cp build/bin/suyu _pkg/drippu
+          cp build/bin/suyu-cmd _pkg/drippu-cmd 2>/dev/null || true
+          tar -czf drippu-macos-arm64.tar.gz -C _pkg .
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: macos
           path: |
-            suyu-macos-arm64.tar.gz
+            drippu-macos-arm64.tar.gz
             toolchain.txt
 
   build-freebsd:
@@ -196,16 +196,16 @@ jobs:
             cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
             cmake --build build --target suyu suyu-cmd -j4
             rm -rf _pkg && mkdir _pkg
-            cp build/bin/suyu _pkg/
-            cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
-            tar -czf suyu-freebsd-x64.tar.gz -C _pkg .
+            cp build/bin/suyu _pkg/drippu
+            cp build/bin/suyu-cmd _pkg/drippu-cmd 2>/dev/null || true
+            tar -czf drippu-freebsd-x64.tar.gz -C _pkg .
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: freebsd
           path: |
-            suyu-freebsd-x64.tar.gz
+            drippu-freebsd-x64.tar.gz
             toolchain.txt
 
   build-android:
@@ -290,14 +290,14 @@ jobs:
         run: |
           rm -rf _pkg && mkdir _pkg
           find build -name 'suyu_libretro.so' -exec cp {} _pkg/ \;
-          tar -czf suyu-libretro-core-linux-x64.tar.gz -C _pkg .
+          tar -czf drippu-libretro-core-linux-x64.tar.gz -C _pkg .
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libretro
           path: |
-            suyu-libretro-core-linux-x64.tar.gz
+            drippu-libretro-core-linux-x64.tar.gz
             toolchain.txt
 
   build-libretro-windows:
@@ -342,7 +342,7 @@ jobs:
           Remove-Item -Recurse -Force _pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory _pkg | Out-Null
           Get-ChildItem build -Recurse -Filter suyu_libretro.dll | ForEach-Object { Copy-Item $_.FullName _pkg/ }
-          Compress-Archive -Path _pkg/* -DestinationPath suyu-libretro-core-windows-x64.zip
+          Compress-Archive -Path _pkg/* -DestinationPath drippu-libretro-core-windows-x64.zip
       - name: Record toolchain
         shell: bash
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
@@ -350,7 +350,7 @@ jobs:
         with:
           name: libretro-windows
           path: |
-            suyu-libretro-core-windows-x64.zip
+            drippu-libretro-core-windows-x64.zip
             toolchain.txt
 
   build-libretro-android:
@@ -397,14 +397,14 @@ jobs:
         run: |
           rm -rf _pkg && mkdir _pkg
           find build -name '*suyu_libretro*.so' -exec cp {} _pkg/suyu_libretro_android_arm64-v8a.so \;
-          tar -czf suyu-libretro-core-android-arm64.tar.gz -C _pkg .
+          tar -czf drippu-libretro-core-android-arm64.tar.gz -C _pkg .
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libretro-android
           path: |
-            suyu-libretro-core-android-arm64.tar.gz
+            drippu-libretro-core-android-arm64.tar.gz
             toolchain.txt
 
   exporter-smoke:

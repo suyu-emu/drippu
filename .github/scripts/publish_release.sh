@@ -24,11 +24,11 @@ if [ "${#files[@]}" -eq 0 ]; then
 fi
 
 required=(
-  suyu-windows-x64.zip
-  suyu-linux-x64.tar.gz
-  suyu-macos-arm64.tar.gz
-  suyu-libretro-core-linux-x64.tar.gz
-  suyu-libretro-core-windows-x64.zip
+  drippu-windows-x64.zip
+  drippu-linux-x64.tar.gz
+  drippu-macos-arm64.tar.gz
+  drippu-libretro-core-linux-x64.tar.gz
+  drippu-libretro-core-windows-x64.zip
 )
 
 found_names=()
@@ -64,7 +64,7 @@ trap 'rm -f "$notes" "$sums"' EXIT
 } >"$sums"
 
 {
-  echo "suyu v0.04 ${short}"
+  echo "drippu v0.04 ${short}"
   echo
   echo "commit: ${sha}"
   if [ -n "$run_id" ]; then
@@ -103,7 +103,7 @@ assets=("${files[@]}" SHA256SUMS)
 
 gh release create "$tag" \
   --repo "$repo" \
-  --title "suyu v0.04 ${short}" \
+  --title "drippu v0.04 ${short}" \
   --notes-file "$notes" \
   --prerelease \
   "${assets[@]}"

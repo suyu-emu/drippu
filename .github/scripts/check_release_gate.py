@@ -547,14 +547,14 @@ class Check:
 
 def sample_artifacts(missing: set[str] | None = None) -> dict[str, bytes]:
     files = {
-        "windows/suyu-windows-x64.zip": b"win",
-        "linux/suyu-linux-x64.tar.gz": b"lin",
-        "macos/suyu-macos-arm64.tar.gz": b"mac",
+        "windows/drippu-windows-x64.zip": b"win",
+        "linux/drippu-linux-x64.tar.gz": b"lin",
+        "macos/drippu-macos-arm64.tar.gz": b"mac",
         "android/suyu.apk": b"apk",
-        "libretro/suyu-libretro-core-linux-x64.tar.gz": b"lr",
-        "libretro-windows/suyu-libretro-core-windows-x64.zip": b"lrw",
-        "freebsd/suyu-freebsd-x64.tar.gz": b"fbsd",
-        "libretro-android/suyu-libretro-core-android-arm64.tar.gz": b"lra",
+        "libretro/drippu-libretro-core-linux-x64.tar.gz": b"lr",
+        "libretro-windows/drippu-libretro-core-windows-x64.zip": b"lrw",
+        "freebsd/drippu-freebsd-x64.tar.gz": b"fbsd",
+        "libretro-android/drippu-libretro-core-android-arm64.tar.gz": b"lra",
     }
     if missing:
         for key in list(files):
