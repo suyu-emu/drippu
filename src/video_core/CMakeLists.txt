@@ -377,9 +377,6 @@ else()
 
     target_compile_options(video_core PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-sign-conversion>)
 
-    # xbyak
-    set_source_files_properties(macro/macro_jit_x64.cpp PROPERTIES COMPILE_OPTIONS "-Wno-conversion;-Wno-shadow")
-
     # Get around GCC failing with intrinsics in Debug
     if (CXX_GCC AND CMAKE_BUILD_TYPE MATCHES "Debug")
         set_source_files_properties(host1x/vic.cpp PROPERTIES COMPILE_OPTIONS "-O2")

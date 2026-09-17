@@ -222,7 +222,6 @@ add_library(shader_recompiler STATIC
     ir_opt/dead_code_elimination_pass.cpp
     ir_opt/dual_vertex_pass.cpp
     ir_opt/global_memory_to_storage_buffer_pass.cpp
-    ir_opt/identity_removal_pass.cpp
     ir_opt/layer_pass.cpp
     ir_opt/lower_fp16_to_fp32.cpp
     ir_opt/lower_fp64_to_fp32.cpp

@@ -25,7 +25,6 @@ namespace Tegra {
 namespace Host1x {
 class Host1x;
 class Nvdec;
-class SyncptIncrManager;
 class Vic;
 } // namespace Host1x
 

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Apple SDL Metal window stub. Not used by suyu.cpp today (Vulkan/MoltenVK is
+// the live macOS path). Kept so APPLE target_sources stays coherent and a
+// future native Metal backend can construct this window class.
+
 #pragma once
 
 #include <memory>
