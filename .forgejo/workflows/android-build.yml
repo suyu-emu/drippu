@@ -10,7 +10,6 @@ on:
 jobs:
   android:
     runs-on: ubuntu-latest
-    if: ${{ github.repository == 'suyu-emu/suyu-android' }}
     steps:
       - uses: actions/checkout@v4
         with:

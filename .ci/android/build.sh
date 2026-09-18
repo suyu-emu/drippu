@@ -27,8 +27,8 @@ Options:
                           	Valid values are: legacy, optimized, standard, chromeos
                           	Default: standard
     -b, --build-type <TYPE>	Build type (variable: TYPE)
-                          	Valid values are: Release, RelWithDebInfo, Debug
-                          	Default: Debug
+                            Valid values are: Release, RelWithDebInfo, Debug
+                            Default: Release
     -n, --nightly           Create a nightly build.
 
 Extra arguments are passed to CMake (e.g. -DCMAKE_OPTION_NAME=VALUE)
@@ -116,6 +116,18 @@ if nightly; then
     NIGHTLY=true
 else
     NIGHTLY=false
+fi
+
+# A release/nightly build signed with the debug key cannot be distributed.
+# Refuse that outcome in CI; warn loudly for local builds.
+if { [ "$DEVEL" != "true" ] || nightly; } && [ -z "${ANDROID_KEYSTORE_B64}" ] && [ -z "${ANDROID_KEYSTORE_FILE}" ]; then
+    if [ -n "${CI}${GITHUB_ACTIONS}" ]; then
+        echo "-- ! Release/nightly build without a release keystore in CI." >&2
+        echo "-- ! Set the ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASS and ANDROID_KEY_ALIAS secrets." >&2
+        echo "-- ! See docs/build/Android.md \"Signing release builds\"." >&2
+        exit 1
+    fi
+    echo "-- WARNING: no release keystore configured; APK/AAB will be signed with the DEBUG key and cannot be distributed." >&2
 fi
 
 echo "-- building..."

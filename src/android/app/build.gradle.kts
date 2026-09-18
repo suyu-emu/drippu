@@ -98,8 +98,9 @@ android {
                         "-DNIGHTLY_BUILD=ON",
                     ))
                 }
-
-                abiFilters("arm64-v8a")
+                // NOTE: Do not set abiFilters here. ABI selection is done
+                // per-product-flavor below so the chromeOS (x86_64) flavor
+                // doesn't also build arm64.
             }
         }
     }
@@ -119,6 +120,30 @@ android {
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"
+        }
+    }
+
+    // Release-signing sanity checks. A release build silently signed with the
+    // debug key cannot be distributed, so validate the configuration early.
+    val buildingRelease = gradle.startParameter.taskNames.any {
+        it.contains("Release", ignoreCase = true)
+    }
+    if (buildingRelease) {
+        if (keystoreFile != null) {
+            require(
+                !System.getenv("ANDROID_KEYSTORE_PASS").isNullOrEmpty() &&
+                    !System.getenv("ANDROID_KEY_ALIAS").isNullOrEmpty()
+            ) {
+                "ANDROID_KEYSTORE_FILE is set but ANDROID_KEYSTORE_PASS and/or " +
+                    "ANDROID_KEY_ALIAS are missing. " +
+                    "See docs/build/Android.md \"Signing release builds\"."
+            }
+        } else {
+            logger.warn(
+                "No release keystore configured (ANDROID_KEYSTORE_FILE is unset). " +
+                    "This release build will be signed with the DEBUG key and cannot be " +
+                    "distributed. See docs/build/Android.md \"Signing release builds\"."
+            )
         }
     }
 
@@ -144,6 +169,11 @@ android {
 
             isMinifyEnabled = true
             isDebuggable = false
+            // Ship native debug symbols so Play vitals crash reports
+            // are symbolicated for the C++ (yuzu-android) code.
+            ndk {
+                debugSymbolLevel = "FULL"
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -192,6 +222,12 @@ android {
             manifestPlaceholders += mapOf("appNameBase" to "suyu")
             resValue("string", "app_name_suffixed", "suyu")
 
+            externalNativeBuild {
+                cmake {
+                    abiFilters("arm64-v8a")
+                }
+            }
+
             ndk {
                 abiFilters += listOf("arm64-v8a")
             }
@@ -206,6 +242,7 @@ android {
             externalNativeBuild {
                 cmake {
                     arguments.add("-DGENSHIN_SPOOF=ON")
+                    abiFilters("arm64-v8a")
                 }
             }
 
@@ -223,12 +260,7 @@ android {
             externalNativeBuild {
                 cmake {
                     arguments.add("-DYUZU_LEGACY=ON")
-                }
-            }
-
-            sourceSets {
-                getByName("legacy") {
-                    res.srcDirs("src/main/legacy")
+                    abiFilters("arm64-v8a")
                 }
             }
 
@@ -251,6 +283,14 @@ android {
                     abiFilters("x86_64")
                 }
             }
+        }
+    }
+
+    // Flavor-specific source directories. This must live at the android
+    // extension level; sourceSets has no meaning inside a productFlavor.
+    sourceSets {
+        getByName("legacy") {
+            res.srcDirs("src/main/legacy")
         }
     }
 
