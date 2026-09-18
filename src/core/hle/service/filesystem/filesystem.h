@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/fs_directory.h"
 #include "core/file_sys/fs_filesystem.h"
@@ -123,6 +125,12 @@ public:
 
     FileSys::ExternalContentProvider* GetExternalContentProvider() const;
 
+    /// Decrypted AOC RomFS baked into a standalone export. Served without NAND or keys.
+    void RegisterBakedAoc(u64 title_id, FileSys::VirtualFile romfs);
+    void ClearBakedAoc();
+    [[nodiscard]] FileSys::VirtualFile GetBakedAocRomFS(u64 title_id) const;
+    [[nodiscard]] std::vector<u64> ListBakedAocTitleIds() const;
+
     // Creates the SaveData, SDMC, and BIS Factories. Should be called once and before any function
     // above is called.
     void CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite = true);
@@ -149,6 +157,8 @@ private:
     std::unique_ptr<FileSys::XCI> gamecard;
     std::unique_ptr<FileSys::RegisteredCache> gamecard_registered;
     std::unique_ptr<FileSys::PlaceholderCache> gamecard_placeholder;
+
+    std::map<u64, FileSys::VirtualFile> baked_aoc;
 
     Core::System& system;
 };

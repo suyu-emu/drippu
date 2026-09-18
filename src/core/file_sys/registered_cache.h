@@ -241,6 +241,9 @@ public:
         std::optional<u64> title_id) const override;
 
     const ExternalContentProvider* GetExternalProvider() const;
+    [[nodiscard]] ContentProvider* GetSlotProvider(ContentProviderUnionSlot slot) {
+        return providers[size_t(slot)];
+    }
     [[nodiscard]] inline const ContentProvider* GetSlotProvider(ContentProviderUnionSlot slot) const {
         return providers[size_t(slot)];
     }
@@ -252,7 +255,7 @@ public:
 
     std::optional<ContentProviderUnionSlot> GetSlotForEntry(u64 title_id, ContentRecordType type) const;
 private:
-    std::array<ContentProvider*, size_t(ContentProviderUnionSlot::Count)> providers;
+    std::array<ContentProvider*, size_t(ContentProviderUnionSlot::Count)> providers{};
 };
 
 class ManualContentProvider : public ContentProvider {

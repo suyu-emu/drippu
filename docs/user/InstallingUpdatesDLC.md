@@ -50,3 +50,21 @@ Upon occasion you may find that you want to disable a certain DLC or Update (inc
 2. Select *Configure Game.*
 3. Uncheck the box next to the DLC or Update you want to disable and hit **OK**.
 4. The listing should now reflect that it has been disabled with a **[D]** before the entry.  If you load the game, you will observe that the reported version is not updated (assuming the game reports this information).
+
+---
+
+## Exporting a game with separate updates / DLC
+
+Game Export can bake **owned** separate update and DLC/AOC dumps (or NAND-installed add-ons for that title) into the standalone package. Merged dumps that already contain the update still work; this is for the split-file layout.
+
+This does not help you obtain dumps. Only use files you already own.
+
+1. Open **Export Game**.
+2. Choose the base ROM.
+3. Under **Updates / DLC**, add the extra NSP/XCI/NCA files, and/or leave **Use NAND-installed add-ons for this title** checked if you already installed them for emulation.
+4. The status line lists what will be baked (update version, DLC IDs, and source).
+5. Export as usual. The package's `exefs/` (including `romfs.bin`) is the **patched snapshot**. DLC is written under `aoc/<title id>/romfs.bin`.
+
+If an extra file cannot be read, export **stops** and reports the path — it does not package a base-only snapshot while claiming the add-on was baked. The status line only lists an update when **both** ExeFS replace and RomFS BKTR applied. A folder dump of extracted `exefs/` cannot BKTR an update (no Program NCA); export refuses rather than mixing update NSOs with base `romfs.bin`. Use the original NSP/XCI (or a merged dump) as the base ROM.
+
+The standalone runtime does **not** need a post-export NAND install. Updates are already applied to ExeFS/RomFS; DLC is served from the baked `aoc/` tree. `content_baked.txt` in the package repeats the same summary.

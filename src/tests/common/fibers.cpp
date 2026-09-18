@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -101,10 +102,35 @@ class TestControl2 {
 public:
     TestControl2() = default;
 
+    // Like WaitForTimingIdle: bounded wait, then the caller fails closed.
+    // On expiry, do not YieldTo the partner (that can deadlock the fiber
+    // mutex so join() never returns and REQUIRE_FALSE never runs). Yield
+    // back to this thread's home fiber and return.
+    bool WaitForHandshakeClear(std::atomic<bool>& flag) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (flag.load()) {
+            if (handshake_timeout.load() || std::chrono::steady_clock::now() >= deadline) {
+                handshake_timeout = true;
+                trap.store(false);
+                trap2.store(false);
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return !handshake_timeout.load();
+    }
+
+    void YieldHome(const std::shared_ptr<Fiber>& from) {
+        const u32 id = thread_ids.Get();
+        Fiber::YieldTo(from, *thread_fibers[id]);
+    }
+
     void DoWork1() {
         trap2 = false;
-        while (trap.load())
-            ;
+        if (!WaitForHandshakeClear(trap)) {
+            YieldHome(fiber1);
+            return;
+        }
         for (u32 i = 0; i < 12000; i++) {
             value1 += i;
         }
@@ -116,8 +142,10 @@ public:
     }
 
     void DoWork2() {
-        while (trap2.load())
-            ;
+        if (!WaitForHandshakeClear(trap2)) {
+            YieldHome(fiber2);
+            return;
+        }
         value2 = 2000;
         trap = false;
         Fiber::YieldTo(fiber2, *fiber1);
@@ -152,6 +180,7 @@ public:
     u32 value2{};
     std::atomic<bool> trap{true};
     std::atomic<bool> trap2{true};
+    std::atomic<bool> handshake_timeout{false};
     ThreadIds thread_ids;
     std::vector<std::shared_ptr<Common::Fiber>> thread_fibers;
     std::shared_ptr<Common::Fiber> fiber1;
@@ -192,6 +221,7 @@ TEST_CASE("Fibers::InterExchange", "[common]") {
     }};
     thread1.join();
     thread2.join();
+    REQUIRE_FALSE(test_control.handshake_timeout);
     REQUIRE(test_control.assert1);
     REQUIRE(test_control.assert2);
     REQUIRE(test_control.assert3);

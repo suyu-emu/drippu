@@ -4,6 +4,7 @@
 #include "suyu/game_export.h"
 #include "suyu/steam_integration.h"
 
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QBuffer>
 #include <QCheckBox>
@@ -18,6 +19,7 @@
 #include <QDialogButtonBox>
 #include <QImage>
 #include <QListWidget>
+#include <QListWidgetItem>
 #include <QMessageBox>
 #include <QCloseEvent>
 #include <QEventLoop>
@@ -33,6 +35,7 @@
 #include <chrono>
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -51,6 +54,7 @@
 #include "common/hex_util.h"
 #include "common/lz4_compression.h"
 #include "common/swap.h"
+#include "core/file_sys/export_content.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/nca_metadata.h"
@@ -274,7 +278,7 @@ static bool CopyPortableSupportData(quint64 program_id, const QString& package_r
 GameExportDialog::GameExportDialog(Core::System& system, QWidget* parent)
     : QDialog(parent), system_(system) {
     setWindowTitle(tr("Export Game — AOT Static Recompilation"));
-    setMinimumSize(540, 420);
+    setMinimumSize(540, 560);
     SetupUi();
 }
 
@@ -303,6 +307,42 @@ void GameExportDialog::SetupUi() {
     auto* browse_btn = new QPushButton(tr("Browse..."), this);
     out_row->addWidget(browse_btn);
     layout->addLayout(out_row);
+
+    auto* addon_label = new QLabel(tr("Updates / DLC:"), this);
+    layout->addWidget(addon_label);
+    addon_files_list = new QListWidget(this);
+    addon_files_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    addon_files_list->setMinimumHeight(72);
+    addon_files_list->setToolTip(
+        tr("Separate update and DLC/AOC dumps you already own. These are baked into "
+           "the exported snapshot; the standalone package does not need NAND installs."));
+    layout->addWidget(addon_files_list);
+    auto* addon_btn_row = new QHBoxLayout();
+    auto* addon_add_btn = new QPushButton(tr("Add Files..."), this);
+    auto* addon_remove_btn = new QPushButton(tr("Remove Selected"), this);
+    auto* addon_clear_btn = new QPushButton(tr("Clear"), this);
+    addon_btn_row->addWidget(addon_add_btn);
+    addon_btn_row->addWidget(addon_remove_btn);
+    addon_btn_row->addWidget(addon_clear_btn);
+    addon_btn_row->addStretch();
+    layout->addLayout(addon_btn_row);
+
+    use_nand_addons_checkbox =
+        new QCheckBox(tr("Use NAND-installed add-ons for this title"), this);
+    use_nand_addons_checkbox->setChecked(true);
+    use_nand_addons_checkbox->setToolTip(
+        tr("Include updates and DLC already installed to this machine's NAND/SD, "
+           "the same content emulation would apply. Uncheck to bake only the base "
+           "ROM, packed extras in that ROM, picked files, and game-directory dumps."));
+    layout->addWidget(use_nand_addons_checkbox);
+
+    bake_status_label = new QLabel(
+        tr("Baking: base game only (no separate update or DLC). "
+           "Standalone snapshot — no NAND install needed after export."),
+        this);
+    bake_status_label->setWordWrap(true);
+    bake_status_label->setStyleSheet(QStringLiteral("color: #888;"));
+    layout->addWidget(bake_status_label);
 
     const QString default_output = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
     if (!default_output.isEmpty()) {
@@ -411,7 +451,9 @@ void GameExportDialog::SetupUi() {
     layout->addWidget(include_custom_config_checkbox);
 
     auto* note_label = new QLabel(
-          tr("Translates the game's ARM64 code into C. Output mirrors the ROM structure: "
+          tr("Translates the game's ARM64 code into C. Separate update/DLC files (or NAND-installed "
+             "add-ons) are baked in at export: the packaged exefs and romfs.bin are the patched "
+             "snapshot, so the standalone build does not need NAND installs afterward. "
              "exefs/ holds one C project per module (main, rtld, sdk, ...). "
              "Build has suyu compile it for you (slow on large titles). "
              "Source gives you the C + CMakeLists.txt to compile yourself. "
@@ -441,6 +483,11 @@ void GameExportDialog::SetupUi() {
     connect(rom_library_btn, &QPushButton::clicked, this, &GameExportDialog::OnSelectFromLibrary);
     connect(rom_browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseRom);
     connect(browse_btn, &QPushButton::clicked, this, &GameExportDialog::OnBrowseOutput);
+    connect(addon_add_btn, &QPushButton::clicked, this, &GameExportDialog::OnAddAddonFiles);
+    connect(addon_remove_btn, &QPushButton::clicked, this, &GameExportDialog::OnRemoveSelectedAddons);
+    connect(addon_clear_btn, &QPushButton::clicked, this, &GameExportDialog::OnClearAddonFiles);
+    connect(use_nand_addons_checkbox, &QCheckBox::toggled, this, [this](bool) { RefreshBakeStatus(); });
+    connect(rom_path_edit, &QLineEdit::editingFinished, this, [this] { RefreshBakeStatus(); });
     connect(export_button, &QPushButton::clicked, this, &GameExportDialog::OnExport);
 }
 
@@ -469,13 +516,26 @@ void GameExportDialog::SetRomPath(const QString& path, quint64 program_id) {
 }
 
 void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QString& output_dir,
-                                               int format_index) {
+                                               int format_index, QStringList extra_addon_paths,
+                                               bool use_nand_addons) {
     if (format_index >= 0 && output_format_combo &&
         format_index < output_format_combo->count()) {
         output_format_combo->setCurrentIndex(format_index);
     }
     SetRomPath(rom_path);
     output_path_edit->setText(output_dir);
+    if (addon_files_list) {
+        addon_files_list->clear();
+        for (const QString& path : extra_addon_paths) {
+            if (!path.isEmpty()) {
+                addon_files_list->addItem(path);
+            }
+        }
+    }
+    if (use_nand_addons_checkbox) {
+        use_nand_addons_checkbox->setChecked(use_nand_addons);
+    }
+    RefreshBakeStatus();
     OnExport();
 }
 
@@ -494,6 +554,75 @@ void GameExportDialog::OnBrowseRom() {
         include_shader_cache_checkbox->setEnabled(false);
         include_custom_config_checkbox->setEnabled(false);
     }
+    RefreshBakeStatus();
+}
+
+void GameExportDialog::OnAddAddonFiles() {
+    const QStringList files = QFileDialog::getOpenFileNames(
+        this, tr("Select update / DLC files"), QString(),
+        tr("Switch content files (*.nsp *.xci *.nca);;All files (*.*)"), nullptr,
+        QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
+    if (!addon_files_list) {
+        return;
+    }
+    for (const QString& file : files) {
+        if (file.isEmpty()) {
+            continue;
+        }
+        bool exists = false;
+        for (int i = 0; i < addon_files_list->count(); ++i) {
+            if (addon_files_list->item(i)->text() == file) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            addon_files_list->addItem(file);
+        }
+    }
+    RefreshBakeStatus();
+}
+
+void GameExportDialog::OnRemoveSelectedAddons() {
+    if (!addon_files_list) {
+        return;
+    }
+    const auto selected = addon_files_list->selectedItems();
+    for (QListWidgetItem* item : selected) {
+        delete addon_files_list->takeItem(addon_files_list->row(item));
+    }
+    RefreshBakeStatus();
+}
+
+void GameExportDialog::OnClearAddonFiles() {
+    if (addon_files_list) {
+        addon_files_list->clear();
+    }
+    RefreshBakeStatus();
+}
+
+void GameExportDialog::RefreshBakeStatus() {
+    if (!bake_status_label) {
+        return;
+    }
+    if (rom_path_edit->text().isEmpty()) {
+        bake_status_label->setText(
+            tr("Select a base ROM. Optional update/DLC files and NAND-installed "
+               "add-ons are baked into the exported snapshot."));
+        return;
+    }
+
+    FileSys::ExportContentRequest request;
+    request.rom_path = rom_path_edit->text().toStdString();
+    request.title_id = rom_program_id;
+    request.use_nand_addons = !use_nand_addons_checkbox || use_nand_addons_checkbox->isChecked();
+    if (addon_files_list) {
+        for (int i = 0; i < addon_files_list->count(); ++i) {
+            request.extra_addon_paths.push_back(addon_files_list->item(i)->text().toStdString());
+        }
+    }
+    const QString status = QString::fromStdString(FileSys::DescribeExportContent(system_, request));
+    bake_status_label->setText(status);
 }
 
 void GameExportDialog::OnSelectFromLibrary() {
@@ -1207,41 +1336,183 @@ static qint64 DumpVirtualDir(const FileSys::VirtualDir& vdir, const QString& des
     return total;
 }
 
-// Extract the romfs VirtualFile from a ROM (NSP/XCI/NCA). Returns nullptr if not available.
-static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path) {
-    // RealVfsFile holds a raw RealVfsFilesystem& (not a shared_ptr), so a
-    // locally-scoped vfs would dangle once files it opened outlive this
-    // function - keep one filesystem instance alive for the process.
-    static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
-    auto file = vfs->OpenFile(rom_path, FileSys::OpenMode::Read);
-    if (!file) return nullptr;
-    const std::string name = file->GetName();
-    auto pos = name.rfind('.'); std::string ext;
-    if (pos != std::string::npos) { ext = name.substr(pos); std::transform(ext.begin(),ext.end(),ext.begin(),::tolower); }
-
-    const auto romfs_from_nsp = [](const std::shared_ptr<FileSys::NSP>& nsp) -> FileSys::VirtualFile {
-        if (nsp->GetStatus() != Loader::ResultStatus::Success) return nullptr;
-        const auto nca = nsp->GetNCA(nsp->GetProgramTitleID(), FileSys::ContentRecordType::Program);
-        return nca ? nca->GetRomFS() : nullptr;
-    };
-
-    if (ext == ".nsp") {
-        auto nsp = std::make_shared<FileSys::NSP>(file);
-        if (auto r = romfs_from_nsp(nsp)) return r;
+static bool DumpVirtualFile(const FileSys::VirtualFile& vf, const QString& dest_path) {
+    if (!vf) {
+        return false;
     }
-    if (ext == ".xci") {
-        auto xci = std::make_shared<FileSys::XCI>(file);
-        if (xci->GetStatus() == Loader::ResultStatus::Success) {
-            auto sec = xci->GetSecurePartitionNSP();
-            if (sec) if (auto r = romfs_from_nsp(sec)) return r;
+    const QFileInfo info(dest_path);
+    if (!QDir().mkpath(info.absolutePath())) {
+        return false;
+    }
+    QFile out(dest_path);
+    if (!out.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    constexpr u64 kChunk = 64ULL * 1024 * 1024;
+    const u64 total = vf->GetSize();
+    for (u64 off = 0; off < total; off += kChunk) {
+        const u64 len = std::min(kChunk, total - off);
+        const auto bytes = vf->ReadBytes(len, off);
+        if (out.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<qint64>(bytes.size())) != static_cast<qint64>(bytes.size())) {
+            return false;
         }
     }
-    if (ext == ".nca") {
-        auto nca = std::make_shared<FileSys::NCA>(file);
-        if (nca->GetStatus() == Loader::ResultStatus::Success)
-            return nca->GetRomFS();
+    return true;
+}
+
+static bool ExeFsDirHasMain(const QString& exefs_dir) {
+    return QFile::exists(exefs_dir + QDir::separator() + QStringLiteral("main"));
+}
+
+static bool VirtualDirHasMain(const FileSys::VirtualDir& vdir) {
+    return vdir && vdir->GetFile("main") != nullptr;
+}
+
+static bool StagedAocPresent(const QString& staged_dir) {
+    const QString aoc_dir = staged_dir + QDir::separator() + QStringLiteral("aoc");
+    return QDir(aoc_dir).exists() &&
+           !QDir(aoc_dir).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty();
+}
+
+static void PlaceParkedRomFS(const QString& staged_dir) {
+    const QString parked = staged_dir + QDir::separator() + QStringLiteral("romfs.bin");
+    const QString exefs = staged_dir + QDir::separator() + QStringLiteral("exefs");
+    if (!QFile::exists(parked) || !ExeFsDirHasMain(exefs)) {
+        return;
     }
-    return nullptr;
+    const QString dest = exefs + QDir::separator() + QStringLiteral("romfs.bin");
+    QFile::remove(dest);
+    QFile::rename(parked, dest);
+}
+
+static bool StagePatchedContent(const FileSys::ExportContentSession& session,
+                                const QString& staged_dir) {
+    const QString exefs_dst = staged_dir + QDir::separator() + QStringLiteral("exefs");
+    // Do not create exefs/ without main: an empty/partial directory blocks
+    // extract fallback and can ship AOC with no baked executable.
+    bool wrote_main = false;
+    if (VirtualDirHasMain(session.GetPatchedExeFS())) {
+        if (DumpVirtualDir(session.GetPatchedExeFS(), exefs_dst) < 0) {
+            return false;
+        }
+        wrote_main = true;
+    }
+    if (session.GetPatchedRomFS()) {
+        const QString romfs_dest =
+            wrote_main ? (exefs_dst + QDir::separator() + QStringLiteral("romfs.bin"))
+                       : (staged_dir + QDir::separator() + QStringLiteral("romfs.bin"));
+        if (!DumpVirtualFile(session.GetPatchedRomFS(), romfs_dest)) {
+            return false;
+        }
+    }
+    const QString aoc_root = staged_dir + QDir::separator() + QStringLiteral("aoc");
+    for (const auto& aoc : session.GetAoc()) {
+        const QString tid =
+            QStringLiteral("%1").arg(aoc.title_id, 16, 16, QLatin1Char('0')).toLower();
+        const QString dest = aoc_root + QDir::separator() + tid + QDir::separator() +
+                             QStringLiteral("romfs.bin");
+        if (!DumpVirtualFile(aoc.romfs, dest)) {
+            return false;
+        }
+    }
+    QFile baked(staged_dir + QDir::separator() + QStringLiteral("content_baked.txt"));
+    if (baked.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QTextStream out(&baked);
+        out << QString::fromStdString(session.GetStatus()) << "\n";
+        out << "Owned dumps only; this export does not acquire content.\n";
+        baked.close();
+    }
+    return true;
+}
+
+static bool CopyStagedContent(const QString& staged_dir, const QString& dest_parent) {
+    if (staged_dir.isEmpty() || !QDir(staged_dir).exists()) {
+        return true;
+    }
+    const QString src_exefs = staged_dir + QDir::separator() + QStringLiteral("exefs");
+    if (QDir(src_exefs).exists() &&
+        !QDir(src_exefs).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty()) {
+        if (!CopyDirectoryRecursive(src_exefs, dest_parent + QDir::separator() +
+                                                   QStringLiteral("exefs"))) {
+            return false;
+        }
+    }
+    const QString src_aoc = staged_dir + QDir::separator() + QStringLiteral("aoc");
+    if (QDir(src_aoc).exists()) {
+        if (!CopyDirectoryRecursive(src_aoc, dest_parent + QDir::separator() +
+                                                 QStringLiteral("aoc"))) {
+            return false;
+        }
+    }
+    const QString baked = staged_dir + QDir::separator() + QStringLiteral("content_baked.txt");
+    if (QFile::exists(baked)) {
+        CopyFileReplacingExisting(baked, dest_parent + QDir::separator() +
+                                             QStringLiteral("content_baked.txt"));
+    }
+    const QString parked_romfs = staged_dir + QDir::separator() + QStringLiteral("romfs.bin");
+    if (QFile::exists(parked_romfs)) {
+        CopyFileReplacingExisting(parked_romfs, dest_parent + QDir::separator() +
+                                                    QStringLiteral("romfs.bin"));
+    }
+    return true;
+}
+
+static bool FillMissingExeFsFromRom(const QString& dest_parent, const QString& rom_path) {
+    const QString dest = dest_parent + QDir::separator() + QStringLiteral("exefs");
+    if (ExeFsDirHasMain(dest)) {
+        return true;
+    }
+    if (rom_path.isEmpty() || !QFile::exists(rom_path)) {
+        return false;
+    }
+    const QFileInfo rom_info(rom_path);
+    if (rom_info.isDir()) {
+        QString src;
+        if (QFile::exists(rom_path + QDir::separator() + QStringLiteral("exefs") +
+                          QDir::separator() + QStringLiteral("main"))) {
+            src = rom_path + QDir::separator() + QStringLiteral("exefs");
+        } else if (QFile::exists(rom_path + QDir::separator() + QStringLiteral("main"))) {
+            src = rom_path;
+        }
+        if (src.isEmpty()) {
+            return false;
+        }
+        return CopyDirectoryRecursive(src, dest) && ExeFsDirHasMain(dest);
+    }
+    auto vdir = ExtractExeFsFromRom(rom_path.toStdString());
+    if (!vdir) {
+        return false;
+    }
+    if (DumpVirtualDir(vdir, dest) < 0) {
+        return false;
+    }
+    return ExeFsDirHasMain(dest);
+}
+
+static bool EnsurePackagedExeFs(const QString& dest_parent, const QString& rom_path) {
+    const QString exefs = dest_parent + QDir::separator() + QStringLiteral("exefs");
+    const bool has_aoc = StagedAocPresent(dest_parent);
+    if (has_aoc && !ExeFsDirHasMain(exefs)) {
+        LOG_ERROR(Frontend, "Refusing to package DLC without baked exefs/main");
+        return false;
+    }
+    if (!ExeFsDirHasMain(exefs)) {
+        const bool partial =
+            QDir(exefs).exists() &&
+            !QDir(exefs).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty();
+        if (!FillMissingExeFsFromRom(dest_parent, rom_path)) {
+            if (partial) {
+                LOG_ERROR(Frontend, "Incomplete exefs/ without main; extract fallback failed");
+                return false;
+            }
+        }
+    }
+    PlaceParkedRomFS(dest_parent);
+    if (has_aoc && !ExeFsDirHasMain(exefs)) {
+        return false;
+    }
+    return true;
 }
 
 static std::optional<u32> ReadArm64InstructionAt(std::span<const u8> text, u32 text_vaddr,
@@ -1617,14 +1888,15 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     // an update or recompiler bump.
     {
         std::vector<suyu::recomp::AotCacheModuleIdentity> current_modules;
+        if (!exefs_dir.isEmpty()) {
+            current_modules = CollectExeFsIdentitiesFromDir(exefs_dir);
+        }
         const QString rom_path = rom_path_edit->text();
-        if (!rom_path.isEmpty() && QFile::exists(rom_path) && QFileInfo(rom_path).isFile()) {
+        if (current_modules.empty() && !rom_path.isEmpty() && QFile::exists(rom_path) &&
+            QFileInfo(rom_path).isFile()) {
             if (auto exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString())) {
                 current_modules = CollectExeFsIdentities(exefs_vdir);
             }
-        }
-        if (current_modules.empty() && !exefs_dir.isEmpty()) {
-            current_modules = CollectExeFsIdentitiesFromDir(exefs_dir);
         }
 
         QString manifest_contents;
@@ -1661,13 +1933,22 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         }
     }
 
-    // Collect NSO files to analyze — either from VFS (ROM containers) or from extracted ExeFS
+    // Collect NSO files to analyze — prefer a PatchManager-baked ExeFS staged to
+    // disk so updates replace base NSOs before AOT. Fall back to opening the ROM.
     std::vector<NsoAnalysisResult> module_results;
     bool used_vfs = false;
 
-    // First, try to open the ROM via VFS to extract ExeFS directly
+    const bool staged_exefs_ready = [&] {
+        if (exefs_dir.isEmpty() || !QDir(exefs_dir).exists()) {
+            return false;
+        }
+        return QFile::exists(exefs_dir + QDir::separator() + QStringLiteral("main")) ||
+               QFile::exists(exefs_dir + QDir::separator() + QStringLiteral("main.npdm"));
+    }();
+
     const QString rom_path = rom_path_edit->text();
-    if (!rom_path.isEmpty() && QFile::exists(rom_path) && QFileInfo(rom_path).isFile()) {
+    if (!staged_exefs_ready && !rom_path.isEmpty() && QFile::exists(rom_path) &&
+        QFileInfo(rom_path).isFile()) {
         const auto t_extract_start = std::chrono::steady_clock::now();
         auto exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString());
         const auto t_extract_end = std::chrono::steady_clock::now();
@@ -2447,7 +2728,8 @@ static QString AotCacheDirFor(const QString& output_dir, const QString& game_nam
 
 bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QString& cache_dir,
                                            const QString& output_dir, const QString& game_name,
-                                           TargetPlatform platform) {
+                                           TargetPlatform platform,
+                                           const QString& staged_content_dir) {
     // The original ROM used to be copied into every package. It is not needed
     // there: the recompiled project carries the guest segments it executes in
     // <module>/data, and nothing in the package or in suyu ever opened the copy.
@@ -2489,40 +2771,14 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             }
         }
 
-        // ── Extract exefs (NSO executables) → <pkg>/exefs/ ──────────────────────
-        // This gives the package the same structure as Switch ROM viewers show.
-        // suyu-cmd auto-detects exefs/main next to it and loads from there.
-        const QString exefs_dst = pkg_dir + QStringLiteral("/exefs");
-        auto exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString());
-        if (exefs_vdir) {
-            DumpVirtualDir(exefs_vdir, exefs_dst);
+        // ── Staged patched exefs + romfs.bin + aoc/ ──────────────────────────
+        // PatchManager already applied update ExeFS replace, RomFS patch, and
+        // AOC dumps. Copy that snapshot; do not re-extract the unpatched ROM.
+        if (!CopyStagedContent(staged_content_dir, pkg_dir)) {
+            return false;
         }
-
-        // ── Extract romfs → <pkg>/exefs/romfs.bin ────────────────────────────────
-        // DeconstructedRomDirectory loader looks for a .romfs file alongside the NSOs.
-        // Romfs can be several GB — only extract if VFS gives it without copying the file.
-        if (exefs_vdir) {
-            auto romfs_vf = ExtractRomFsFromRom(rom_path.toStdString());
-            if (romfs_vf) {
-                // Always extract the decrypted romfs into the package so the
-                // export is genuinely standalone: no original ROM file and no
-                // keys required at runtime (only at export time, on this
-                // machine, to read the source ROM once). Streamed in chunks -
-                // romfs can be many GB and ReadAllBytes() would double the
-                // package's peak memory use for no benefit.
-                QFile rf(exefs_dst + QStringLiteral("/romfs.bin"));
-                if (rf.open(QIODevice::WriteOnly)) {
-                    constexpr u64 kChunk = 64ULL * 1024 * 1024;
-                    const u64 total = romfs_vf->GetSize();
-                    for (u64 off = 0; off < total; off += kChunk) {
-                        const u64 len = std::min(kChunk, total - off);
-                        const auto bytes = romfs_vf->ReadBytes(len, off);
-                        rf.write(reinterpret_cast<const char*>(bytes.data()),
-                                 static_cast<qint64>(bytes.size()));
-                    }
-                    rf.close();
-                }
-            }
+        if (!EnsurePackagedExeFs(pkg_dir, rom_path)) {
+            return false;
         }
 
         // Bundle suyu-cmd.exe (renamed to the game name) and its runtime DLLs so the
@@ -2695,8 +2951,10 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             out << "Contents:\n";
             out << "- " << game_name << ".exe : the game (recompiled code + HLE/GPU backend, one file)\n";
             out << "- launch.bat      : one-click launcher\n";
-            out << "- exefs/          : the game's own executables and data, extracted once at\n";
-            out << "                    export time so no ROM or decryption keys are needed to run\n";
+            out << "- exefs/          : patched executables and romfs.bin (base + baked update)\n";
+            out << "                    extracted once at export time so no ROM or keys are needed\n";
+            out << "- aoc/            : decrypted DLC/AOC romfs snapshots, if any were baked in\n";
+            out << "- content_baked.txt : which update/DLC sources were included\n";
             out << "- *.dll           : runtime libraries (FFmpeg, Vulkan, OpenSSL)\n";
             out << "- mods/           : optional; drop <title_id>/<mod name>/ folders here\n";
             out << "- user/           : this game's own config, saves, and logs (not suyu's)\n\n";
@@ -2719,6 +2977,13 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
 
         write_source_reference(bin_dir);
 
+        if (!CopyStagedContent(staged_content_dir, bin_dir)) {
+            return false;
+        }
+        if (!EnsurePackagedExeFs(bin_dir, rom_path)) {
+            return false;
+        }
+
         // Copy AOT cache
         if (!CopyDirectoryUnlessInPlace(cache_dir,
                                     bin_dir + QDir::separator() + QStringLiteral("aot_cache"))) {
@@ -2730,6 +2995,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             QTextStream out(&readme);
             out << "Suyu native export artifact bundle\n\n";
             out << "Compiler artifacts are under usr/bin/aot_cache.\n";
+            out << "Patched exefs/romfs.bin (and aoc/ if DLC was baked) sit next to that cache.\n";
             out << "No frontend runtime binary is bundled in this export.\n";
             readme.close();
         }
@@ -2748,6 +3014,13 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
 
         write_source_reference(res_dir);
 
+        if (!CopyStagedContent(staged_content_dir, res_dir)) {
+            return false;
+        }
+        if (!EnsurePackagedExeFs(res_dir, rom_path)) {
+            return false;
+        }
+
         // Copy AOT cache
         if (!CopyDirectoryUnlessInPlace(cache_dir,
                                     res_dir + QDir::separator() + QStringLiteral("aot_cache"))) {
@@ -2759,6 +3032,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             QTextStream out(&readme);
             out << "Suyu native export artifact bundle\n\n";
             out << "Compiler artifacts are under Contents/Resources/aot_cache.\n";
+            out << "Patched exefs/romfs.bin (and aoc/ if DLC was baked) sit next to that cache.\n";
             out << "No frontend runtime binary is bundled in this export.\n";
             readme.close();
         }
@@ -2936,6 +3210,21 @@ public:
 private:
     bool& flag_;
 };
+
+class WorkDirGuard {
+public:
+    explicit WorkDirGuard(QString path) : path_{std::move(path)} {}
+    ~WorkDirGuard() {
+        if (!path_.isEmpty()) {
+            QDir(path_).removeRecursively();
+        }
+    }
+    WorkDirGuard(const WorkDirGuard&) = delete;
+    WorkDirGuard& operator=(const WorkDirGuard&) = delete;
+
+private:
+    QString path_;
+};
 } // namespace
 
 /// Direct-from-ROM icon+title fallback for when the export ran without ever
@@ -3081,29 +3370,82 @@ void GameExportDialog::OnExport() {
     // copy it across meant writing 12 GB and holding both at once, which is
     // where large exports were failing during packaging.
     const QString cache_work = AotCacheDirFor(output_dir, game_name, platform);
-    QDir().mkpath(exefs_work);
+    QDir().mkpath(work_dir);
     QDir().mkpath(cache_work);
+    const WorkDirGuard work_cleanup{work_dir};
     progress_bar->setValue(5);
 
-    // Step 2: ExeFS extraction is handled inside RunAotPrecompile via VFS.
-    // For extracted directories, we copy them to the work area here.
-    status_label->setText(tr("Scanning for ExeFS content..."));
+    // Step 2: Resolve base + updates/DLC like emulation, then bake PatchManager
+    // (update ExeFS replace, RomFS patch, AOC) into the staged snapshot.
+    status_label->setText(tr("Resolving updates and DLC..."));
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
-    QFileInfo rom_fi(rom_path);
-    if (rom_fi.isDir()) {
-        const QString exefs_sub = rom_path + QDir::separator() + QStringLiteral("exefs");
-        if (QDir(exefs_sub).exists()) {
-            if (!CopyDirectoryRecursive(exefs_sub, exefs_work)) {
-                throw std::runtime_error("Failed to copy ExeFS staging directory");
+    FileSys::ExportContentRequest request;
+    request.rom_path = rom_path.toStdString();
+    request.title_id = rom_program_id;
+    request.use_nand_addons = !use_nand_addons_checkbox || use_nand_addons_checkbox->isChecked();
+    if (addon_files_list) {
+        for (int i = 0; i < addon_files_list->count(); ++i) {
+            request.extra_addon_paths.push_back(addon_files_list->item(i)->text().toStdString());
+        }
+    }
+
+    FileSys::ExportContentSession session;
+    const bool resolved = session.Resolve(system_, request);
+    if (bake_status_label) {
+        bake_status_label->setText(QString::fromStdString(session.GetStatus()));
+    }
+    if (!resolved || !session.ok() || !session.GetFailedAddonPaths().empty()) {
+        QString message = QString::fromStdString(session.GetError());
+        if (message.isEmpty()) {
+            message = tr("Could not resolve updates/DLC for export.");
+        }
+        if (!session.GetFailedAddonPaths().empty()) {
+            QStringList paths;
+            for (const auto& path : session.GetFailedAddonPaths()) {
+                paths << QString::fromStdString(path);
             }
-        } else {
-            if (!CopyDirectoryRecursive(rom_path, exefs_work)) {
-                throw std::runtime_error("Failed to copy ROM directory into export staging area");
+            message += QStringLiteral("\n") + paths.join(QLatin1Char('\n'));
+        }
+        throw std::runtime_error(message.toStdString());
+    }
+    QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+    if (session.GetPatchedExeFS() || session.GetPatchedRomFS() || !session.GetAoc().empty()) {
+        if (!StagePatchedContent(session, work_dir)) {
+            throw std::runtime_error("Failed to write patched ExeFS/RomFS snapshot");
+        }
+    } else {
+        QFileInfo rom_fi(rom_path);
+        if (rom_fi.isDir()) {
+            const QString exefs_sub = rom_path + QDir::separator() + QStringLiteral("exefs");
+            if (QFile::exists(exefs_sub + QDir::separator() + QStringLiteral("main"))) {
+                if (!CopyDirectoryRecursive(exefs_sub, exefs_work)) {
+                    throw std::runtime_error("Failed to copy ExeFS staging directory");
+                }
+            } else if (QFile::exists(rom_path + QDir::separator() + QStringLiteral("main"))) {
+                if (!CopyDirectoryRecursive(rom_path, exefs_work)) {
+                    throw std::runtime_error("Failed to copy ROM directory into export staging area");
+                }
             }
         }
     }
-    // For packaged ROM files (NSP/XCI/NCA), the AOT step uses VFS to extract ExeFS directly.
+    if (!ExeFsDirHasMain(exefs_work)) {
+        if (!session.GetAoc().empty()) {
+            throw std::runtime_error(
+                "DLC was baked but exefs/main is missing; refusing unpatched main fallback");
+        }
+        if (QDir(exefs_work).exists() &&
+            !QDir(exefs_work).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty()) {
+            if (!FillMissingExeFsFromRom(work_dir, rom_path)) {
+                throw std::runtime_error("Incomplete exefs/ without main; extract fallback failed");
+            }
+        }
+    }
+    PlaceParkedRomFS(work_dir);
+    if (rom_program_id == 0 && session.GetTitleID() != 0) {
+        rom_program_id = session.GetTitleID();
+    }
     progress_bar->setValue(15);
 
     // Step 3: AOT pre-compilation
@@ -3127,7 +3469,8 @@ void GameExportDialog::OnExport() {
     status_label->setText(tr("Packaging native export artifacts..."));
     QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
-    const bool pkg_ok = PackageNativeExport(rom_path, cache_work, output_dir, game_name, platform);
+    const bool pkg_ok =
+        PackageNativeExport(rom_path, cache_work, output_dir, game_name, platform, work_dir);
     if (!pkg_ok) {
         status_label->setText(tr("Packaging failed."));
         progress_bar->setValue(0);
@@ -3164,8 +3507,6 @@ void GameExportDialog::OnExport() {
     }
     progress_bar->setValue(90);
 
-    // Step 6: Clean up working directory
-    QDir(work_dir).removeRecursively();
     progress_bar->setValue(100);
 
     // Determine final output path for display

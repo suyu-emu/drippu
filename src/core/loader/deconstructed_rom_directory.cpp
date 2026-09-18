@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <cstdlib>
 #include "common/logging.h"
 #include "common/random.h"
 #include "common/settings.h"
@@ -145,6 +146,8 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         return {ResultStatus::ErrorAlreadyLoaded, {}};
     }
 
+    system.GetFileSystemController().ClearBakedAoc();
+
     if (dir == nullptr) {
         if (file == nullptr) {
             return {ResultStatus::ErrorNullFile, {}};
@@ -281,6 +284,25 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         romfs = dir->GetFile("romfs.bin");
         if (romfs == nullptr) {
             romfs = dir->GetFile("romfs");
+        }
+
+        // Standalone exports dump decrypted AOC next to exefs/ as aoc/<tid>/romfs.bin
+        // so DLC works without NAND or keys. Register those snapshots before the
+        // RomFS factory is created (aoc:u and fsp OpenDataStorageByDataId read them).
+        if (const auto parent = dir->GetParentDirectory()) {
+            if (const auto aoc_dir = parent->GetSubdirectory("aoc")) {
+                for (const auto& sub : aoc_dir->GetSubdirectories()) {
+                    const auto& aoc_dir_name = sub->GetName();
+                    char* end = nullptr;
+                    const u64 tid = std::strtoull(aoc_dir_name.c_str(), &end, 16);
+                    if (end == nullptr || *end != '\0' || tid == 0) {
+                        continue;
+                    }
+                    if (auto rf = sub->GetFile("romfs.bin")) {
+                        system.GetFileSystemController().RegisterBakedAoc(tid, std::move(rf));
+                    }
+                }
+            }
         }
     }
     LOG_DEBUG(Loader, "registering romfs factory for pid={} title={:016X} romfs_present={}",

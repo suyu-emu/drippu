@@ -768,6 +768,38 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
 void FileSystemController::Reset() {
     std::scoped_lock lk{registration_lock};
     registrations.clear();
+    baked_aoc.clear();
+}
+
+void FileSystemController::RegisterBakedAoc(u64 title_id, FileSys::VirtualFile romfs) {
+    if (title_id == 0 || !romfs) {
+        return;
+    }
+    baked_aoc.insert_or_assign(title_id, std::move(romfs));
+    LOG_INFO(Service_FS, "Registered baked AOC romfs for title_id={:016X}", title_id);
+}
+
+void FileSystemController::ClearBakedAoc() {
+    baked_aoc.clear();
+}
+
+FileSys::VirtualFile FileSystemController::GetBakedAocRomFS(u64 title_id) const {
+    const auto it = baked_aoc.find(title_id);
+    if (it == baked_aoc.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+std::vector<u64> FileSystemController::ListBakedAocTitleIds() const {
+    std::vector<u64> out;
+    out.reserve(baked_aoc.size());
+    for (const auto& [id, file] : baked_aoc) {
+        if (file) {
+            out.push_back(id);
+        }
+    }
+    return out;
 }
 
 void LoopProcess(Core::System& system) {

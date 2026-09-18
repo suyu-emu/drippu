@@ -13,6 +13,8 @@
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/export_bake.h"
 #include "smoke_config.h"
 
 #include <atomic>
@@ -1291,6 +1293,92 @@ void TestCacheInvalidation() {
     }
 }
 
+void TestExportAddonClassification() {
+    constexpr u64 base = 0x0100AABBCCDDE000ULL;
+    constexpr u64 update = base | 0x800;
+    constexpr u64 aoc = FileSys::GetAOCBaseTitleID(base) + 3;
+    if (FileSys::ClassifyTitleRelation(base, base) != FileSys::TitleRelation::Base) {
+        fail("base title classified incorrectly");
+    } else if (FileSys::ClassifyTitleRelation(base, update) != FileSys::TitleRelation::Update) {
+        fail("update title classified incorrectly");
+    } else if (FileSys::ClassifyTitleRelation(base, aoc) != FileSys::TitleRelation::Aoc) {
+        fail("AOC title classified incorrectly");
+    } else if (FileSys::GetAOCID(aoc) != 3) {
+        fail("GetAOCID mismatch");
+    } else {
+        pass("title relation classifies base / update / AOC");
+    }
+
+    const std::string none = FileSys::FormatExportBakeStatus({});
+    if (none.find("base game only") == std::string::npos ||
+        none.find("no NAND install") == std::string::npos) {
+        fail("empty bake status missing snapshot wording: " + none);
+    } else {
+        pass("empty bake status is base-only snapshot");
+    }
+
+    const std::vector<FileSys::ExportBakeItem> items{
+        {FileSys::ExportBakeItem::Kind::Update, "Update v16.0.0", "picked file"},
+        {FileSys::ExportBakeItem::Kind::Dlc, "DLC 1, 7", "NAND"},
+    };
+    const std::string status = FileSys::FormatExportBakeStatus(items);
+    if (status.find("Update v16.0.0") == std::string::npos ||
+        status.find("DLC 1, 7") == std::string::npos || status.find("NAND") == std::string::npos ||
+        status.find("Standalone snapshot") == std::string::npos) {
+        fail("bake status missing baked addons: " + status);
+    } else {
+        pass("bake status lists update, DLC, and snapshot note");
+    }
+
+    const std::vector<FileSys::ExportBakeItem> candidates{
+        {FileSys::ExportBakeItem::Kind::Update, "Update v1.0.0", "NAND"},
+        {FileSys::ExportBakeItem::Kind::Dlc, "DLC 1", "picked file"},
+    };
+    const auto omitted = FileSys::FilterAppliedBakeItems(candidates, false, 0);
+    if (!omitted.empty()) {
+        fail("FilterAppliedBakeItems listed update without ExeFS replace");
+    } else {
+        pass("FilterAppliedBakeItems omits unapplied update");
+    }
+    const auto dlc_kept = FileSys::FilterAppliedBakeItems(candidates, false, 1);
+    if (dlc_kept.size() != 1 || dlc_kept[0].kind != FileSys::ExportBakeItem::Kind::Dlc) {
+        fail("FilterAppliedBakeItems dropped dumped DLC");
+    } else {
+        pass("FilterAppliedBakeItems keeps dumped DLC only");
+    }
+    const std::string fail_note = FileSys::FormatFailedAddonNote(1);
+    if (fail_note.find("will not continue") == std::string::npos) {
+        fail("failed-addon note missing abort wording: " + fail_note);
+    } else {
+        pass("failed extras abort export");
+    }
+
+    constexpr u64 update_npdm = base | 0x800;
+    if (FileSys::GetBaseTitleID(update_npdm) != base ||
+        FileSys::GetBaseTitleID(aoc) != FileSys::GetBaseTitleID(update_npdm)) {
+        fail("AOC Count/List base id disagrees for update NPDM");
+    } else {
+        pass("AOC Count/List share GetBaseTitleID including update NPDM");
+    }
+
+    if (FileSys::DecideUpdateBake(true, false, true, false) !=
+        FileSys::UpdateBakeDecision::MissingBaseProgramNca) {
+        fail("directory dump without Program NCA must refuse update bake");
+    } else if (FileSys::UpdateBakeRefusal(FileSys::UpdateBakeDecision::MissingBaseProgramNca) ==
+               nullptr) {
+        fail("missing Program NCA needs a refusal message");
+    } else if (FileSys::DecideUpdateBake(true, true, true, true) !=
+               FileSys::UpdateBakeDecision::Applied) {
+        fail("full ExeFS+RomFS apply should be Applied");
+    } else if (FileSys::PatchHandleReplaced(true, true, true)) {
+        fail("same PatchManager handle must not count as replace");
+    } else if (!FileSys::PatchHandleReplaced(true, true, false)) {
+        fail("different PatchManager handle should count as replace");
+    } else {
+        pass("DecideUpdateBake fails closed without Program NCA");
+    }
+}
+
 void DummyBlock(void* c) {
     (void)c;
 }
@@ -1684,6 +1772,7 @@ int main() {
     TestUnresolvedImportPolicy();
     TestModuleRegistrationSession();
     TestCacheInvalidation();
+    TestExportAddonClassification();
     TestSharedImageAbi(root);
     TestAotCacheReuse();
 

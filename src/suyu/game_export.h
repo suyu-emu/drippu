@@ -8,10 +8,12 @@
 #include <QComboBox>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QPixmap>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 namespace Core {
@@ -23,10 +25,11 @@ class System;
  * ahead-of-time (AOT) static recompilation.
  *
  * Pipeline:
- *   1. Extract ExeFS/RomFS from the ROM container (NSP/XCI/NCA)
- *   2. Translate ARM64 code blocks into Dynarmic IR compiler artifacts
- *   3. Package IR dumps, guest code slices, block maps, and game data
- *   4. Generate a platform-specific export bundle for a future custom runtime
+ *   1. Resolve base ROM + optional update/DLC NSPs and/or NAND-installed addons
+ *   2. Run PatchManager so packaged exefs + romfs.bin are the patched snapshot
+ *   3. Translate those patched NSOs into Dynarmic IR compiler artifacts
+ *   4. Package IR dumps, guest code slices, and the baked game data
+ *   5. Generate a platform-specific export bundle for a future custom runtime
  *
  * Dynarmic does not expose a stable block-serialization API for ready-made
  * host machine code export, so suyu serializes a frontend boundary instead:
@@ -59,8 +62,11 @@ public:
     /// directly.
     /// @param format_index optional output-format combo index to select first
     ///        (0 = Source, 1 = Build); negative leaves the current selection.
+    /// @param extra_addon_paths optional update/DLC NSP paths to bake in.
+    /// @param use_nand_addons whether NAND-installed addons for the title are used.
     void TriggerExportForTesting(const QString& rom_path, const QString& output_dir,
-                                 int format_index = -1);
+                                 int format_index = -1, QStringList extra_addon_paths = {},
+                                 bool use_nand_addons = true);
 
     /// Every standalone recompiled executable that has already been built for
     /// this game, one per recompiled module, newest-looking first. Empty when
@@ -96,6 +102,9 @@ private slots:
     void OnBrowseRom();
     void OnSelectFromLibrary();
     void OnBrowseOutput();
+    void OnAddAddonFiles();
+    void OnRemoveSelectedAddons();
+    void OnClearAddonFiles();
     void OnExport();
 
 protected:
@@ -111,6 +120,7 @@ protected:
 
 private:
     void SetupUi();
+    void RefreshBakeStatus();
 
     /// True from the moment OnExport() starts until it returns. Guards both
     /// dialog teardown and re-entry into OnExport() itself: the automation RPC
@@ -124,9 +134,10 @@ private:
                              RecompileBackend backend, const QString& game_name);
 
     /// Package the translated output into a platform-specific export bundle.
+    /// @param staged_content_dir work directory with patched exefs/ and aoc/.
     bool PackageNativeExport(const QString& rom_path, const QString& cache_dir,
                              const QString& output_dir, const QString& game_name,
-                             TargetPlatform platform);
+                             TargetPlatform platform, const QString& staged_content_dir = {});
 
     QLineEdit* rom_path_edit{};
     QLineEdit* output_path_edit{};
@@ -135,6 +146,9 @@ private:
     QCheckBox* include_save_data_checkbox{};
     QCheckBox* include_shader_cache_checkbox{};
     QCheckBox* include_custom_config_checkbox{};
+    QListWidget* addon_files_list{};
+    QCheckBox* use_nand_addons_checkbox{};
+    QLabel* bake_status_label{};
     QCheckBox* aot_full_scan_checkbox{};
     /// When checked and a module fails to recompile, emit a stub that falls back
     /// to the dynarmic interpreter for that module instead of aborting the export.

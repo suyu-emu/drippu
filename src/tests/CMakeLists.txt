@@ -6,6 +6,7 @@
 
 add_executable(tests
     common/bit_field.cpp
+    common/catch_starting_listener.cpp
     common/cityhash.cpp
     common/container_hash.cpp
     common/fibers.cpp
@@ -17,6 +18,7 @@ add_executable(tests
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
+    core/export_content.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
     input_common/calibration_configuration_job.cpp
@@ -27,7 +29,8 @@ create_target_directory_groups(tests)
 target_link_libraries(tests PRIVATE common core input_common video_core)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
-add_test(NAME tests COMMAND tests)
+add_test(NAME tests COMMAND tests --durations yes --order decl)
+set_tests_properties(tests PROPERTIES TIMEOUT 180)
 
 # Header-only exporter smoke; also configurable as a standalone CMake project
 # from src/tests/recompiler (PR CI does that so it needs no emulator deps).

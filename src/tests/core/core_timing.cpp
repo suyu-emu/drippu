@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -56,6 +57,19 @@ void ResetCallbackState() {
     expected_callback = 0;
 }
 
+// HasPendingEvents stays true until the host timer parks on an empty queue
+// (wait_set). A bare spin can hang CI for CTest's 1500s default.
+bool WaitForTimingIdle(Core::Timing::CoreTiming& core_timing) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (core_timing.HasPendingEvents()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
 } // Anonymous namespace
 
 TEST_CASE("CoreTiming[BasicOrder]", "[core]") {
@@ -85,9 +99,7 @@ TEST_CASE("CoreTiming[BasicOrder]", "[core]") {
 
     core_timing.Pause(false); // No need to sync
 
-    while (core_timing.HasPendingEvents())
-        ;
-
+    REQUIRE(WaitForTimingIdle(core_timing));
     REQUIRE(callbacks_ran_flags.all());
 
     for (std::size_t i = 0; i < delays.size(); i++) {
@@ -127,9 +139,7 @@ TEST_CASE("CoreTiming[BasicOrderNoPausing]", "[core]") {
     const double scheduling_time = static_cast<double>(end - start);
     const double timer_time = static_cast<double>(TestTimerSpeed(core_timing));
 
-    while (core_timing.HasPendingEvents())
-        ;
-
+    REQUIRE(WaitForTimingIdle(core_timing));
     REQUIRE(callbacks_ran_flags.all());
 
     for (std::size_t i = 0; i < delays.size(); i++) {

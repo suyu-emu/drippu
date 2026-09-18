@@ -21,6 +21,7 @@
 #include "core/hle/service/aoc/addon_content_manager.h"
 #include "core/hle/service/aoc/purchase_event_manager.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/server_manager.h"
 #include "core/loader/loader.h"
@@ -29,6 +30,12 @@ namespace Service::AOC {
 
 static bool CheckAOCTitleIDMatchesBase(u64 title_id, u64 base) {
     return FileSys::GetBaseTitleID(title_id) == base;
+}
+
+static u64 CurrentAocApplicationId(Core::System& system) {
+    // Count and List must use the same id. A patched ExeFS NPDM can report
+    // base|0x800; AOC title ids still compare against the base application.
+    return FileSys::GetBaseTitleID(system.GetApplicationProcessProgramID());
 }
 
 static std::vector<u64> AccumulateAOCTitleIDs(Core::System& system) {
@@ -91,7 +98,7 @@ IAddOnContentManager::~IAddOnContentManager() {
 Result IAddOnContentManager::CountAddOnContent(Out<u32> out_count, ClientProcessId process_id) {
     LOG_DEBUG(Service_AOC, "called. process_id={}", process_id.pid);
 
-    const auto current = system.GetApplicationProcessProgramID();
+    const auto current = CurrentAocApplicationId(system);
 
     const auto& disabled = Settings::values.disabled_addons[current];
     if (std::find(disabled.begin(), disabled.end(), "DLC") != disabled.end()) {
@@ -99,8 +106,15 @@ Result IAddOnContentManager::CountAddOnContent(Out<u32> out_count, ClientProcess
         R_SUCCEED();
     }
 
+    auto ids = add_on_content;
+    for (u64 id : system.GetFileSystemController().ListBakedAocTitleIds()) {
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+            ids.push_back(id);
+        }
+    }
+
     *out_count = static_cast<u32>(
-        std::count_if(add_on_content.begin(), add_on_content.end(),
+        std::count_if(ids.begin(), ids.end(),
                       [current](u64 tid) { return CheckAOCTitleIDMatchesBase(tid, current); }));
 
     R_SUCCEED();
@@ -112,12 +126,18 @@ Result IAddOnContentManager::ListAddOnContent(Out<u32> out_count,
     LOG_DEBUG(Service_AOC, "called with offset={}, count={}, process_id={}", offset, count,
               process_id.pid);
 
-    const auto current = FileSys::GetBaseTitleID(system.GetApplicationProcessProgramID());
+    const auto current = CurrentAocApplicationId(system);
 
     std::vector<u32> out;
     const auto& disabled = Settings::values.disabled_addons[current];
     if (std::find(disabled.begin(), disabled.end(), "DLC") == disabled.end()) {
-        for (u64 content_id : add_on_content) {
+        auto ids = add_on_content;
+        for (u64 id : system.GetFileSystemController().ListBakedAocTitleIds()) {
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+                ids.push_back(id);
+            }
+        }
+        for (u64 content_id : ids) {
             if (FileSys::GetBaseTitleID(content_id) != current) {
                 continue;
             }

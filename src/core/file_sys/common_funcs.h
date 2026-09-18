@@ -52,4 +52,31 @@ constexpr u64 BASE_TITLE_ID_MASK = 0xFFFFFFFFFFFFE000;
     return aoc_title_id & AOC_TITLE_ID_MASK;
 }
 
+enum class TitleRelation {
+    Unrelated,    ///< Different application
+    Base,         ///< The base program itself
+    Update,       ///< Title update (ExeFS replace / RomFS patch)
+    Aoc,          ///< Add-on content / DLC
+    OtherRelated, ///< Same application family, not update or AOC
+};
+
+/// How @p other_title_id relates to @p base_title_id for export/content resolution.
+[[nodiscard]] constexpr TitleRelation ClassifyTitleRelation(u64 base_title_id, u64 other_title_id) {
+    const u64 base = GetBaseTitleID(base_title_id);
+    if (GetBaseTitleID(other_title_id) != base) {
+        return TitleRelation::Unrelated;
+    }
+    if (other_title_id == base) {
+        return TitleRelation::Base;
+    }
+    // Update title IDs set bit 0x800 on the base program ID (see GetUpdateTitleID).
+    if (other_title_id == (base | 0x800)) {
+        return TitleRelation::Update;
+    }
+    if ((other_title_id & ~AOC_TITLE_ID_MASK) == GetAOCBaseTitleID(base)) {
+        return TitleRelation::Aoc;
+    }
+    return TitleRelation::OtherRelated;
+}
+
 } // namespace FileSys

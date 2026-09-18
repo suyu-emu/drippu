@@ -69,6 +69,12 @@ VirtualFile RomFSFactory::OpenPatchedRomFSWithProgramIndex(u64 title_id, u8 prog
 }
 
 VirtualFile RomFSFactory::Open(u64 title_id, StorageId storage, ContentRecordType type) const {
+    if (type == ContentRecordType::Data) {
+        if (auto baked = filesystem_controller.GetBakedAocRomFS(title_id)) {
+            return baked;
+        }
+    }
+
     const std::shared_ptr<NCA> res = GetEntry(title_id, storage, type);
     if (res == nullptr) {
         return nullptr;
