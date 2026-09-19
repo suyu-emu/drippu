@@ -68,7 +68,10 @@ jobs:
             stdbuf -oL -eL ./bin/tests --durations yes --order decl "~[export]"
           echo '=== recomp_stack_harness ==='
           timeout --foreground --kill-after=10s 60s \
-            stdbuf -oL -eL ./bin/recomp_stack_harness
+            stdbuf -oL -eL python3 "$GITHUB_WORKSPACE/scripts/recompiler_compat_baseline.py" \
+              --harness ./bin/recomp_stack_harness \
+              --output "$GITHUB_WORKSPACE/recomp-compat-baseline.json" \
+              --iterations 32
       - name: Validate and upload recompiler benchmark baseline
         run: |
           python3 scripts/compare_recomp_benchmark.py recomp_benchmark.json \
@@ -77,6 +80,27 @@ jobs:
         with:
           name: recomp-benchmark-baseline
           path: recomp_benchmark.json
+      - name: Validate compatibility baseline
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          record = json.loads(Path('recomp-compat-baseline.json').read_text())
+          assert record['schema_version'] == 1
+          assert record['kind'] == 'recompiler_compatibility_baseline'
+          assert record['repository']['git_sha']
+          assert record['fixture']['redistributable'] is True
+          assert len(record['workloads']) == 4
+          assert all(workload['status'] == 'pass' for workload in record['workloads'])
+          assert record['failures'] == []
+          PY
+      - name: Upload compatibility baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recompiler-compatibility-baseline
+          path: recomp-compat-baseline.json
+          if-no-files-found: error
 
   tests-sanitizer:
     name: Linux x86-64 sanitizers

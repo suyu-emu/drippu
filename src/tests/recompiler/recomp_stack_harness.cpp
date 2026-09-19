@@ -1652,6 +1652,36 @@ void ScenarioRestart(StackFixture& f) {
     ScenarioPass("new process ArmRecomp (fresh icache) re-runs Translate AOT", before);
 }
 
+void ScenarioSaveLoad(StackFixture& f) {
+    const int before = g_fails;
+    // A compatibility baseline must prove that a guest checkpoint can be
+    // captured and restored without losing the backend, PC, or TLS state. The
+    // checkpoint uses the same ThreadContext representation the kernel saves
+    // when a scheduler unloads a thread; no title data is involved.
+    f.PrepThreadForTlsSvc(f.thread);
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    Kernel::Svc::ThreadContext checkpoint{};
+    f.arm->GetContext(checkpoint);
+    const u64 tls = GetInteger(f.thread->GetTlsAddress());
+
+    const auto first = f.arm->RunThread(f.thread);
+    ExpectTrue("save/load initial SVC", True(first & Core::HaltReason::SupervisorCall));
+    Kernel::Svc::ThreadContext mutated{};
+    f.arm->GetContext(mutated);
+    ExpectTrue("save/load execution changed context", mutated.pc != checkpoint.pc);
+
+    f.arm->SetContext(checkpoint);
+    f.arm->SetTpidrroEl0(tls);
+    const auto restored = f.arm->RunThread(f.thread);
+    ExpectTrue("save/load restored SVC", True(restored & Core::HaltReason::SupervisorCall));
+    ExpectEq("save/load restored SVC number", f.arm->GetSvcNumber(), 42);
+    Kernel::Svc::ThreadContext restored_ctx{};
+    f.arm->GetContext(restored_ctx);
+    ExpectEq("save/load restored TLS", restored_ctx.r[3], tls);
+    ExpectEq("save/load restored x0", restored_ctx.r[0], 0x1234);
+    ScenarioPass("ThreadContext save/load restores AOT execution and TLS", before);
+}
+
 void ScenarioStepMiss(StackFixture& f) {
     const int before = g_fails;
     // On the restarted process: force-miss registered AOT at kOffMiss.
@@ -2572,6 +2602,7 @@ int main() {
     // ClearInstructionCache permanently refuses AOT; run after the above.
     ScenarioInvalidation(*fix);
     ScenarioRestart(*fix);
+    ScenarioSaveLoad(*fix);
     ScenarioStepMiss(*fix);
 
     const fs::path json_path = [](const fs::path& work) {
