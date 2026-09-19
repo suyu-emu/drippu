@@ -2347,8 +2347,10 @@ int main() {
 
     ScenarioAotLiveProof(*fix); // before Clear: proves Lookup + AOT != Dynarmic twin
     ScenarioSvcTlsCrossPage(*fix);
-    ScenarioPhysicalCoreDispatch(*fix);
     ScenarioLeftoverSvcStep(*fix);
+    // ScenarioLeftoverSvcStep consumes the pending SVC produced above. Keep
+    // any scenario that may leave a pending SVC after that consumer.
+    ScenarioPhysicalCoreDispatch(*fix);
     ScenarioLoadContextTls(*fix);
     // Force-miss + unhandled need AllowsAot (registered Translate blocks).
     ScenarioForceMissRegistered(*fix);
