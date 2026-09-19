@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Real-stack homebrew integration harness: ArmRecomp (process ArmInterface via
-// SetRecompLookup) + in-tree Dynarmic fallback + PhysicalCore::LoadContext TLS.
+// Real-stack synthetic-homebrew integration harness: ArmRecomp (process
+// ArmInterface via SetRecompLookup) + in-tree Dynarmic fallback + the kernel
+// scheduler's PhysicalCore dispatch and SVC path.
 //
 // AOT blocks are Translate()'d from real guest encodings and compiled into a
 // shared library (SUYU_HOSTED_RECOMP helpers). Matching AArch64 bytes are
@@ -21,8 +22,8 @@
 // have store=0; that is not a fold. Live pin is: not shl/imul, plus runtime
 // host_mem callback counts (512 × iters).
 //
-// Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
-// safe live HLE). Does not load copyrighted titles or keys.
+// The fixture is a small custom CodeSet image, not an NSO/NRO. It is entirely
+// generated in this test and contains no firmware, keys, or copyrighted data.
 
 #include <algorithm>
 #include <atomic>
@@ -64,6 +65,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/memory_types.h"
 #include "core/hle/kernel/physical_core.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/memory.h"
 #include "core/recompiler/arm64_to_c.h"
@@ -176,6 +178,7 @@ constexpr u64 kOffAotProof = 0x1400;
 constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
 constexpr u64 kOffStepNoSvc = 0x1C00; // MOVZ #7 only — leftover pending_svc pin
 constexpr u64 kOffCrossPage = 0x1FFC;
+constexpr u64 kOffCoreDispatch = 0x2008; // TLS + safe GetCurrentProcessorNumber SVC
 // Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003).
 // 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
 constexpr u64 kOffBench = 0x2400;
@@ -201,6 +204,8 @@ constexpr u32 kMovzX0Cafe = 0xD2800000u | (0xCAFEu << 5);
 constexpr u32 kSvc77 = 0xD40009A1u;
 constexpr u32 kMovzX0_7 = 0xD28000E0u;
 constexpr u32 kSvc1 = 0xD4000021u;
+constexpr u32 kSvcGetCurrentProcessor = 0xD4000201u; // SVC #0x10
+constexpr u32 kMovzX1_55 = 0xD2800AA1u;
 constexpr u32 kMovzX0_0 = 0xD2800000u;
 constexpr u32 kAddX0X0X1 = 0x8B010000u; // ADD X0, X0, X1
 constexpr u32 kStrX0X3 = 0xF9000060u;   // STR X0, [X3] — opaque store breaks x0 recurrence
@@ -222,6 +227,7 @@ BlockFn g_block_miss_park = nullptr;
 BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
 BlockFn g_block_step_no_svc = nullptr;
+BlockFn g_block_core_dispatch = nullptr;
 BlockFn g_block_bench = nullptr;
 BlockFn g_block_insn[suyu::recomp::insn_test::kInsnBlockCount]{};
 SetBaseFn g_set_base = nullptr;
@@ -750,6 +756,9 @@ Core::RecompBlockFn Lookup(u64 pc) {
     if (pc == g_entry + kOffStepNoSvc) {
         return g_block_step_no_svc;
     }
+    if (pc == g_entry + kOffCoreDispatch) {
+        return g_block_core_dispatch;
+    }
     if (pc == g_entry + kOffBench) {
         return g_block_bench;
     }
@@ -784,6 +793,11 @@ std::string BuildAotSource() {
     const std::string t_mov7 = TranslateInsn(kMovzX0_7, kOffPlain);
     const std::string t_svc1 = TranslateInsn(kSvc1, kOffPlain + 4);
     const std::string t_step_mov7 = TranslateInsn(kMovzX0_7, kOffStepNoSvc);
+    const std::string t_core_mov = TranslateInsn(kMovzX0_1234, kOffCoreDispatch + 0);
+    const std::string t_core_tls = TranslateInsn(kMrsX3Tpidrro, kOffCoreDispatch + 4);
+    const std::string t_core_marker = TranslateInsn(kMovzX1_55, kOffCoreDispatch + 8);
+    const std::string t_core_svc =
+        TranslateInsn(kSvcGetCurrentProcessor, kOffCoreDispatch + 12);
 
     std::ostringstream src;
     src << R"C(#include <stdint.h>
@@ -925,6 +939,11 @@ void block_step_no_svc(GuestContext* c) {
     src << t_step_mov7;
     src << "    c->pc = g_module_base + 0x" << std::hex << (kOffStepNoSvc + 4) << std::dec
         << "ULL;\n";
+    src << R"C(}
+
+void block_core_dispatch(GuestContext* c) {
+)C";
+    src << t_core_mov << t_core_tls << t_core_marker << t_core_svc;
     src << R"C(}
 
 void block_bench(GuestContext* c) {
@@ -1081,6 +1100,7 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_aot_proof = reinterpret_cast<BlockFn>(dlsym(g_so, "block_aot_proof"));
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
+    g_block_core_dispatch = reinterpret_cast<BlockFn>(dlsym(g_so, "block_core_dispatch"));
     g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
     for (int i = 0; i < suyu::recomp::insn_test::kInsnBlockCount; ++i) {
         const std::string sym = "block_insn_" + std::to_string(i);
@@ -1096,11 +1116,13 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym block_aot_proof", g_block_aot_proof != nullptr);
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
     ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
+    ExpectTrue("dlsym block_core_dispatch", g_block_core_dispatch != nullptr);
     ExpectTrue("dlsym block_bench", g_block_bench != nullptr);
     ExpectTrue("dlsym g_recomp_hm_load_calls", g_hm_load_calls != nullptr);
     ExpectTrue("dlsym g_recomp_hm_store_calls", g_hm_store_calls != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
-           g_block_plain && g_block_step_no_svc && g_block_bench && g_hm_load_calls &&
+           g_block_plain && g_block_step_no_svc && g_block_core_dispatch && g_block_bench &&
+           g_hm_load_calls &&
            g_hm_store_calls && g_block_insn[0] &&
            g_block_insn[suyu::recomp::insn_test::kInsnBlockCount - 1];
 #endif
@@ -1133,6 +1155,10 @@ void WriteGuestImage(std::vector<u8>& image) {
     put(kOffPlain, kMovzX0_7);
     put(kOffPlain + 4, kSvc1);
     put(kOffStepNoSvc, kMovzX0_7);
+    put(kOffCoreDispatch + 0, kMovzX0_1234);
+    put(kOffCoreDispatch + 4, kMrsX3Tpidrro);
+    put(kOffCoreDispatch + 8, kMovzX1_55);
+    put(kOffCoreDispatch + 12, kSvcGetCurrentProcessor);
     for (const auto& [off, enc] : BenchInsns()) {
         put(off, enc);
     }
@@ -1405,6 +1431,59 @@ void ScenarioSvcTlsCrossPage(StackFixture& f) {
     ExpectEq("cross-page store", f.system.ApplicationMemory().Read64(g_entry + kOffCrossPage),
              0xABCD);
     ScenarioPass("Translate AOT SVC/TLS/cross-page via ApplicationMemory", before);
+}
+
+void ScenarioPhysicalCoreDispatch(StackFixture& f) {
+    const int before = g_fails;
+    auto& kernel = f.system.Kernel();
+
+    // Run on a registered emulated core so PhysicalCore::RunThread's Svc::Call
+    // observes the same current core/process context as CpuManager's guest
+    // loop. SVC #0x10 is a side-effect-free kernel service and therefore makes
+    // a redistributable, deterministic real-dispatch fixture.
+    f.system.RegisterCoreThread(0);
+    const auto run = [&](Kernel::KThread* t, u64 expected_tls, const char* label) {
+        Kernel::SetCurrentThread(kernel, t);
+        auto& ctx = t->GetContext();
+        ctx = {};
+        ctx.pc = g_entry + kOffCoreDispatch;
+        kernel.PhysicalCore(0).LoadContext(t);
+        kernel.PhysicalCore(0).RunThread(kernel, t);
+
+        f.arm = t->GetOwnerProcess()->GetArmInterface(0);
+        ExpectEq((std::string(label) + " SVC number").c_str(), f.arm->GetSvcNumber(), 0x10);
+        Kernel::Svc::ThreadContext out{};
+        f.arm->GetContext(out);
+        ExpectEq((std::string(label) + " SVC result core").c_str(), out.r[0], 0);
+        ExpectEq((std::string(label) + " TLS").c_str(), out.r[3], expected_tls);
+        ExpectEq((std::string(label) + " marker").c_str(), out.r[1], 0x55);
+    };
+
+    run(f.thread, GetInteger(f.thread->GetTlsAddress()), "scheduler thread A");
+    run(f.thread_b, GetInteger(f.thread_b->GetTlsAddress()), "scheduler thread B");
+    ExpectTrue("scheduler thread TLS values distinct",
+               GetInteger(f.thread->GetTlsAddress()) != GetInteger(f.thread_b->GetTlsAddress()));
+
+    // Feed both fixture threads through the real priority queue. Calling the
+    // fiber-based rescheduler from this standalone process would yield to a
+    // CpuManager guest fiber that the harness does not own, so stop at the
+    // scheduler's deterministic selection boundary and assert its choice.
+    f.thread->SetPriority(20);
+    f.thread_b->SetPriority(10);
+    f.thread->SetState(kernel, Kernel::ThreadState::Runnable);
+    f.thread_b->SetState(kernel, Kernel::ThreadState::Runnable);
+    {
+        Kernel::KScopedSchedulerLock lock(kernel);
+        const u64 cores = Kernel::KScheduler::UpdateHighestPriorityThreads(kernel);
+        ExpectTrue("scheduler priority update requested core 0", (cores & 1) != 0);
+        ExpectTrue("scheduler selects higher-priority fixture thread",
+                   Kernel::KScheduler::GetPriorityQueue(kernel).GetScheduledFront(0) ==
+                       f.thread_b);
+    }
+    f.thread->SetState(kernel, Kernel::ThreadState::Initialized);
+    f.thread_b->SetState(kernel, Kernel::ThreadState::Initialized);
+    Kernel::SetCurrentThread(kernel, f.thread);
+    ScenarioPass("PhysicalCore scheduler dispatch -> ArmRecomp -> Svc::Call (A/B TLS)", before);
 }
 
 void ScenarioLeftoverSvcStep(StackFixture& f) {
@@ -2222,9 +2301,9 @@ void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
 void PrintGaps() {
     std::cout
         << "GAPS (honest / out of scope):\n"
-        << "  - Full PhysicalCore::RunThread -> Svc::Call HLE (needs safe SVC + services)\n"
-        << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
-        << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
+        << "  - Multi-core KScheduler fiber world / CpuManager guest loop (the fixture uses a\n"
+           "    registered core and real PhysicalCore::RunThread/Svc::Call dispatch)\n"
+        << "  - Real NSO/NRO homebrew load (this uses a self-contained synthetic CodeSet)\n"
         << "  - gdbstub StepThread against a live title\n"
         << "  - GPU frame times (this harness has no renderer; slice = RunThread until SVC)\n"
         << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
@@ -2268,6 +2347,7 @@ int main() {
 
     ScenarioAotLiveProof(*fix); // before Clear: proves Lookup + AOT != Dynarmic twin
     ScenarioSvcTlsCrossPage(*fix);
+    ScenarioPhysicalCoreDispatch(*fix);
     ScenarioLeftoverSvcStep(*fix);
     ScenarioLoadContextTls(*fix);
     // Force-miss + unhandled need AllowsAot (registered Translate blocks).
