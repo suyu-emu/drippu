@@ -39,11 +39,13 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -58,6 +60,7 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_image_abi.h"
+#include "core/arm/recomp/recomp_icache.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
@@ -2032,6 +2035,7 @@ nlohmann::json MetricsToJson(const Core::RecompExecutionMetrics& m) {
           {"unhandled_opcode", m.fallback_unhandled_opcode},
           {"icache_rejected", m.fallback_icache_rejected},
           {"no_fallback_available", m.fallback_no_backend}}},
+        {"aot_range_rejects", m.aot_range_rejects},
         {"svc_calls", m.svc_calls},
     };
 }
@@ -2053,6 +2057,7 @@ Core::RecompExecutionMetrics MetricsDelta(const Core::RecompExecutionMetrics& af
     d.fallback_icache_rejected =
         sub(after.fallback_icache_rejected, before.fallback_icache_rejected);
     d.fallback_no_backend = sub(after.fallback_no_backend, before.fallback_no_backend);
+    d.aot_range_rejects = sub(after.aot_range_rejects, before.aot_range_rejects);
     d.svc_calls = sub(after.svc_calls, before.svc_calls);
     return d;
 }
@@ -2182,6 +2187,8 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         }
     }
     g_force_miss_pc = 0;
+    r.perf_stats_frametime_seconds =
+        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
     r.mem_after = ReadMem();
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;
@@ -2255,6 +2262,7 @@ nlohmann::json ModeToJson(const ModeResult& r) {
          {{"count", r.frame_events},
           {"wall_time_ns", r.frame_event_time_ns},
           {"source", "Core::PerfStats BeginSystemFrame/EndSystemFrame event boundary"},
+          {"perf_stats_frametime_seconds", r.perf_stats_frametime_seconds},
           {"note", "Standalone harness has no renderer/display; these are explicit emulated frame-event boundaries, not renamed RunThread slices."}}},
         {"host_mem_callbacks",
          {{"load", r.hm_load_calls},
@@ -2264,7 +2272,79 @@ nlohmann::json ModeToJson(const ModeResult& r) {
     };
 }
 
+void ScenarioRangeCacheSelfCheck() {
+    suyu::recomp::RecompICache cache;
+    ExpectTrue("empty range cache allows AOT", cache.AllowsAotAt(0x4000));
+    cache.InvalidateRange(0x4004, 1);
+    ExpectTrue("middle-byte invalidation rejects containing page", !cache.AllowsAotAt(0x4FFC));
+    ExpectTrue("middle-byte invalidation leaves next page usable", cache.AllowsAotAt(0x5000));
+    suyu::recomp::RecompICache cross_page;
+    cross_page.InvalidateRange(0x4FFF, 2);
+    ExpectTrue("cross-page invalidation rejects first page", !cross_page.AllowsAotAt(0x4FFE));
+    ExpectTrue("cross-page invalidation rejects second page", !cross_page.AllowsAotAt(0x5000));
+    ExpectTrue("cross-page invalidation leaves third page usable", cross_page.AllowsAotAt(0x6000));
+    cache.InvalidateRange(0x5000, 0x1000);
+    ExpectTrue("adjacent invalidation merges", cache.InvalidatedRangeCount() == 1);
+    cache.InvalidateRange(std::numeric_limits<u64>::max() - 2, 16);
+    ExpectTrue("overflow invalidation remains bounded", !cache.AllowsAotAt(std::numeric_limits<u64>::max() - 1));
+    suyu::recomp::RecompICache concurrent;
+    std::thread first([&] { concurrent.InvalidateRange(0x10000, 1); });
+    std::thread second([&] { concurrent.InvalidateRange(0x20000, 1); });
+    first.join();
+    second.join();
+    ExpectTrue("concurrent invalidation writers retain both ranges",
+               concurrent.InvalidatedRangeCount() == 2);
+}
+
 void AddRepresentativeWorkloads(nlohmann::json& doc, StackFixture& f, int iters);
+
+void ScenarioRangeInvalidation(StackFixture& f) {
+    const int before = g_fails;
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("range invalidate ArmRecomp", recomp != nullptr);
+    if (!recomp) {
+        return;
+    }
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffPlain;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto before_metrics = Core::GetRecompExecutionMetrics();
+    const auto aot_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("range precondition AOT", True(aot_hr & Core::HaltReason::SupervisorCall));
+
+    // Reject just the page containing plain_svc. The neighbouring TLS block
+    // remains statically executable and AllowsAot() stays true globally.
+    // Invalidate the SVC in the middle of the two-instruction block. The
+    // page-conservative cache rejects the containing block, not just entries
+    // whose PC equals the changed byte.
+    f.arm->InvalidateCacheRange(g_entry + kOffPlain + 4, 1);
+    ExpectTrue("range invalidation preserves global AOT", recomp->AllowsAot());
+    ctx = {};
+    ctx.pc = g_entry + kOffPlain;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto jit_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("range invalidation falls back only affected block",
+               True(jit_hr & Core::HaltReason::SupervisorCall));
+    const auto after_metrics = Core::GetRecompExecutionMetrics();
+    ExpectTrue("range invalidation recorded rejection",
+               after_metrics.aot_range_rejects > before_metrics.aot_range_rejects);
+    ExpectTrue("range invalidation recorded icache fallback",
+               after_metrics.fallback_icache_rejected > before_metrics.fallback_icache_rejected);
+
+    // A block outside the changed range still takes the AOT path.
+    ctx = {};
+    ctx.pc = g_entry + kOffTlsSvc;
+    ctx.r[4] = g_entry + kOffCrossPage;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto unaffected_before = Core::GetRecompExecutionMetrics();
+    const auto unaffected_hr = f.arm->RunThread(f.thread);
+    const auto unaffected_after = Core::GetRecompExecutionMetrics();
+    ExpectTrue("unaffected range remains AOT",
+               True(unaffected_hr & Core::HaltReason::SupervisorCall) &&
+                   unaffected_after.aot_block_executions > unaffected_before.aot_block_executions);
+    ScenarioPass("range-specific AOT invalidation keeps unaffected blocks usable", before);
+}
 
 void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const ModeResult& jit,
                          int iters, StackFixture& f) {
@@ -2548,11 +2628,11 @@ void PrintGaps() {
            "    registered core and real PhysicalCore::RunThread/Svc::Call dispatch)\n"
         << "  - Real NSO/NRO homebrew load (this uses a self-contained synthetic CodeSet)\n"
         << "  - gdbstub StepThread against a live title\n"
-        << "  - GPU frame times (this harness has no renderer; slice = RunThread until SVC)\n"
+        << "  - Renderer GPU frame times (standalone harness records Core::PerfStats frame-event boundaries)\n"
         << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
         << "  - AOT .so size includes non-bench integration blocks\n"
         << "  - Bench slice is ADD+STR+LDR (anti-fold), not a pure ALU stream\n"
-        << "  - #5 compatibility, #6 opts, #7 release-gate\n"
+        << "  - #5 compatibility, #7 release-gate\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
@@ -2561,7 +2641,7 @@ void PrintGaps() {
         << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json),\n"
         << "  JudgeAotBenchDump FAILs discriminating PLT dump (counts lock PLT vs loop);\n"
         << "  live gcc -O3 PASS; named store/load PLT not required; host_mem callbacks "
-           "512 x iters.\n"
+           "512 x iters; range invalidation keeps unaffected AOT blocks live.\n"
         << "  #4 Translate AOT vs Dynarmic instruction correctness (edge + random inputs).\n";
 }
 
@@ -2574,6 +2654,7 @@ int main() {
     std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark + insn correctness)\n";
 
     ScenarioFoldPinSelfCheck();
+    ScenarioRangeCacheSelfCheck();
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const fs::path root =
@@ -2599,6 +2680,7 @@ int main() {
     ScenarioForceMissRegistered(*fix);
     ScenarioUnhandledFallback(*fix);
     ScenarioInsnCorrectness(*fix);
+    ScenarioRangeInvalidation(*fix);
     // ClearInstructionCache permanently refuses AOT; run after the above.
     ScenarioInvalidation(*fix);
     ScenarioRestart(*fix);

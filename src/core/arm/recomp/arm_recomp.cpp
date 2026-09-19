@@ -196,6 +196,7 @@ struct RecompCounters {
     std::atomic<u64> no_fallback_available{0};
     std::atomic<u64> clear_instruction_cache{0};
     std::atomic<u64> invalidate_cache_range{0};
+    std::atomic<u64> aot_range_rejects{0};
     std::atomic<u64> permanent_aot_reject{0};
     std::atomic<u64> jit_halt_cache_invalidation{0};
 
@@ -249,6 +250,7 @@ struct RecompCounters {
         add(no_fallback_available, src.no_fallback_available);
         add(clear_instruction_cache, src.clear_instruction_cache);
         add(invalidate_cache_range, src.invalidate_cache_range);
+        add(aot_range_rejects, src.aot_range_rejects);
         add(permanent_aot_reject, src.permanent_aot_reject);
         add(jit_halt_cache_invalidation, src.jit_halt_cache_invalidation);
     }
@@ -269,6 +271,7 @@ struct RecompCounters {
         no_fallback_available.store(0, std::memory_order_relaxed);
         clear_instruction_cache.store(0, std::memory_order_relaxed);
         invalidate_cache_range.store(0, std::memory_order_relaxed);
+        aot_range_rejects.store(0, std::memory_order_relaxed);
         permanent_aot_reject.store(0, std::memory_order_relaxed);
         jit_halt_cache_invalidation.store(0, std::memory_order_relaxed);
     }
@@ -371,8 +374,9 @@ std::string FormatRecompCoverage() {
     o += fmt::format("  ClearInstructionCache  : {} (permanent reject events {})\n",
                      g_counters.clear_instruction_cache.load(),
                      g_counters.permanent_aot_reject.load());
-    o += fmt::format("  InvalidateCacheRange   : {} (does not reject AOT)\n",
-                     g_counters.invalidate_cache_range.load());
+    o += fmt::format("  InvalidateCacheRange   : {} (range AOT rejects {})\n",
+                     g_counters.invalidate_cache_range.load(),
+                     g_counters.aot_range_rejects.load());
     o += fmt::format("  unresolved import traps: {}\n", g_counters.unresolved_import_traps.load());
     if (const u64 nofb = g_counters.no_fallback_available.load(); nofb) {
         o += fmt::format("  threads killed with no JIT fallback: {}\n", nofb);
@@ -569,6 +573,8 @@ RecompExecutionMetrics GetRecompExecutionMetrics() {
         SumCounter(g_lifetime.clear_instruction_cache, g_counters.clear_instruction_cache);
     m.invalidate_cache_range_calls =
         SumCounter(g_lifetime.invalidate_cache_range, g_counters.invalidate_cache_range);
+    m.aot_range_rejects =
+        SumCounter(g_lifetime.aot_range_rejects, g_counters.aot_range_rejects);
     m.permanent_aot_reject_events =
         SumCounter(g_lifetime.permanent_aot_reject, g_counters.permanent_aot_reject);
     m.jit_halt_cache_invalidation =
@@ -639,6 +645,7 @@ std::string FormatRecompExecutionJson() {
         {"icache",
          {{"clear_instruction_cache_calls", m.clear_instruction_cache_calls},
           {"invalidate_cache_range_calls", m.invalidate_cache_range_calls},
+          {"aot_range_rejects", m.aot_range_rejects},
           {"permanent_aot_reject_events", m.permanent_aot_reject_events},
           {"jit_halt_cache_invalidation", m.jit_halt_cache_invalidation}}},
         {"svc_calls", m.svc_calls},
@@ -1184,6 +1191,7 @@ struct ArmRecomp::Impl {
     std::unique_ptr<ArmDynarmic64> fallback{};
     bool in_fallback{false};
     bool fallback_unavailable{false};
+    std::atomic<bool> aot_execution_started{false};
     suyu::recomp::RecompICache icache{};
 
     AotLookup LookupAot(u64 pc, RecompBlockFn* out = nullptr) {
@@ -1194,11 +1202,14 @@ struct ArmRecomp::Impl {
         if (!block) {
             return AotLookup::Miss;
         }
-        if (icache.AllowsAot()) {
+        if (icache.AllowsAotAt(pc)) {
             return AotLookup::Hit;
         }
         if (out) {
             *out = nullptr;
+        }
+        if (icache.AllowsAot()) {
+            g_counters.aot_range_rejects.fetch_add(1, std::memory_order_relaxed);
         }
         static std::atomic<int> refused{0};
         if (refused.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -1557,6 +1568,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         impl->ctx.chain_budget = impl->icache.AllowsAot() ? kChainBudget : 0;
         {
             ScopedNs timer{g_counters.aot_time_ns};
+            impl->aot_execution_started.store(true, std::memory_order_release);
             block(&impl->ctx);
         }
         {
@@ -1660,6 +1672,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
     {
         ScopedNs timer{g_counters.aot_time_ns};
+        impl->aot_execution_started.store(true, std::memory_order_release);
         block(&impl->ctx);
     }
 
@@ -1706,6 +1719,13 @@ void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
     // halt reasons and call icache.Clear() from RunFallback/StepFallback.
     g_counters.invalidate_cache_range.fetch_add(1, std::memory_order_relaxed);
     impl->ctx.chain_budget = 0;
+    // During initial module mapping the fallback does not exist yet, and the
+    // loader's protection notification is not evidence that guest bytes
+    // changed. Once Dynarmic is live, retain only this affected range as a
+    // JIT island; unrelated AOT entry PCs remain eligible.
+    if (impl->fallback || impl->aot_execution_started.load(std::memory_order_acquire)) {
+        impl->icache.InvalidateRange(addr, size);
+    }
     if (impl->fallback) {
         impl->fallback->InvalidateCacheRange(addr, size);
     }

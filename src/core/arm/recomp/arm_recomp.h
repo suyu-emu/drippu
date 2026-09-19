@@ -77,7 +77,7 @@ RecompLookupFn GetRecompLookup();
 /// transitions.{aot_to_dynarmic,dynarmic_to_aot},
 /// fallback_reasons.{lookup_miss,unhandled_opcode,icache_rejected,no_fallback_available},
 /// icache.{clear_instruction_cache_calls,invalidate_cache_range_calls,
-///         permanent_aot_reject_events,jit_halt_cache_invalidation},
+///         aot_range_rejects,permanent_aot_reject_events,jit_halt_cache_invalidation},
 /// plus svc_calls, unresolved_import_traps, and histograms.
 ///
 /// Benchmark comparison (drippu backlog #3) is not this snapshot. The stack
@@ -112,6 +112,7 @@ struct RecompExecutionMetrics {
     u64 svc_calls{};
     u64 clear_instruction_cache_calls{};
     u64 invalidate_cache_range_calls{};
+    u64 aot_range_rejects{};
     u64 permanent_aot_reject_events{};
     u64 jit_halt_cache_invalidation{};
 };
