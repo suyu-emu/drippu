@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "recomp_benchmark_baseline",
+  "description": "Portable guardrails for the deterministic recompiler benchmark suite. Timing values are intentionally not fixed across hosts.",
+  "workloads": ["alu_add_reload_svc", "tls_svc", "plain_svc"],
+  "thresholds": {
+    "required_workloads": 3,
+    "required_backends": ["hybrid_aot", "jit"],
+    "min_iterations": 4,
+    "max_aot_to_jit_transition_ratio": 1.0,
+    "max_invalid_json_size_bytes": 10485760
+  }
+}
