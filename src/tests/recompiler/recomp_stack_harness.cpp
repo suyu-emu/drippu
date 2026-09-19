@@ -1781,8 +1781,9 @@ void ScenarioInsnCorrectness(StackFixture& f) {
                  " dyn=" + std::to_string(dyn.svc));
         }
         SameGprsNzcv(aot.ctx, dyn.ctx, tag);
-        if (std::string_view(blk.name) == "logic_flags") {
-            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS write C=V=0.
+        if (std::string_view(blk.name) == "logic_flags" ||
+            std::string_view(blk.name) == "p0_logic_flags") {
+            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS/BICS write C=V=0.
             // This fails if AOT left those bits stale even when N/Z match.
             if ((Nzcv(aot.ctx) & 0x30000000u) != 0) {
                 Fail(std::string(tag) + " AOT ANDS left C/V stale nzcv=" +
@@ -1821,6 +1822,16 @@ void ScenarioInsnCorrectness(StackFixture& f) {
             edge[1] = 0x8000000000000000ULL;
             edge[2] = 1;
         }
+        if (std::string_view(blk.name) == "b_cbz" || std::string_view(blk.name) == "b_tbz") {
+            edge[0] = 0; // taken: CBZ X0==0, TBZ bit 3 clear
+        } else if (std::string_view(blk.name) == "b_cbnz") {
+            edge[0] = 1; // taken: CBNZ X0!=0
+        } else if (std::string_view(blk.name) == "b_tbnz") {
+            edge[0] = 8; // taken: TBNZ bit 3 set
+        } else if (std::string_view(blk.name) == "b_beq") {
+            edge[0] = 0x1234;
+            edge[1] = 0x1234; // taken: X0==X1
+        }
         one(blk, edge, (std::string(blk.name) + " edge").c_str());
 
         u64 wrap[32]{};
@@ -1833,6 +1844,17 @@ void ScenarioInsnCorrectness(StackFixture& f) {
             wrap[1] = g_entry + kOffInsnScratch;
             wrap[2] = ~0ULL;
             wrap[3] = 0xFF;
+        }
+        if (std::string_view(blk.name) == "b_cbz") {
+            wrap[0] = 1; // not-taken: CBZ X0!=0
+        } else if (std::string_view(blk.name) == "b_cbnz" ||
+                   std::string_view(blk.name) == "b_tbnz") {
+            wrap[0] = 0; // not-taken: CBNZ X0==0, TBNZ bit 3 clear
+        } else if (std::string_view(blk.name) == "b_tbz") {
+            wrap[0] = 8; // not-taken: TBZ bit 3 set
+        } else if (std::string_view(blk.name) == "b_beq") {
+            wrap[0] = 1;
+            wrap[1] = 2; // not-taken: X0!=X1
         }
         one(blk, wrap, (std::string(blk.name) + " wrap").c_str());
 
