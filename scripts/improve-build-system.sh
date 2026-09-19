@@ -52,6 +52,52 @@ MISSING_TOOLS=0
 check_tool "cmake" || MISSING_TOOLS=$((MISSING_TOOLS + 1))
 check_tool "git" || MISSING_TOOLS=$((MISSING_TOOLS + 1))
 
+# Check for a working C compiler. We probe cc/gcc/clang (not just gcc) and
+# then actually compile, link, and run a trivial program: a compiler binary
+# that exists but cannot build (missing linker, missing libc headers,
+# broken snap install, ...) must fail here with a clear message, not later
+# inside cmake with an inscrutable error.
+check_c_compiler() {
+    local cc=""
+    local candidate
+    for candidate in cc gcc clang; do
+        if command -v "$candidate" &> /dev/null; then
+            cc="$candidate"
+            break
+        fi
+    done
+    if [ -z "$cc" ]; then
+        print_error "no C compiler found (looked for cc, gcc, clang in PATH)"
+        print_error "install a toolchain for your platform, e.g.:"
+        print_error "  Debian/Ubuntu: sudo apt install build-essential"
+        print_error "  Fedora:        sudo dnf install gcc"
+        print_error "  Arch:          sudo pacman -S base-devel"
+        print_error "  macOS:         xcode-select --install"
+        print_error "  Windows:       Visual Studio Build Tools (\"Desktop development with C++\")"
+        print_error "                 or MSYS2: pacman -S mingw-w64-ucrt-x86_64-gcc"
+        return 1
+    fi
+    print_success "C compiler found: $cc ($(command -v "$cc"))"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    echo 'int main(void){return 0;}' > "$tmpdir/cc_probe.c"
+    if ! "$cc" -o "$tmpdir/cc_probe" "$tmpdir/cc_probe.c" &> "$tmpdir/cc_probe.log"; then
+        print_error "C compiler '$cc' exists but cannot compile a trivial program:"
+        sed 's/^/    /' "$tmpdir/cc_probe.log" | head -20
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! "$tmpdir/cc_probe"; then
+        print_error "C compiler '$cc' produced a binary that does not run (broken toolchain?)"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    rm -rf "$tmpdir"
+    print_success "C compiler '$cc' passed the compile-and-link smoke test"
+    return 0
+}
+check_c_compiler || MISSING_TOOLS=$((MISSING_TOOLS + 1))
+
 if [ $MISSING_TOOLS -gt 0 ]; then
     print_error "Please install missing tools before continuing"
     exit 1
