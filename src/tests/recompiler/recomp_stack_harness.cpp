@@ -2045,13 +2045,14 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         ctx.r[3] = g_entry + kOffBenchScratch;
         f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
 
+        const auto frame_t0 = std::chrono::steady_clock::now();
         f.system.GetPerfStats().BeginSystemFrame();
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto slice_t0 = std::chrono::steady_clock::now();
         const auto hr = f.arm->RunThread(f.thread);
-        const u64 ns = NsSince(t0);
+        const u64 ns = NsSince(slice_t0);
         f.system.GetPerfStats().EndSystemFrame();
         ++r.frame_events;
-        r.frame_event_time_ns += ns;
+        r.frame_event_time_ns += NsSince(frame_t0);
         times.push_back(ns);
         if (i == 0) {
             r.mem_after_first = ReadMem();
@@ -2196,7 +2197,9 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"expected_svc", kBenchSvcImm},
           {"iters", iters}}},
         {"aot_compile",
-         {{"translate_ns", g_aot_compile.translate_ns},
+         {{"scope", "shared_aot_image"},
+          {"per_workload", "unavailable"},
+          {"translate_ns", g_aot_compile.translate_ns},
           {"bench_translate_ns", g_aot_compile.bench_translate_ns},
           {"cmake_configure_ns", g_aot_compile.cmake_configure_ns},
           {"cmake_build_ns", g_aot_compile.cmake_build_ns},
@@ -2290,29 +2293,45 @@ ModeResult RunRepresentativeWorkload(StackFixture& f, const char* id, const char
         ctx.pc = pc;
         if (tls) {
             ctx.r[4] = g_entry + kOffCrossPage;
-            f.arm->SetTpidrroEl0(0xC0FFEE);
         }
         f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+        if (tls) {
+            // LoadContext publishes the thread's TPIDRRO. Set the test value
+            // afterwards so the generated MRS observes it, exactly as the
+            // production context-switch contract requires.
+            f.arm->SetTpidrroEl0(0xC0FFEE);
+        }
+        const auto frame_t0 = std::chrono::steady_clock::now();
         f.system.GetPerfStats().BeginSystemFrame();
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto slice_t0 = std::chrono::steady_clock::now();
         const auto hr = f.arm->RunThread(f.thread);
-        const u64 ns = NsSince(t0);
+        const u64 ns = NsSince(slice_t0);
         f.system.GetPerfStats().EndSystemFrame();
         times.push_back(ns);
         ++r.frame_events;
-        r.frame_event_time_ns += ns;
+        r.frame_event_time_ns += NsSince(frame_t0);
         r.halt_svc = r.halt_svc || True(hr & Core::HaltReason::SupervisorCall);
         r.svc = f.arm->GetSvcNumber();
         Kernel::Svc::ThreadContext out{};
         f.arm->GetContext(out);
         r.x0 = out.r[0];
+        if (tls) {
+            if (out.r[1] != expected_x0 || out.r[3] != 0xC0FFEE ||
+                f.system.ApplicationMemory().Read64(g_entry + kOffCrossPage) != 0xABCD) {
+                Fail(std::string(id) + " TLS/cross-page effects mismatch");
+            }
+        }
+        if (i == 0) {
+            r.mem_after_first = ReadMem();
+        }
         if (!True(hr & Core::HaltReason::SupervisorCall) || r.svc != expected_svc ||
             r.x0 != expected_x0) {
             Fail(std::string(id) + " result mismatch");
         }
     }
     g_force_miss_pc = 0;
-    r.mem_after_first = ReadMem();
+    r.perf_stats_frametime_seconds =
+        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
     r.mem_after = r.mem_after_first;
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;
