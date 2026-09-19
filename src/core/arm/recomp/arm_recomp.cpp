@@ -169,6 +169,32 @@ namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
 
+// The loader creates one ArmRecomp per physical core, but instruction-cache
+// invalidation is process-wide. Weak ownership makes this state shared by all
+// cores of one live KProcess and naturally drops it when the process exits,
+// avoiding stale state if an address is reused by a later process.
+struct RecompProcessState {
+    suyu::recomp::RecompICache icache;
+    std::atomic<bool> execution_started{false};
+};
+
+std::mutex g_process_states_lock;
+std::unordered_map<Kernel::KProcess*, std::weak_ptr<RecompProcessState>> g_process_states;
+
+std::shared_ptr<RecompProcessState> AcquireProcessState(Kernel::KProcess* process) {
+    if (!process) {
+        return std::make_shared<RecompProcessState>();
+    }
+    std::scoped_lock lock{g_process_states_lock};
+    auto& weak = g_process_states[process];
+    if (auto state = weak.lock()) {
+        return state;
+    }
+    auto state = std::make_shared<RecompProcessState>();
+    weak = state;
+    return state;
+}
+
 /// Execution coverage for the AOT path (mk8-recomp #13) plus wall-clock time
 /// in each backend (drippu backlog #2).
 ///
@@ -692,7 +718,9 @@ bool WriteRecompExecutionJson(const std::filesystem::path& path) {
 }
 
 struct ArmRecomp::Impl {
-    Impl(System& system_, RecompLookupFn lookup_) : system{system_}, lookup{lookup_} {
+    Impl(System& system_, RecompLookupFn lookup_, Kernel::KProcess* process)
+        : system{system_}, lookup{lookup_}, process_state{AcquireProcessState(process)},
+          icache{process_state->icache} {
         std::memset(&ctx, 0, sizeof(ctx));
         ctx.pending_svc = kNoPendingSvc;
         // Point the recompiled code at the emulator's address space.
@@ -1191,8 +1219,8 @@ struct ArmRecomp::Impl {
     std::unique_ptr<ArmDynarmic64> fallback{};
     bool in_fallback{false};
     bool fallback_unavailable{false};
-    std::atomic<bool> aot_execution_started{false};
-    suyu::recomp::RecompICache icache{};
+    std::shared_ptr<RecompProcessState> process_state;
+    suyu::recomp::RecompICache& icache;
 
     AotLookup LookupAot(u64 pc, RecompBlockFn* out = nullptr) {
         const RecompBlockFn block = lookup ? lookup(pc) : nullptr;
@@ -1234,7 +1262,7 @@ struct ArmRecomp::Impl {
 ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
                      Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
                      std::size_t core_index)
-    : ArmInterface{uses_wall_clock}, impl{std::make_unique<Impl>(system, lookup)} {
+    : ArmInterface{uses_wall_clock}, impl{std::make_unique<Impl>(system, lookup, process)} {
     impl->owner_process = process;
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;
@@ -1565,10 +1593,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // The budget bounds that chain, and what is left of it afterwards says
         // how many blocks actually ran - without which every count here would
         // report chains rather than blocks.
-        impl->ctx.chain_budget = impl->icache.AllowsAot() ? kChainBudget : 0;
+        impl->ctx.chain_budget = impl->icache.AllowsAotChaining() ? kChainBudget : 0;
         {
             ScopedNs timer{g_counters.aot_time_ns};
-            impl->aot_execution_started.store(true, std::memory_order_release);
+            impl->process_state->execution_started.store(true, std::memory_order_release);
             block(&impl->ctx);
         }
         {
@@ -1672,7 +1700,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
     {
         ScopedNs timer{g_counters.aot_time_ns};
-        impl->aot_execution_started.store(true, std::memory_order_release);
+        impl->process_state->execution_started.store(true, std::memory_order_release);
         block(&impl->ctx);
     }
 
@@ -1723,7 +1751,7 @@ void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
     // loader's protection notification is not evidence that guest bytes
     // changed. Once Dynarmic is live, retain only this affected range as a
     // JIT island; unrelated AOT entry PCs remain eligible.
-    if (impl->fallback || impl->aot_execution_started.load(std::memory_order_acquire)) {
+    if (impl->fallback || impl->process_state->execution_started.load(std::memory_order_acquire)) {
         impl->icache.InvalidateRange(addr, size);
     }
     if (impl->fallback) {

@@ -29,6 +29,13 @@ public:
         return !aot_rejected_.load(std::memory_order_acquire);
     }
 
+    // Direct calls emitted by the static pass bypass the dispatcher. Once any
+    // range has been invalidated, disable those chains globally; each target
+    // then re-enters LookupAot and observes the immutable range snapshot.
+    bool AllowsAotChaining() const {
+        return AllowsAot() && !has_invalidated_ranges_.load(std::memory_order_acquire);
+    }
+
     // Invalidate the page-conservative AOT ranges intersecting the changed
     // bytes. This keeps unrelated pages usable after a self-modifying page or
     // debugger patch instead of forcing the entire image to JIT.
@@ -43,6 +50,12 @@ public:
                 ? std::numeric_limits<std::uint64_t>::max()
                 : original_start + static_cast<std::uint64_t>(length);
         start = original_start & ~(page_size - 1);
+        // A compiled block can begin on the preceding page and cross into the
+        // modified page. Without block extent metadata, conservatively reject
+        // that preceding page too so stale cross-page AOT cannot survive.
+        if (start >= page_size) {
+            start -= page_size;
+        }
         const std::uint64_t raw_end = original_end;
         const std::uint64_t end =
             raw_end > std::numeric_limits<std::uint64_t>::max() - (page_size - 1)

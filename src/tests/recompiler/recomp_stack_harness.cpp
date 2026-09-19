@@ -190,6 +190,8 @@ constexpr u64 kOffCoreDispatch = 0x2008; // TLS + safe GetCurrentProcessorNumber
 // Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003).
 // 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
 constexpr u64 kOffBench = 0x2400;
+constexpr u64 kOffChainEntry = 0x3000;
+constexpr u64 kOffChainTarget = 0x4010;
 constexpr int kBenchAdds = 512;
 constexpr u32 kBenchSvcImm = 3;
 constexpr u64 kCodeBytes = 5 * Kernel::PageSize;
@@ -237,6 +239,8 @@ BlockFn g_block_plain = nullptr;
 BlockFn g_block_step_no_svc = nullptr;
 BlockFn g_block_core_dispatch = nullptr;
 BlockFn g_block_bench = nullptr;
+BlockFn g_block_chain_entry = nullptr;
+BlockFn g_block_chain_target = nullptr;
 BlockFn g_block_insn[suyu::recomp::insn_test::kInsnBlockCount]{};
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
@@ -770,6 +774,12 @@ Core::RecompBlockFn Lookup(u64 pc) {
     if (pc == g_entry + kOffBench) {
         return g_block_bench;
     }
+    if (pc == g_entry + kOffChainEntry) {
+        return g_block_chain_entry;
+    }
+    if (pc == g_entry + kOffChainTarget) {
+        return g_block_chain_target;
+    }
     if (pc >= g_entry + suyu::recomp::insn_test::kOffInsn) {
         const u64 rel = pc - (g_entry + suyu::recomp::insn_test::kOffInsn);
         const u64 idx = rel / suyu::recomp::insn_test::kInsnStride;
@@ -986,6 +996,18 @@ void block_bench(GuestContext* c) {
     src << R"C(}
 )C";
 
+    // Direct-chain regression fixture. The entry block calls its target
+    // directly while the chain budget permits it; after invalidation the
+    // shared runtime disables chaining and the target must be reached through
+    // the dispatcher/JIT rather than stale generated code.
+    src << "void block_chain_target(GuestContext* c) {\n"
+        << "    c->x[0] = 0xCAFEULL; c->pending_svc = 77; c->pc = g_module_base + 0x"
+        << std::hex << kOffChainTarget + 4 << std::dec << "ULL;\n}\n"
+        << "void block_chain_entry(GuestContext* c) {\n"
+        << "    if (--c->chain_budget <= 0) { c->pc = g_module_base + 0x" << std::hex
+        << kOffChainTarget << std::dec << "ULL; return; }\n"
+        << "    return block_chain_target(c);\n}\n";
+
     const auto insn_blocks = suyu::recomp::insn_test::ReferenceBlocks();
     for (size_t bi = 0; bi < insn_blocks.size(); ++bi) {
         src << "void block_insn_" << bi << "(GuestContext* c) {\n";
@@ -1117,6 +1139,8 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
     g_block_core_dispatch = reinterpret_cast<BlockFn>(dlsym(g_so, "block_core_dispatch"));
     g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
+    g_block_chain_entry = reinterpret_cast<BlockFn>(dlsym(g_so, "block_chain_entry"));
+    g_block_chain_target = reinterpret_cast<BlockFn>(dlsym(g_so, "block_chain_target"));
     for (int i = 0; i < suyu::recomp::insn_test::kInsnBlockCount; ++i) {
         const std::string sym = "block_insn_" + std::to_string(i);
         g_block_insn[i] = reinterpret_cast<BlockFn>(dlsym(g_so, sym.c_str()));
@@ -1133,12 +1157,14 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
     ExpectTrue("dlsym block_core_dispatch", g_block_core_dispatch != nullptr);
     ExpectTrue("dlsym block_bench", g_block_bench != nullptr);
+    ExpectTrue("dlsym block_chain_entry", g_block_chain_entry != nullptr);
+    ExpectTrue("dlsym block_chain_target", g_block_chain_target != nullptr);
     ExpectTrue("dlsym g_recomp_hm_load_calls", g_hm_load_calls != nullptr);
     ExpectTrue("dlsym g_recomp_hm_store_calls", g_hm_store_calls != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
            g_block_plain && g_block_step_no_svc && g_block_core_dispatch && g_block_bench &&
-           g_hm_load_calls &&
-           g_hm_store_calls && g_block_insn[0] &&
+           g_hm_load_calls && g_hm_store_calls && g_block_chain_entry && g_block_chain_target &&
+           g_block_insn[0] &&
            g_block_insn[suyu::recomp::insn_test::kInsnBlockCount - 1];
 #endif
 }
@@ -1177,6 +1203,11 @@ void WriteGuestImage(std::vector<u8>& image) {
     for (const auto& [off, enc] : BenchInsns()) {
         put(off, enc);
     }
+    // Guest twin for the direct-chain regression: B reaches the target's
+    // MOVZ/SVC bytes when the target is forced through Dynarmic.
+    put(kOffChainEntry, 0x14000404u); // B +0x1010 to kOffChainTarget
+    put(kOffChainTarget, kMovzX0Cafe);
+    put(kOffChainTarget + 4, kSvc77);
     for (const auto& blk : suyu::recomp::insn_test::ReferenceBlocks()) {
         u64 off = blk.offset;
         for (u32 enc : blk.insns) {
@@ -2298,6 +2329,44 @@ void ScenarioRangeCacheSelfCheck() {
 
 void AddRepresentativeWorkloads(nlohmann::json& doc, StackFixture& f, int iters);
 
+void ScenarioDirectChainInvalidation(StackFixture& f) {
+    const int before = g_fails;
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("direct-chain ArmRecomp", recomp != nullptr);
+    if (!recomp) {
+        return;
+    }
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffChainEntry;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto aot_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("direct-chain pre-invalidation SVC", True(aot_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("direct-chain pre-invalidation SVC number", f.arm->GetSvcNumber(), 77);
+    Kernel::Svc::ThreadContext aot_ctx{};
+    f.arm->GetContext(aot_ctx);
+    ExpectEq("direct-chain pre-invalidation result", aot_ctx.r[0], 0xCAFE);
+
+    // Invalidate the target bytes before the next entry. Page-conservative
+    // invalidation also rejects a source block on the preceding page when
+    // needed; the important property is that no direct generated call can
+    // execute the stale target after the process-wide chain gate is closed.
+    f.arm->InvalidateCacheRange(g_entry + kOffChainTarget, 8);
+    ExpectTrue("direct-chain invalidation keeps global AOT mode", recomp->AllowsAot());
+    ctx = {};
+    ctx.pc = g_entry + kOffChainEntry;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto jit_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("direct-chain post-invalidation SVC", True(jit_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("direct-chain post-invalidation SVC number", f.arm->GetSvcNumber(), 77);
+    Kernel::Svc::ThreadContext jit_ctx{};
+    f.arm->GetContext(jit_ctx);
+    ExpectEq("direct-chain post-invalidation result", jit_ctx.r[0], 0xCAFE);
+    const auto metrics = Core::GetRecompExecutionMetrics();
+    ExpectTrue("direct-chain stale target rejected", metrics.fallback_icache_rejected > 0);
+    ScenarioPass("direct AOT chain target observes process-wide invalidation", before);
+}
+
 void ScenarioRangeInvalidation(StackFixture& f) {
     const int before = g_fails;
     auto* recomp = AsRecomp(f.arm);
@@ -2307,25 +2376,41 @@ void ScenarioRangeInvalidation(StackFixture& f) {
     }
     auto& ctx = f.thread->GetContext();
     ctx = {};
-    ctx.pc = g_entry + kOffPlain;
+    ctx.pc = g_entry + kOffBench;
+    ctx.r[1] = 1;
+    ctx.r[3] = g_entry + kOffBenchScratch;
     f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
     const auto before_metrics = Core::GetRecompExecutionMetrics();
     const auto aot_hr = f.arm->RunThread(f.thread);
     ExpectTrue("range precondition AOT", True(aot_hr & Core::HaltReason::SupervisorCall));
 
-    // Reject just the page containing plain_svc. The neighbouring TLS block
-    // remains statically executable and AllowsAot() stays true globally.
-    // Invalidate the SVC in the middle of the two-instruction block. The
+    // Reject just the page containing the benchmark block. The neighbouring
+    // plain_svc block remains statically executable and AllowsAot() stays true globally.
+    // Invalidate an instruction in the middle of the benchmark block. The
     // page-conservative cache rejects the containing block, not just entries
     // whose PC equals the changed byte.
-    f.arm->InvalidateCacheRange(g_entry + kOffPlain + 4, 1);
+    f.arm->InvalidateCacheRange(g_entry + kOffBench + 4, 1);
     ExpectTrue("range invalidation preserves global AOT", recomp->AllowsAot());
+    for (std::size_t i = 1; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+        if (auto* idle = f.process->GetArmInterface(i)) {
+            // Invalidate through an otherwise idle core. The process-wide
+            // cache must make the next core-0 lookup reject the stale block.
+            idle->InvalidateCacheRange(g_entry + kOffBench + 4, 1);
+            break;
+        }
+    }
     ctx = {};
-    ctx.pc = g_entry + kOffPlain;
+    ctx.pc = g_entry + kOffBench;
+    ctx.r[1] = 1;
+    ctx.r[3] = g_entry + kOffBenchScratch;
     f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
     const auto jit_hr = f.arm->RunThread(f.thread);
     ExpectTrue("range invalidation falls back only affected block",
                True(jit_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("range invalidation affected SVC", f.arm->GetSvcNumber(), kBenchSvcImm);
+    Kernel::Svc::ThreadContext affected{};
+    f.arm->GetContext(affected);
+    ExpectEq("range invalidation affected result", affected.r[0], static_cast<u64>(kBenchAdds));
     const auto after_metrics = Core::GetRecompExecutionMetrics();
     ExpectTrue("range invalidation recorded rejection",
                after_metrics.aot_range_rejects > before_metrics.aot_range_rejects);
@@ -2334,8 +2419,7 @@ void ScenarioRangeInvalidation(StackFixture& f) {
 
     // A block outside the changed range still takes the AOT path.
     ctx = {};
-    ctx.pc = g_entry + kOffTlsSvc;
-    ctx.r[4] = g_entry + kOffCrossPage;
+    ctx.pc = g_entry + kOffPlain;
     f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
     const auto unaffected_before = Core::GetRecompExecutionMetrics();
     const auto unaffected_hr = f.arm->RunThread(f.thread);
@@ -2680,6 +2764,7 @@ int main() {
     ScenarioForceMissRegistered(*fix);
     ScenarioUnhandledFallback(*fix);
     ScenarioInsnCorrectness(*fix);
+    ScenarioDirectChainInvalidation(*fix);
     ScenarioRangeInvalidation(*fix);
     // ClearInstructionCache permanently refuses AOT; run after the above.
     ScenarioInvalidation(*fix);
