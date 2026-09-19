@@ -24,8 +24,8 @@ ManifestDPIAware true
 !define PRODUCT_NAME "drippu"
 !define PRODUCT_EXE "suyu.exe"
 !define PRODUCT_CLI_EXE "suyu-cli.exe"
-!define PRODUCT_PUBLISHER "SourCreamCulture / drippu"
-!define PRODUCT_WEB_SITE "https://github.com/SourCreamCulture/drippu"
+!define PRODUCT_PUBLISHER "suyu Emulator Project"
+!define PRODUCT_WEB_SITE "https://github.com/suyu-emu/drippu"
 !define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_EXE}"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 

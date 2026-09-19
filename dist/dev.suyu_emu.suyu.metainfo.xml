@@ -13,7 +13,7 @@ SPDX-License-Identifier: CC0-1.0
   <name>drippu</name>
   <summary>Nintendo Switch emulator</summary>
   <description>
-    <p>drippu is an open-source Nintendo Switch emulator and native recompiler — a continued fork of the suyu codebase, itself based on Eden / yuzu.</p>
+    <p>drippu is the experimental edition of suyu: an open-source Nintendo Switch emulator and native recompiler built on the shared Eden / yuzu lineage.</p>
     <p>The emulator is capable of running commercial games at full speed when hardware requirements are met, using user-provided games and encryption keys.</p>
     <p>Check the project repository for builds, compatibility notes, and contributing information.</p>
   </description>
@@ -25,9 +25,9 @@ SPDX-License-Identifier: CC0-1.0
     <keyword>switch</keyword>
     <keyword>emulator</keyword>
   </keywords>
-  <url type="homepage">https://github.com/SourCreamCulture/drippu</url>
-  <url type="bugtracker">https://github.com/SourCreamCulture/drippu/issues</url>
-  <url type="vcs-browser">https://github.com/SourCreamCulture/drippu</url>
+  <url type="homepage">https://github.com/suyu-emu/drippu</url>
+  <url type="bugtracker">https://github.com/suyu-emu/drippu/issues</url>
+  <url type="vcs-browser">https://github.com/suyu-emu/drippu</url>
   <launchable type="desktop-id">dev.suyu_emu.suyu.desktop</launchable>
   <provides>
     <binary>suyu</binary>
@@ -45,6 +45,6 @@ SPDX-License-Identifier: CC0-1.0
     <memory>16384</memory>
   </recommends>
   <project_license>GPL-3.0-or-later</project_license>
-  <developer_name>SourCreamCulture / drippu</developer_name>
+  <developer_name>suyu Emulator Project</developer_name>
   <content_rating type="oars-1.0"/>
 </component>
