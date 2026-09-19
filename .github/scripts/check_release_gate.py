@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -280,6 +281,13 @@ def write_executable(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
+def shell_path(path: Path) -> str:
+    """Render a temporary Windows path in the POSIX form Git Bash accepts."""
+    if os.name == "nt":
+        return "/" + path.drive[0].lower() + path.as_posix()[2:]
+    return str(path)
+
+
 def run_publish_shell(
     spec: JobSpec,
     artifacts: dict[str, bytes],
@@ -372,10 +380,10 @@ exit 0
 """
         write_executable(
             bin_dir / "gh",
-            gh_stub.replace("__LOG__", str(log_path))
-            .replace("__NOTES__", str(notes_path))
-            .replace("__CHECKSUMS__", str(checksum_path))
-            .replace("__UPLOADED__", str(uploaded_dir)),
+            gh_stub.replace("__LOG__", shell_path(log_path))
+            .replace("__NOTES__", shell_path(notes_path))
+            .replace("__CHECKSUMS__", shell_path(checksum_path))
+            .replace("__UPLOADED__", shell_path(uploaded_dir)),
         )
         git_stub = """#!/bin/bash
 LOG=__LOG__
@@ -385,7 +393,7 @@ if [ "${1:-}" = "push" ] && [ "${2:-}" = "--delete" ]; then
 fi
 exec /usr/bin/git "$@"
 """
-        write_executable(bin_dir / "git", git_stub.replace("__LOG__", str(log_path)))
+        write_executable(bin_dir / "git", git_stub.replace("__LOG__", shell_path(log_path)))
 
         env = os.environ.copy()
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
@@ -405,6 +413,16 @@ exec /usr/bin/git "$@"
                 .replace("${{ github.run_id }}", "1")
                 .replace("${{ github.server_url }}", "https://github.com")
             )
+            # Git Bash login profiles rebuild PATH from the Windows process
+            # environment, which can hide the temporary gh/git stubs above.
+            # Re-export the POSIX form explicitly so the publish simulation is
+            # deterministic on Windows developer machines as well as CI.
+            if os.name == "nt":
+                bin_posix = "/" + bin_dir.drive[0].lower() + bin_dir.as_posix()[2:]
+                rendered = f"export PATH={shlex.quote(bin_posix)}:$PATH\n{rendered}"
+                rendered = rendered.replace(
+                    "gh release", f"{shlex.quote(bin_posix + '/gh')} release"
+                )
             proc = subprocess.run(
                 ["bash", "-lc", rendered],
                 cwd=tmp_path,
@@ -498,6 +516,19 @@ def workflow_has_test_suite_job(doc: dict[str, Any], text: str) -> bool:
         if spec.job_id == "tests" and spec.job_id != "exporter-smoke":
             return True
     return False
+
+
+def workflow_has_artifact_verification(text: str) -> bool:
+    """Require native package checks before artifacts reach Publish Release."""
+    required_markers = (
+        "verify_release_artifacts.py desktop --platform windows",
+        "verify_release_artifacts.py desktop --platform linux",
+        "verify_release_artifacts.py desktop --platform macos",
+        "verify_release_artifacts.py libretro --platform linux",
+        "verify_release_artifacts.py libretro --platform windows",
+        "Run release-gate regression",
+    )
+    return all(marker in text for marker in required_markers)
 
 
 def publish_deletes_a_release(spec: JobSpec) -> bool:
@@ -630,6 +661,10 @@ def main() -> int:
     check.expect(
         workflow_has_test_suite_job(doc, text),
         "release workflow builds and runs the test suite",
+    )
+    check.expect(
+        workflow_has_artifact_verification(text),
+        "release workflow verifies desktop and libretro packages before publishing",
     )
 
     commit = "cafebabedeadbeef0123456789abcdef01234567"

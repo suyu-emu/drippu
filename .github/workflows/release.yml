@@ -60,6 +60,9 @@ jobs:
           Copy-Item build/bin/suyu-cmd.exe _pkg/drippu-cmd.exe
           windeployqt --release --no-translations _pkg/drippu.exe
           Compress-Archive -Path _pkg/* -DestinationPath drippu-windows-x64.zip
+      - name: Verify packaged Windows application and dependencies
+        shell: pwsh
+        run: python .github/scripts/verify_release_artifacts.py desktop --platform windows --archive drippu-windows-x64.zip
       - name: Record toolchain
         shell: bash
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
@@ -118,6 +121,8 @@ jobs:
           cp build/bin/suyu _pkg/drippu
           cp build/bin/suyu-cmd _pkg/drippu-cmd 2>/dev/null || true
           tar -czf drippu-linux-x64.tar.gz -C _pkg .
+      - name: Verify packaged Linux application and dependencies
+        run: python3 .github/scripts/verify_release_artifacts.py desktop --platform linux --archive drippu-linux-x64.tar.gz
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
@@ -165,6 +170,8 @@ jobs:
           cp -r build/bin/suyu.app _pkg/drippu.app 2>/dev/null || cp build/bin/suyu _pkg/drippu
           cp build/bin/suyu-cmd _pkg/drippu-cmd 2>/dev/null || true
           tar -czf drippu-macos-arm64.tar.gz -C _pkg .
+      - name: Verify packaged macOS application and dependencies
+        run: python3 .github/scripts/verify_release_artifacts.py desktop --platform macos --archive drippu-macos-arm64.tar.gz
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
@@ -239,6 +246,11 @@ jobs:
         run: |
           rm -rf _pkg && mkdir _pkg
           find src/android -name '*.apk' -exec cp {} _pkg/ \;
+      - name: Verify packaged Android APKs
+        run: |
+          for apk in _pkg/*.apk; do
+            python3 .github/scripts/verify_release_artifacts.py apk --platform android --archive "$apk"
+          done
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
@@ -291,6 +303,8 @@ jobs:
           rm -rf _pkg && mkdir _pkg
           find build -name 'suyu_libretro.so' -exec cp {} _pkg/ \;
           tar -czf drippu-libretro-core-linux-x64.tar.gz -C _pkg .
+      - name: Verify packaged Linux libretro core and API
+        run: python3 .github/scripts/verify_release_artifacts.py libretro --platform linux --archive drippu-libretro-core-linux-x64.tar.gz
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
@@ -341,8 +355,11 @@ jobs:
         run: |
           Remove-Item -Recurse -Force _pkg -ErrorAction SilentlyContinue
           New-Item -ItemType Directory _pkg | Out-Null
-          Get-ChildItem build -Recurse -Filter suyu_libretro.dll | ForEach-Object { Copy-Item $_.FullName _pkg/ }
+          Get-ChildItem build -Recurse -Filter '*.dll' | ForEach-Object { Copy-Item $_.FullName _pkg/ -Force }
           Compress-Archive -Path _pkg/* -DestinationPath drippu-libretro-core-windows-x64.zip
+      - name: Verify packaged Windows libretro core and API
+        shell: pwsh
+        run: python .github/scripts/verify_release_artifacts.py libretro --platform windows --archive drippu-libretro-core-windows-x64.zip
       - name: Record toolchain
         shell: bash
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
@@ -398,6 +415,9 @@ jobs:
           rm -rf _pkg && mkdir _pkg
           find build -name '*suyu_libretro*.so' -exec cp {} _pkg/suyu_libretro_android_arm64-v8a.so \;
           tar -czf drippu-libretro-core-android-arm64.tar.gz -C _pkg .
+      - name: Verify packaged Android libretro core archive
+        run: |
+          test "$(tar -tzf drippu-libretro-core-android-arm64.tar.gz | grep -c '\.so$')" -ge 1
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
@@ -413,10 +433,35 @@ jobs:
   tests:
     uses: ./.github/workflows/tests.yml
 
-  release:
-    name: Publish Release
+  verify-release-artifacts:
+    name: Verify release artifact structure
     if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' }}
     needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android, exporter-smoke, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Install release-gate dependencies
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.2
+      - name: Test artifact verifier
+        run: python3 .github/scripts/test_verify_release_artifacts.py
+      - name: Check every archive has the expected package structure
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) | sort)
+          test "${#archives[@]}" -gt 0
+          for archive in "${archives[@]}"; do
+            python3 .github/scripts/verify_release_artifacts.py structure --platform generic --archive "$archive"
+          done
+      - name: Run release-gate regression
+        run: python3 .github/scripts/check_release_gate.py
+
+  release:
+    name: Publish Release
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' && needs.verify-release-artifacts.result == 'success' }}
+    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android, exporter-smoke, tests, verify-release-artifacts]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
