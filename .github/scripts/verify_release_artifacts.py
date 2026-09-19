@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import stat
@@ -120,10 +121,30 @@ def desktop_binaries(root: Path, target: str) -> list[Path]:
     for name in names:
         paths = [root / name, root / "_pkg" / name]
         if target == "macos" and name == "drippu":
-            paths[0:0] = sorted(
-                path for path in (root / "drippu.app" / "Contents" / "MacOS").glob("*")
-                if path.is_file() and os.access(path, os.X_OK)
-            )
+            bundle_bin = root / "drippu.app" / "Contents" / "MacOS"
+            bundle_executable = None
+            info_plist = bundle_bin.parent / "Info.plist"
+            if info_plist.is_file():
+                try:
+                    with info_plist.open("rb") as stream:
+                        executable_name = plistlib.load(stream).get("CFBundleExecutable")
+                    if isinstance(executable_name, str):
+                        candidate = bundle_bin / executable_name
+                        if candidate.is_file() and os.access(candidate, os.X_OK):
+                            bundle_executable = candidate
+                except (OSError, plistlib.InvalidFileException, ValueError):
+                    pass
+            if bundle_executable is None:
+                bundle_executable = next(
+                    (
+                        path
+                        for path in sorted(bundle_bin.glob("*"))
+                        if path.is_file() and os.access(path, os.X_OK)
+                    ),
+                    None,
+                )
+            if bundle_executable is not None:
+                paths[0:0] = [bundle_executable]
         for candidate in paths:
             if candidate.is_file() and os.access(candidate, os.X_OK if target != "windows" else os.R_OK):
                 candidates.append(candidate)
@@ -157,6 +178,19 @@ def launch_desktop(binary: Path, target: str) -> None:
         fail(f"packaged desktop launch failed ({process.returncode}): {stderr[-2000:]}\n{stdout[-1000:]}")
 
 
+def smoke_cli(binary: Path, target: str) -> None:
+    """Run each packaged command-line binary with a bounded success probe."""
+    env = os.environ.copy()
+    if target in ("linux", "macos"):
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        result = run([str(binary), "--version"], timeout=12, env=env)
+    except OSError as exc:
+        fail(f"could not launch packaged command-line executable {binary}: {exc}")
+    if result.returncode != 0:
+        fail(f"packaged command-line smoke failed ({result.returncode}) for {binary}: {result.stderr[-2000:]}")
+
+
 class RetroSystemInfo(ctypes.Structure):
     _fields_ = [
         ("library_name", ctypes.c_char_p),
@@ -180,16 +214,24 @@ def libretro_binary(root: Path) -> Path:
 def smoke_libretro(binary: Path, target: str) -> None:
     check_dependencies(binary, target)
     dll_directory = None
+    old_library_path: str | None = None
     if target == "windows" and hasattr(os, "add_dll_directory"):
         dll_directory = os.add_dll_directory(str(binary.parent))
     elif target == "linux":
-        old_library_path = os.environ.get("LD_LIBRARY_PATH", "")
-        os.environ["LD_LIBRARY_PATH"] = str(binary.parent) + (os.pathsep + old_library_path if old_library_path else "")
+        old_library_path = os.environ.get("LD_LIBRARY_PATH")
+        os.environ["LD_LIBRARY_PATH"] = str(binary.parent) + (
+            os.pathsep + old_library_path if old_library_path else ""
+        )
     try:
         core = ctypes.CDLL(str(binary))
     except OSError as exc:
         fail(f"could not load packaged libretro core {binary}: {exc}")
     finally:
+        if target == "linux":
+            if old_library_path is None:
+                os.environ.pop("LD_LIBRARY_PATH", None)
+            else:
+                os.environ["LD_LIBRARY_PATH"] = old_library_path
         if dll_directory is not None:
             dll_directory.close()
     try:
@@ -217,15 +259,22 @@ def verify_structure(root: Path, archive: Path) -> None:
             fail(f"APK has no AndroidManifest.xml: {archive.name}")
         return
     names = {path.name for path in files}
-    if archive.name.endswith("-windows-x64.zip") and not {"drippu.exe", "drippu-cmd.exe"}.issubset(names):
-        # Libretro Windows archives intentionally contain only the core DLL.
-        if not any(name.endswith(".dll") for name in names):
-            fail(f"Windows package has no executable or DLL: {archive.name}")
-    elif "libretro-core" in archive.name:
+    if "libretro-core" in archive.name:
         if not any(path.suffix.lower() in (".so", ".dll", ".dylib") for path in files):
             fail(f"libretro package has no shared library: {archive.name}")
-    elif not ({"drippu", "drippu-cmd"} <= names or any(path.name == "drippu" for path in files)):
-        fail(f"desktop package is missing its launchable binaries: {archive.name}")
+    elif archive.name.endswith("-windows-x64.zip") and not {"drippu.exe", "drippu-cmd.exe"}.issubset(names):
+        fail(f"Windows desktop package is missing its launchable binaries: {archive.name}")
+    else:
+        has_cli = "drippu-cmd" in names or "drippu-cmd.exe" in names
+        has_macos_bundle = any(
+            path.parent.name == "MacOS"
+            and path.parent.parent.name == "Contents"
+            and path.parent.parent.parent.name == "drippu.app"
+            for path in files
+        )
+        has_gui = "drippu" in names or "drippu.exe" in names or has_macos_bundle
+        if not (has_gui and has_cli):
+            fail(f"desktop package is missing its launchable binaries: {archive.name}")
 
 
 def verify(archive: Path, mode: str, target: str) -> None:
@@ -240,9 +289,15 @@ def verify(archive: Path, mode: str, target: str) -> None:
             binaries = desktop_binaries(root, target)
             for binary in binaries:
                 check_dependencies(binary, target)
-            # The GUI is the release-facing desktop smoke. The command-line
-            # binary is dependency-checked above but need not open a window.
-            launch_desktop(binaries[0], target)
+            gui = next(
+                binary
+                for binary in binaries
+                if binary.name not in ("drippu-cmd", "drippu-cmd.exe")
+            )
+            launch_desktop(gui, target)
+            for binary in binaries:
+                if binary.name in ("drippu-cmd", "drippu-cmd.exe"):
+                    smoke_cli(binary, target)
         elif mode == "libretro":
             smoke_libretro(libretro_binary(root), target)
         elif mode == "apk":

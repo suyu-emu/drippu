@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import copy
 import re
 import shlex
 import shutil
@@ -284,8 +285,10 @@ def write_executable(path: Path, body: str) -> None:
 def shell_path(path: Path) -> str:
     """Render a temporary Windows path in the POSIX form Git Bash accepts."""
     if os.name == "nt":
-        return "/" + path.drive[0].lower() + path.as_posix()[2:]
-    return str(path)
+        rendered = "/" + path.drive[0].lower() + path.as_posix()[2:]
+    else:
+        rendered = str(path)
+    return shlex.quote(rendered)
 
 
 def run_publish_shell(
@@ -518,17 +521,50 @@ def workflow_has_test_suite_job(doc: dict[str, Any], text: str) -> bool:
     return False
 
 
-def workflow_has_artifact_verification(text: str) -> bool:
-    """Require native package checks before artifacts reach Publish Release."""
-    required_markers = (
-        "verify_release_artifacts.py desktop --platform windows",
-        "verify_release_artifacts.py desktop --platform linux",
-        "verify_release_artifacts.py desktop --platform macos",
-        "verify_release_artifacts.py libretro --platform linux",
-        "verify_release_artifacts.py libretro --platform windows",
-        "Run release-gate regression",
-    )
-    return all(marker in text for marker in required_markers)
+def enabled_run_lines(spec: JobSpec) -> list[str]:
+    """Return executable lines from enabled run steps, excluding comments."""
+    lines: list[str] = []
+    for step in spec.steps:
+        if not isinstance(step, dict):
+            continue
+        raw_if = step.get("if")
+        if isinstance(raw_if, str) and unwrap_expression(raw_if).strip().lower() in {"false", "0"}:
+            continue
+        run = step_run_script(step)
+        if run is None:
+            continue
+        lines.extend(
+            line.strip()
+            for line in run.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return lines
+
+
+def workflow_has_artifact_verification(doc: dict[str, Any]) -> bool:
+    """Require native package checks in their owning jobs before publishing."""
+    jobs = parse_jobs(doc)
+    expected = {
+        "build-windows": "verify_release_artifacts.py desktop --platform windows",
+        "build-linux": "verify_release_artifacts.py desktop --platform linux",
+        "build-macos": "verify_release_artifacts.py desktop --platform macos",
+        "build-android": "verify_release_artifacts.py apk --platform android",
+        "build-libretro": "verify_release_artifacts.py libretro --platform linux",
+        "build-libretro-windows": "verify_release_artifacts.py libretro --platform windows",
+    }
+    for job_id, marker in expected.items():
+        spec = jobs.get(job_id)
+        if spec is None or not any(marker in line for line in enabled_run_lines(spec)):
+            return False
+
+    aggregate = jobs.get("verify-release-artifacts")
+    if aggregate is None or not any(
+        "check_release_gate.py" in line for line in enabled_run_lines(aggregate)
+    ):
+        return False
+
+    publish = jobs.get(PUBLISH_JOB_ID)
+    return publish is not None and "verify-release-artifacts" in publish.needs
 
 
 def publish_deletes_a_release(spec: JobSpec) -> bool:
@@ -663,8 +699,44 @@ def main() -> int:
         "release workflow builds and runs the test suite",
     )
     check.expect(
-        workflow_has_artifact_verification(text),
+        workflow_has_artifact_verification(doc),
         "release workflow verifies desktop and libretro packages before publishing",
+    )
+    commented = copy.deepcopy(doc)
+    commented_step = commented["jobs"]["build-linux"]["steps"]
+    for step in commented_step:
+        if isinstance(step, dict) and "verify_release_artifacts.py desktop --platform linux" in str(step.get("run", "")):
+            step["run"] = "# verify_release_artifacts.py desktop --platform linux"
+            break
+    check.expect(
+        not workflow_has_artifact_verification(commented),
+        "commented-out package checks do not satisfy the release gate",
+    )
+    unrelated = copy.deepcopy(doc)
+    unrelated["jobs"]["build-windows"]["steps"] = []
+    unrelated["jobs"]["unrelated-marker-job"] = {
+        "steps": [{"run": "verify_release_artifacts.py desktop --platform windows"}],
+    }
+    check.expect(
+        not workflow_has_artifact_verification(unrelated),
+        "package checks in unrelated jobs do not satisfy the release gate",
+    )
+    missing_publish_dependency = copy.deepcopy(doc)
+    missing_publish_dependency["jobs"][PUBLISH_JOB_ID]["needs"] = [
+        need
+        for need in missing_publish_dependency["jobs"][PUBLISH_JOB_ID]["needs"]
+        if need != "verify-release-artifacts"
+    ]
+    check.expect(
+        not workflow_has_artifact_verification(missing_publish_dependency),
+        "publishing must depend on the aggregate artifact verification job",
+    )
+    path_with_spaces = shell_path(Path("C:/Temp/release gate/trace.log"))
+    check.expect(
+        "release gate" in path_with_spaces
+        and path_with_spaces.startswith("'")
+        and path_with_spaces.endswith("'"),
+        "converted temporary paths are shell-quoted when they contain spaces",
     )
 
     commit = "cafebabedeadbeef0123456789abcdef01234567"

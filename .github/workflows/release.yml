@@ -444,19 +444,21 @@ jobs:
         with:
           path: artifacts
       - name: Install release-gate dependencies
-        run: python3 -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.2
+        run: |
+          python3 -m venv .release-gate-venv
+          .release-gate-venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.2
       - name: Test artifact verifier
-        run: python3 .github/scripts/test_verify_release_artifacts.py
+        run: .release-gate-venv/bin/python .github/scripts/test_verify_release_artifacts.py
       - name: Check every archive has the expected package structure
         run: |
           set -euo pipefail
           mapfile -t archives < <(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) | sort)
           test "${#archives[@]}" -gt 0
           for archive in "${archives[@]}"; do
-            python3 .github/scripts/verify_release_artifacts.py structure --platform generic --archive "$archive"
+            .release-gate-venv/bin/python .github/scripts/verify_release_artifacts.py structure --platform generic --archive "$archive"
           done
       - name: Run release-gate regression
-        run: python3 .github/scripts/check_release_gate.py
+        run: .release-gate-venv/bin/python .github/scripts/check_release_gate.py
 
   release:
     name: Publish Release
