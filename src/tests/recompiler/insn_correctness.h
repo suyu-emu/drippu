@@ -38,7 +38,10 @@ constexpr u32 kSvcPark = 0xD4000001u | (kInsnSvcImm << 5); // SVC #4
 // Guest layout used by recomp_stack_harness. One 4KiB page after the ADD bench.
 constexpr u64 kOffInsn = 0x4000;
 constexpr u64 kInsnStride = 0x80;
-constexpr int kInsnBlockCount = 14;
+// Branch probes end their conditional instruction at the final word of each
+// stride. Their fall-through PC is therefore the next registered block start,
+// keeping both directions on compiled AOT blocks instead of Dynarmic gaps.
+constexpr int kInsnBlockCount = 19;
 
 enum class Kind : int {
     Add64 = 1,
@@ -147,11 +150,12 @@ constexpr u32 EncBCond(u32 cond, s32 imm19) {
 }
 
 // Word displacement between two ReferenceBlocks, for branch encodings.
-// Branch targets must land exactly on a registered block start: the stack
-// harness dispatcher's Lookup only resolves stride-aligned PCs, so a branch
-// to any other PC would fall back to Dynarmic instead of staying in AOT.
+// The conditional branch occupies the final word in the source stride. Its
+// fall-through (PC + 4) is the next registered block start, while the target
+// is another stride-aligned block.
 constexpr s32 BranchWords(int from_block, int to_block) {
-    return static_cast<s32>((to_block - from_block) * (kInsnStride / 4));
+    return static_cast<s32>((to_block - from_block) * (kInsnStride / 4) -
+                            (kInsnStride / 4 - 1));
 }
 
 constexpr u32 EncLogicalShifted(bool sf, u32 opc, bool invert, u32 rd, u32 rn, u32 rm, u32 shift,
@@ -174,6 +178,8 @@ constexpr u32 EncMovWide(u32 opc, bool sf, u32 hw, u32 imm16, u32 rd) {
     return (sf ? 0x80000000u : 0) | ((opc & 3) << 29) | 0x12800000u | ((hw & 3) << 21) |
            ((imm16 & 0xFFFF) << 5) | rd;
 }
+
+constexpr u32 kNop = 0xD503201Fu;
 
 constexpr u32 EncAddImm(bool sf, bool sub, bool setflags, u32 rd, u32 rn, u32 imm12) {
     return (sf ? 0x80000000u : 0) | (sub ? 0x40000000u : 0) | (setflags ? 0x20000000u : 0) |
@@ -266,6 +272,20 @@ inline std::vector<RefBlock> ReferenceBlocks() {
         v.push_back(kSvcPark);
         return v;
     };
+    auto branch = [](u32 insn) {
+        std::vector<u32> v(kInsnStride / 4 - 1, kNop);
+        v.push_back(insn);
+        return v;
+    };
+    auto branch_pair = [](u32 setup, u32 insn) {
+        std::vector<u32> v(kInsnStride / 4 - 2, kNop);
+        v.push_back(setup);
+        v.push_back(insn);
+        return v;
+    };
+    auto marker = [&](u32 reg, u32 value) {
+        return park({EncMovWide(2, true, 0, value, reg)});
+    };
     return {
         {"alu", kOffInsn + 0 * kInsnStride,
          park({
@@ -348,25 +368,27 @@ inline std::vector<RefBlock> ReferenceBlocks() {
              EncLogicalShifted(true, 3, false, 0, 1, 2, 1, 7), // ANDS X0,X1,X2,LSR#7
              EncLogicalShifted(true, 3, true, 3, 1, 2, 3, 13),  // BICS X3,X1,X2,ROR#13
          })},
-        // P0: conditional branches. Each branch block's taken target is the
-        // shared b_taken block (index 13); the fallthrough parks in the branch
-        // block itself. Taken and not-taken therefore park at different PCs,
-        // so a wrong direction fails the final state comparison in either
-        // case. Edge presets below force each direction deterministically.
+        // P0: conditional branches. The branch is the final instruction in
+        // each stride, so both target and PC+4 land on registered AOT blocks.
+        // Each direction writes a marker before parking, making a wrong
+        // direction observable without relying on a fallback PC.
         {"b_cbz", kOffInsn + 8 * kInsnStride,
-         {EncCbz(false, true, 0, BranchWords(8, 13)), kSvcPark}},
-        {"b_cbnz", kOffInsn + 9 * kInsnStride,
-         {EncCbz(true, true, 0, BranchWords(9, 13)), kSvcPark}},
-        {"b_tbz", kOffInsn + 10 * kInsnStride,
-         {EncTbz(false, 0, 3, BranchWords(10, 13)), kSvcPark}},
-        {"b_tbnz", kOffInsn + 11 * kInsnStride,
-         {EncTbz(true, 0, 3, BranchWords(11, 13)), kSvcPark}},
-        {"b_beq", kOffInsn + 12 * kInsnStride,
-         {EncAddShiftedEx(true, true, true, 31, 0, 1, 0, 0), // SUBS XZR,X0,X1
-          EncBCond(0, BranchWords(12, 13) - 1),              // B.EQ -> b_taken
-          kSvcPark}},
-        {"b_taken", kOffInsn + 13 * kInsnStride,
-         {EncMovWide(2, true, 0, 0xB7, 11), kSvcPark}}, // MOVZ X11,#0xB7 marker
+         branch(EncCbz(false, true, 0, BranchWords(8, 18)))},
+        {"b_cbz_fallthrough", kOffInsn + 9 * kInsnStride, marker(10, 0xC1)},
+        {"b_cbnz", kOffInsn + 10 * kInsnStride,
+         branch(EncCbz(true, true, 0, BranchWords(10, 18)))},
+        {"b_cbnz_fallthrough", kOffInsn + 11 * kInsnStride, marker(10, 0xC2)},
+        {"b_tbz", kOffInsn + 12 * kInsnStride,
+         branch(EncTbz(false, 0, 3, BranchWords(12, 18)))},
+        {"b_tbz_fallthrough", kOffInsn + 13 * kInsnStride, marker(10, 0xC3)},
+        {"b_tbnz", kOffInsn + 14 * kInsnStride,
+         branch(EncTbz(true, 0, 3, BranchWords(14, 18)))},
+        {"b_tbnz_fallthrough", kOffInsn + 15 * kInsnStride, marker(10, 0xC4)},
+        {"b_beq", kOffInsn + 16 * kInsnStride,
+         branch_pair(EncAddShiftedEx(true, true, true, 31, 0, 1, 0, 0), // SUBS XZR,X0,X1
+                     EncBCond(0, BranchWords(16, 18)))},
+        {"b_beq_fallthrough", kOffInsn + 17 * kInsnStride, marker(10, 0xC5)},
+        {"b_taken", kOffInsn + 18 * kInsnStride, marker(11, 0xB7)},
     };
 }
 

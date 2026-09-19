@@ -1758,6 +1758,18 @@ void ScenarioInsnCorrectness(StackFixture& f) {
                  f.system.ApplicationMemory().Read32(pc), blocks[bi].insns.front());
         ExpectTrue(("AOT registered " + std::string(blocks[bi].name)).c_str(),
                    Lookup(pc) == g_block_insn[bi] && g_block_insn[bi] != nullptr);
+        const std::string_view name = blocks[bi].name;
+        if (name == "b_cbz" || name == "b_cbnz" || name == "b_tbz" || name == "b_tbnz" ||
+            name == "b_beq") {
+            ExpectEq((std::string(name) + " stride-sized AOT layout").c_str(),
+                     static_cast<u64>(blocks[bi].insns.size()),
+                     suyu::recomp::insn_test::kInsnStride / 4);
+            ExpectTrue((std::string(name) + " AOT fallthrough registered").c_str(),
+                       Lookup(pc + suyu::recomp::insn_test::kInsnStride) != nullptr);
+            ExpectTrue((std::string(name) + " AOT taken target registered").c_str(),
+                       Lookup(g_entry + suyu::recomp::insn_test::kOffInsn +
+                                  18 * suyu::recomp::insn_test::kInsnStride) != nullptr);
+        }
     }
 
     suyu::recomp::insn_test::XorShift64 rng(suyu::recomp::insn_test::RandomSeed());
@@ -1768,7 +1780,9 @@ void ScenarioInsnCorrectness(StackFixture& f) {
         FillThreadRegs(init, x);
         init.pc = g_entry + blk.offset;
         SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
+        const auto aot_metrics_before = Core::GetRecompExecutionMetrics();
         const InsnSnap aot = RunInsnBackend(f, g_entry + blk.offset, true, init);
+        const auto aot_metrics_after = Core::GetRecompExecutionMetrics();
         SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
         const InsnSnap dyn = RunInsnBackend(f, g_entry + blk.offset, false, init);
         if (!aot.halt_svc || !dyn.halt_svc) {
@@ -1796,6 +1810,35 @@ void ScenarioInsnCorrectness(StackFixture& f) {
         }
         if (aot.mem0 != dyn.mem0 || aot.mem8 != dyn.mem8) {
             Fail(std::string(tag) + " mem mismatch");
+        }
+        const std::string_view name = blk.name;
+        if (name == "b_cbz" || name == "b_cbnz" || name == "b_tbz" || name == "b_tbnz" ||
+            name == "b_beq") {
+            bool taken = false;
+            u64 fallthrough_marker = 0;
+            if (name == "b_cbz") {
+                taken = x[0] == 0;
+                fallthrough_marker = 0xC1;
+            } else if (name == "b_cbnz") {
+                taken = x[0] != 0;
+                fallthrough_marker = 0xC2;
+            } else if (name == "b_tbz") {
+                taken = (x[0] & (1ULL << 3)) == 0;
+                fallthrough_marker = 0xC3;
+            } else if (name == "b_tbnz") {
+                taken = (x[0] & (1ULL << 3)) != 0;
+                fallthrough_marker = 0xC4;
+            } else {
+                taken = x[0] == x[1];
+                fallthrough_marker = 0xC5;
+            }
+            const u64 marker = Gpr(aot.ctx, taken ? 11 : 10);
+            ExpectEq((std::string(tag) + " branch marker").c_str(), marker,
+                     taken ? 0xB7 : fallthrough_marker);
+            ExpectEq((std::string(tag) + " AOT branch fallback lookup delta").c_str(),
+                     aot_metrics_after.fallback_lookup_miss -
+                         aot_metrics_before.fallback_lookup_miss,
+                     0);
         }
     };
 
