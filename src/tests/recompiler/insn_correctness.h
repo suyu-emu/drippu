@@ -366,7 +366,7 @@ inline std::vector<RefBlock> ReferenceBlocks() {
           EncBCond(0, BranchWords(12, 13) - 1),              // B.EQ -> b_taken
           kSvcPark}},
         {"b_taken", kOffInsn + 13 * kInsnStride,
-         {EncMovWide(2, true, 11, 0xB7, 0), kSvcPark}}, // MOVZ X11,#0xB7 marker
+         {EncMovWide(2, true, 0, 0xB7, 11), kSvcPark}}, // MOVZ X11,#0xB7 marker
     };
 }
 
