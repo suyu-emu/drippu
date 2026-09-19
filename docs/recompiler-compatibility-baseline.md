@@ -34,13 +34,17 @@ Build the full-tree target, then run:
 python3 scripts/recompiler_compat_baseline.py \
   --harness build/bin/recomp_stack_harness \
   --output recomp-compat-baseline.json \
-  --iterations 32
+  --iterations 32 \
+  --timeout-seconds 60
 ```
 
-The command always writes JSON, including when the harness fails. A non-zero
-exit status means a workload marker was missing or the harness returned a
-failure. Use `--setting key=value` for any run-specific setting that must be
-recorded. The workflow uploads the JSON as the
+The runner captures repository provenance before starting the harness. It
+launches the harness in a separate process group, sends a graceful termination
+on timeout, then kills the full group if needed. It always writes JSON,
+including when the harness times out; timeout is recorded in
+`command.timed_out` and `failures`. A non-zero exit status means a workload
+marker was missing, the harness returned a failure, or the timeout fired. Use
+`--setting key=value` for any run-specific setting that must be recorded. The workflow uploads the JSON as the
 `recompiler-compatibility-baseline` artifact.
 
 ## JSON record
