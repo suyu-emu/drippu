@@ -237,8 +237,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build glslang-tools
+      - name: Set up release keystore
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_B64" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEYSTORE_PASS" ]; then
+            echo "::error::Android release signing requires ANDROID_KEYSTORE_B64, ANDROID_KEY_ALIAS, and ANDROID_KEYSTORE_PASS."
+            exit 1
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$GITHUB_WORKSPACE/release.jks"
+          echo "ANDROID_KEYSTORE_FILE=$GITHUB_WORKSPACE/release.jks" >> "$GITHUB_ENV"
       - name: Build APKs
         working-directory: src/android
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ env.ANDROID_KEYSTORE_FILE }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
         run: |
           chmod +x gradlew
           ./gradlew assembleLegacyRelease assembleMainlineRelease assembleChromeOSRelease assembleGenshinSpoofRelease --stacktrace
@@ -248,9 +264,26 @@ jobs:
           find src/android -name '*.apk' -exec cp {} _pkg/ \;
       - name: Verify packaged Android APKs
         run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          DEBUG_CERT="9D09B2001BE0DDE93EA0444C536B72270FAB3EB1A2FCCFD56E1A3C46CC0D7AF1"
           for apk in _pkg/*.apk; do
             python3 .github/scripts/verify_release_artifacts.py apk --platform android --archive "$apk"
+            "$APKSIGNER" verify "$apk"
+            CERT=$("$APKSIGNER" verify --print-certs "$apk" | grep -i "SHA-256" | tr -d ':' | tr '[:lower:]' '[:upper:]')
+            echo "$apk certs: $CERT"
+            case "$CERT" in
+              *"$DEBUG_CERT"*)
+                echo "::error::$apk is signed with the debug key and cannot be distributed."
+                exit 1
+                ;;
+            esac
           done
+      - name: Remove release keystore
+        if: ${{ always() }}
+        run: |
+          if [ -n "${ANDROID_KEYSTORE_FILE:-}" ]; then
+            rm -f -- "$ANDROID_KEYSTORE_FILE"
+          fi
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v4
