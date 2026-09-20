@@ -59,6 +59,7 @@
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/hardware_properties.h"
 #include "core/file_sys/program_metadata.h"
@@ -71,6 +72,7 @@
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/memory.h"
+#include "core/perf_stats.h"
 #include "core/recompiler/arm64_to_c.h"
 #include "smoke_config.h"
 #include "tests/recompiler/insn_correctness.h"
@@ -2017,6 +2019,7 @@ struct ModeResult {
     u32 expected_svc{};
     u64 frame_events{};
     u64 frame_event_time_ns{};
+    double perf_stats_frametime_seconds{};
 };
 
 ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
