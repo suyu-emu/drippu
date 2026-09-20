@@ -11,11 +11,16 @@ def fail(message: str) -> None:
 
 
 def validate_mode(mode: dict, name: str, backend: str, minimum_iterations: int) -> None:
+    if mode.get("backend") != backend:
+        fail(f"{name}: backend label does not match execution backend {backend}")
     if mode.get("execution_backend") != backend:
         fail(f"{name}: expected backend {backend}")
     slices = mode.get("slices", {})
     if int(slices.get("count", 0)) < minimum_iterations:
         fail(f"{name}: too few slice samples")
+    for key in ("first_ns", "median_ns", "p95_ns"):
+        if int(slices.get(key, 0)) <= 0:
+            fail(f"{name}: missing positive slice metric {key}")
     if int(mode.get("startup_ns", 0)) <= 0:
         fail(f"{name}: missing startup timing")
     events = mode.get("frame_events", {})
@@ -28,9 +33,28 @@ def validate_mode(mode: dict, name: str, backend: str, minimum_iterations: int) 
         fail(f"{name}: x0 correctness mismatch")
     if correctness.get("svc") != correctness.get("expected_svc"):
         fail(f"{name}: SVC correctness mismatch")
+    generated = mode.get("generated_binary", {})
+    if not isinstance(generated, dict):
+        fail(f"{name}: missing generated binary size proxy")
+    if backend == "hybrid_aot":
+        if int(generated.get("aot_so_bytes", 0)) <= 0 or int(
+            generated.get("bench_generated_c_bytes", 0)
+        ) <= 0:
+            fail(f"{name}: missing AOT generated size proxies")
+        if mode.get("compile_ns") is not None or mode.get("compile_ns_scope") != "shared_aggregate":
+            fail(f"{name}: AOT compile time must be an explicit shared aggregate")
+    elif "jit_rss_delta_after_first_slice_bytes" not in generated:
+        fail(f"{name}: missing JIT generated size proxy")
     metrics = mode.get("execution_metrics_delta", {})
     if "backends" not in metrics or "transitions" not in metrics or "fallback_reasons" not in metrics:
         fail(f"{name}: incomplete execution metrics")
+    backend_metrics = metrics.get("backends", {})
+    aot_blocks = int(backend_metrics.get("aot", {}).get("block_executions", 0))
+    dynarmic_slices = int(backend_metrics.get("dynarmic", {}).get("run_slices", 0))
+    if backend == "hybrid_aot" and (aot_blocks <= 0 or dynarmic_slices != 0):
+        fail(f"{name}: AOT execution path was not isolated")
+    if backend == "jit" and (dynarmic_slices <= 0 or aot_blocks != 0):
+        fail(f"{name}: JIT execution path was not isolated")
 
 
 def main() -> int:
@@ -95,7 +119,14 @@ def main() -> int:
     aggregate = result.get("aot_compile", {})
     if aggregate.get("scope") != "shared_aot_image" or aggregate.get("per_workload") != "unavailable":
         fail("AOT compile scope must be an explicit shared aggregate")
-    for key in ("translate_ns", "cmake_configure_ns", "cmake_build_ns", "dlopen_ns", "so_bytes"):
+    for key in (
+        "translate_ns",
+        "bench_translate_ns",
+        "cmake_configure_ns",
+        "cmake_build_ns",
+        "dlopen_ns",
+        "so_bytes",
+    ):
         if int(aggregate.get(key, 0)) <= 0:
             fail(f"missing shared AOT aggregate {key}")
     print(f"validated {len(workloads)} representative workloads")
