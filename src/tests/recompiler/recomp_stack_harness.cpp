@@ -26,7 +26,9 @@
 // generated in this test and contains no firmware, keys, or copyrighted data.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <regex>
@@ -41,6 +43,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #ifndef _WIN32
@@ -56,6 +59,7 @@
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/hardware_properties.h"
 #include "core/file_sys/program_metadata.h"
@@ -68,6 +72,7 @@
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/memory.h"
+#include "core/perf_stats.h"
 #include "core/recompiler/arm64_to_c.h"
 #include "smoke_config.h"
 #include "tests/recompiler/insn_correctness.h"
@@ -89,7 +94,7 @@ void Pass(const std::string& msg) {
     std::cout << "PASS: " << msg << std::endl;
 }
 
-void ExpectEq(const char* name, u64 got, u64 want) {
+void ExpectEq(const std::string& name, u64 got, u64 want) {
     if (got != want) {
         Fail(std::string(name) + ": got=" + std::to_string(got) + " want=" + std::to_string(want));
     } else {
@@ -97,7 +102,7 @@ void ExpectEq(const char* name, u64 got, u64 want) {
     }
 }
 
-void ExpectTrue(const char* name, bool cond) {
+void ExpectTrue(const std::string& name, bool cond) {
     if (!cond) {
         Fail(std::string(name) + " was false");
     } else {
@@ -1996,6 +2001,7 @@ nlohmann::json SliceStatsToJson(const SliceStats& s) {
 
 struct ModeResult {
     const char* id = "";
+    const char* backend = "";
     const char* description = "";
     SliceStats slices{};
     u64 startup_ns{};
@@ -2009,11 +2015,19 @@ struct ModeResult {
     Core::RecompExecutionMetrics exec{};
     u64 hm_load_calls{};
     u64 hm_store_calls{};
+    u64 expected_x0{};
+    u32 expected_svc{};
+    u64 frame_events{};
+    u64 frame_event_time_ns{};
+    double perf_stats_frametime_seconds{};
 };
 
 ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
     ModeResult r;
     r.id = hybrid_aot ? "hybrid_aot" : "jit";
+    r.backend = hybrid_aot ? "hybrid_aot" : "jit";
+    r.expected_x0 = kBenchAdds;
+    r.expected_svc = kBenchSvcImm;
     r.description = hybrid_aot
                         ? "ArmRecomp Translate AOT lookup hit; Dynarmic fallback must not run"
                         : "ArmRecomp force-miss of the same PC; Dynarmic executes guest RX";
@@ -2034,9 +2048,14 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         ctx.r[3] = g_entry + kOffBenchScratch;
         f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
 
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto frame_t0 = std::chrono::steady_clock::now();
+        f.system.GetPerfStats().BeginSystemFrame();
+        const auto slice_t0 = std::chrono::steady_clock::now();
         const auto hr = f.arm->RunThread(f.thread);
-        const u64 ns = NsSince(t0);
+        const u64 ns = NsSince(slice_t0);
+        f.system.GetPerfStats().EndSystemFrame();
+        ++r.frame_events;
+        r.frame_event_time_ns += NsSince(frame_t0);
         times.push_back(ns);
         if (i == 0) {
             r.mem_after_first = ReadMem();
@@ -2083,7 +2102,7 @@ nlohmann::json ModeToJson(const ModeResult& r) {
     const std::int64_t rss_first_delta = static_cast<std::int64_t>(r.mem_after_first.vmrss_kb) -
                                 static_cast<std::int64_t>(r.mem_before.vmrss_kb);
     nlohmann::json generated;
-    if (std::string_view(r.id) == "hybrid_aot") {
+    if (std::string_view(r.backend) == "hybrid_aot") {
         generated = {
             {"aot_so_bytes", g_aot_compile.so_bytes},
             {"aot_so_path", g_aot_compile.so_path},
@@ -2099,15 +2118,21 @@ nlohmann::json ModeToJson(const ModeResult& r) {
         };
     }
     return {
-        {"backend", r.id},
+        {"backend", r.backend},
+        {"execution_backend", r.backend},
         {"description", r.description},
         {"slices", SliceStatsToJson(r.slices)},
         {"startup_ns", r.startup_ns},
-        {"compile_ns", r.compile_ns},
+        {"compile_ns", std::string_view(r.backend) == "hybrid_aot"
+                           ? nlohmann::json(nullptr)
+                           : nlohmann::json(r.compile_ns)},
         {"compile_ns_meaning",
-         std::string_view(r.id) == "hybrid_aot"
-             ? "AOT Translate + cmake configure/build of libstack_aot.so + dlopen"
+         std::string_view(r.backend) == "hybrid_aot"
+             ? "unavailable per workload; see top-level aot_compile shared aggregate"
              : "approx first-JIT compile: first_slice_ns - median_ns"},
+        {"compile_ns_scope", std::string_view(r.backend) == "hybrid_aot"
+                                 ? "shared_aggregate"
+                                 : "workload"},
         {"memory",
          {{"sampler", "/proc/self/status"},
           {"rss_kb_before", r.mem_before.vmrss_kb},
@@ -2121,9 +2146,14 @@ nlohmann::json ModeToJson(const ModeResult& r) {
          {{"x0", r.x0},
           {"svc", r.svc},
           {"halt_supervisor_call", r.halt_svc},
-          {"expected_x0", kBenchAdds},
-          {"expected_svc", kBenchSvcImm}}},
+          {"expected_x0", r.expected_x0},
+          {"expected_svc", r.expected_svc}}},
         {"execution_metrics_delta", MetricsToJson(r.exec)},
+        {"frame_events",
+         {{"count", r.frame_events},
+          {"wall_time_ns", r.frame_event_time_ns},
+          {"source", "Core::PerfStats BeginSystemFrame/EndSystemFrame event boundary"},
+          {"note", "Standalone harness has no renderer/display; these are explicit emulated frame-event boundaries, not renamed RunThread slices."}}},
         {"host_mem_callbacks",
          {{"load", r.hm_load_calls},
           {"store", r.hm_store_calls},
@@ -2132,12 +2162,14 @@ nlohmann::json ModeToJson(const ModeResult& r) {
     };
 }
 
+void AddRepresentativeWorkloads(nlohmann::json& doc, StackFixture& f, int iters);
+
 void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const ModeResult& jit,
-                         int iters) {
+                         int iters, StackFixture& f) {
     const int before = g_fails;
     std::ostringstream entry_pc;
     entry_pc << "0x" << std::hex << (g_entry + kOffBench);
-    const nlohmann::json doc{
+    nlohmann::json doc{
         {"schema_version", 1},
         {"kind", "recomp_benchmark"},
         {"clock", "steady_clock"},
@@ -2173,7 +2205,9 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"expected_svc", kBenchSvcImm},
           {"iters", iters}}},
         {"aot_compile",
-         {{"translate_ns", g_aot_compile.translate_ns},
+         {{"scope", "shared_aot_image"},
+          {"per_workload", "unavailable"},
+          {"translate_ns", g_aot_compile.translate_ns},
           {"bench_translate_ns", g_aot_compile.bench_translate_ns},
           {"cmake_configure_ns", g_aot_compile.cmake_configure_ns},
           {"cmake_build_ns", g_aot_compile.cmake_build_ns},
@@ -2206,6 +2240,7 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
             {"excerpt", g_aot_compile.disasm_excerpt}}}}},
         {"modes", {{"hybrid_aot", ModeToJson(aot)}, {"jit", ModeToJson(jit)}}},
     };
+    AddRepresentativeWorkloads(doc, f, std::max(4, std::min(iters, 16)));
 
     if (path.has_parent_path()) {
         fs::create_directories(path.parent_path());
@@ -2239,6 +2274,110 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
     std::cout << "recomp_benchmark.json path: " << path << "\n";
     std::cout << "=== recomp_benchmark.json ===\n" << json << std::endl;
     ScenarioPass("JIT vs hybrid AOT benchmark JSON from identical guest fixture", before);
+}
+
+// Keep a small suite of workloads alongside the anti-folding ALU/memory loop.
+// These are deliberately self-contained guest blocks already used by the
+// integration scenarios: a TLS/SVC transition and a minimal compute/SVC
+// workload exercise different transition and state-marshalling paths while
+// remaining deterministic on every host.
+ModeResult RunRepresentativeWorkload(StackFixture& f, const char* id, const char* description,
+                                     u64 pc, u64 expected_x0, u32 expected_svc, int iters,
+                                     bool tls, bool force_miss) {
+    ModeResult r;
+    r.id = id;
+    r.backend = force_miss ? "jit" : "hybrid_aot";
+    r.description = description;
+    r.expected_x0 = expected_x0;
+    r.expected_svc = expected_svc;
+    g_force_miss_pc = force_miss ? pc : 0;
+    const auto before = Core::GetRecompExecutionMetrics();
+    r.mem_before = ReadMem();
+    std::vector<u64> times;
+    times.reserve(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
+        auto& ctx = f.thread->GetContext();
+        ctx = {};
+        ctx.pc = pc;
+        if (tls) {
+            ctx.r[4] = g_entry + kOffCrossPage;
+        }
+        f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+        if (tls) {
+            // LoadContext publishes the thread's TPIDRRO. Set the test value
+            // afterwards so the generated MRS observes it, exactly as the
+            // production context-switch contract requires.
+            f.arm->SetTpidrroEl0(0xC0FFEE);
+        }
+        const auto frame_t0 = std::chrono::steady_clock::now();
+        f.system.GetPerfStats().BeginSystemFrame();
+        const auto slice_t0 = std::chrono::steady_clock::now();
+        const auto hr = f.arm->RunThread(f.thread);
+        const u64 ns = NsSince(slice_t0);
+        f.system.GetPerfStats().EndSystemFrame();
+        times.push_back(ns);
+        ++r.frame_events;
+        r.frame_event_time_ns += NsSince(frame_t0);
+        r.halt_svc = r.halt_svc || True(hr & Core::HaltReason::SupervisorCall);
+        r.svc = f.arm->GetSvcNumber();
+        Kernel::Svc::ThreadContext out{};
+        f.arm->GetContext(out);
+        r.x0 = out.r[0];
+        if (tls) {
+            if (out.r[1] != expected_x0 || out.r[3] != 0xC0FFEE ||
+                f.system.ApplicationMemory().Read64(g_entry + kOffCrossPage) != 0xABCD) {
+                Fail(std::string(id) + " TLS/cross-page effects mismatch");
+            }
+        }
+        if (i == 0) {
+            r.mem_after_first = ReadMem();
+        }
+        if (!True(hr & Core::HaltReason::SupervisorCall) || r.svc != expected_svc ||
+            r.x0 != expected_x0) {
+            Fail(std::string(id) + " result mismatch");
+        }
+    }
+    g_force_miss_pc = 0;
+    r.perf_stats_frametime_seconds =
+        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
+    r.mem_after = ReadMem();
+    r.slices = SummarizeSlices(std::move(times));
+    r.startup_ns = r.slices.first_ns;
+    r.compile_ns = r.slices.first_ns > r.slices.median_ns
+                       ? r.slices.first_ns - r.slices.median_ns
+                       : 0;
+    r.exec = MetricsDelta(Core::GetRecompExecutionMetrics(), before);
+    return r;
+}
+
+void AddRepresentativeWorkloads(nlohmann::json& doc, StackFixture& f, int iters) {
+    nlohmann::json suite = nlohmann::json::object();
+    for (const auto& spec : std::array{
+             std::tuple{"tls_svc", "TLS register and cross-page store followed by SVC", kOffTlsSvc,
+                        u64{0x1234}, u32{42}, true},
+             std::tuple{"plain_svc", "minimal MOVZ plus SVC transition", kOffPlain, u64{7},
+                        u32{1}, false},
+         }) {
+        const auto [id, description, off, expected_x0, expected_svc, tls] = spec;
+        // AOT first, then force the identical PC through Dynarmic. Both modes
+        // therefore report real RunThread timings for the same guest bytes.
+        auto aot = RunRepresentativeWorkload(f, id, description, g_entry + off, expected_x0,
+                                             expected_svc, iters, tls, false);
+        const std::string jit_id = std::string(id) + "_jit";
+        auto jit = RunRepresentativeWorkload(f, jit_id.c_str(), description, g_entry + off,
+                                             expected_x0, expected_svc, iters, tls, true);
+        ExpectTrue(std::string(id) + " AOT blocks", aot.exec.aot_block_executions >=
+                                                     static_cast<u64>(iters));
+        ExpectEq(std::string(id) + " AOT no JIT", aot.exec.dynarmic_run_slices, 0);
+        ExpectTrue(std::string(id) + " JIT slices", jit.exec.dynarmic_run_slices >=
+                                                     static_cast<u64>(iters));
+        ExpectEq(std::string(id) + " JIT no AOT", jit.exec.aot_block_executions, 0);
+        suite[id] = {{"description", description},
+                     {"iters", iters},
+                     {"aot", ModeToJson(aot)},
+                     {"jit", ModeToJson(jit)}};
+    }
+    doc["representative_workloads"] = std::move(suite);
 }
 
 void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
@@ -2295,7 +2434,7 @@ void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
     ExpectEq("both modes x0", aot.x0, jit.x0);
     ExpectEq("both modes svc", static_cast<u64>(aot.svc), static_cast<u64>(jit.svc));
 
-    ExportBenchmarkJson(json_path, aot, jit, iters);
+    ExportBenchmarkJson(json_path, aot, jit, iters, f);
     ScenarioPass("identical JIT vs hybrid AOT workload (slice/startup/compile/memory/size)",
                  before);
 }

@@ -50,6 +50,8 @@ jobs:
         run: cmake --build build --target tests recomp_stack_harness -j4
       - name: Run tests
         working-directory: build
+        env:
+          SUYU_RECOMP_BENCHMARK_JSON: ${{ github.workspace }}/recomp_benchmark.json
         run: |
           set -euo pipefail
           # Do not use Catch2 -s: it dumps millions of PASSED lines (RingBuffer)
@@ -67,6 +69,14 @@ jobs:
           echo '=== recomp_stack_harness ==='
           timeout --foreground --kill-after=10s 60s \
             stdbuf -oL -eL ./bin/recomp_stack_harness
+      - name: Validate and upload recompiler benchmark baseline
+        run: |
+          python3 scripts/compare_recomp_benchmark.py recomp_benchmark.json \
+            --baseline src/tests/recompiler/benchmarks/recomp_benchmark_baseline.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recomp-benchmark-baseline
+          path: recomp_benchmark.json
 
   tests-sanitizer:
     name: Linux x86-64 sanitizers
