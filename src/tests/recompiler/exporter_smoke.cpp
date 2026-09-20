@@ -242,6 +242,16 @@ int CmakeBuild(const fs::path& src, const fs::path& build, const char* target,
                bool iso_c11) {
     std::vector<std::string> cfg{SUYU_SMOKE_CMAKE, "-S", src.string(), "-B",
                                  build.string(), "-DCMAKE_BUILD_TYPE=Release"};
+    // Forward the parent sanitizer configuration into each generated project.
+    // An empty value deliberately adds no cache entries for normal smoke runs.
+    const char* sanitizer_flags = SUYU_SMOKE_SANITIZER_FLAGS;
+    if (sanitizer_flags && sanitizer_flags[0] != '\0') {
+        const std::string flags{sanitizer_flags};
+        cfg.push_back("-DCMAKE_C_FLAGS=" + flags);
+        cfg.push_back("-DCMAKE_CXX_FLAGS=" + flags);
+        cfg.push_back("-DCMAKE_EXE_LINKER_FLAGS=" + flags);
+        cfg.push_back("-DCMAKE_SHARED_LINKER_FLAGS=" + flags);
+    }
     const std::string gen = SUYU_SMOKE_GENERATOR;
     if (!gen.empty()) {
         cfg.push_back("-G");

@@ -100,11 +100,26 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build-recomp-san --output-on-failure
-      - name: ARM64 sanitizer gap
+
+  tests-sanitizer-arm64:
+    name: Linux ARM64 sanitizers
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host arch
+        run: test "$(uname -m)" = aarch64
+      - name: Configure recompiler tests (ASan+UBSan)
         run: |
-          echo "This job is ubuntu-24.04 (x86-64). No ARM64 runner is configured"
-          echo "in this workflow; do not treat a green x86-64 sanitizer job as"
-          echo "ARM64 sanitizer coverage. Full-tree recomp_stack_harness under"
-          echo "sanitizers: cmake -DYUZU_ENABLE_SANITIZERS=ON -DYUZU_TESTS=ON ..."
-          echo "then ctest -R recomp_stack_harness with ASAN_OPTIONS=detect_leaks=0"
-          echo "(the harness intentionally leaks the System fixture)."
+          cmake -S src/tests/recompiler -B build-recomp-san \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSUYU_ENABLE_SANITIZERS=ON \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++
+      - name: Build
+        run: cmake --build build-recomp-san -j2
+      - name: Run exporter_smoke + homebrew_harness (insn correctness)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-recomp-san --output-on-failure

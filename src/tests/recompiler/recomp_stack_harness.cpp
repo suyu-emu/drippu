@@ -891,6 +891,13 @@ void recomp_set_flags(GuestContext* c,int is_sub,uint64_t a,uint64_t b,uint64_t 
     if(is_sub){ c->c=(a>=b); c->v=(((a^b)&(a^r))&s)?1:0; }
     else { c->c=(r<a); c->v=((~(a^b)&(a^r))&s)?1:0; }
 }
+int recomp_cond(GuestContext* c,unsigned cond){
+    int n=c->n,z=c->z,cc=c->c,v=c->v,res;
+    switch(cond>>1){case 0:res=z;break;case 1:res=cc;break;case 2:res=n;break;
+    case 3:res=v;break;case 4:res=cc&&!z;break;case 5:res=(n==v);break;
+    case 6:res=(n==v)&&!z;break;default:res=1;}
+    return ((cond&1)&&cond!=15)?!res:res;
+}
 uint64_t recomp_umulh(uint64_t a,uint64_t b){
     uint64_t al=a&0xFFFFFFFFULL, ah=a>>32, bl=b&0xFFFFFFFFULL, bh=b>>32;
     uint64_t ll=al*bl, lh=al*bh, hl=ah*bl, hh=ah*bh;
@@ -1758,6 +1765,18 @@ void ScenarioInsnCorrectness(StackFixture& f) {
                  f.system.ApplicationMemory().Read32(pc), blocks[bi].insns.front());
         ExpectTrue(("AOT registered " + std::string(blocks[bi].name)).c_str(),
                    Lookup(pc) == g_block_insn[bi] && g_block_insn[bi] != nullptr);
+        const std::string_view name = blocks[bi].name;
+        if (name == "b_cbz" || name == "b_cbnz" || name == "b_tbz" || name == "b_tbnz" ||
+            name == "b_beq") {
+            ExpectEq((std::string(name) + " stride-sized AOT layout").c_str(),
+                     static_cast<u64>(blocks[bi].insns.size()),
+                     suyu::recomp::insn_test::kInsnStride / 4);
+            ExpectTrue((std::string(name) + " AOT fallthrough registered").c_str(),
+                       Lookup(pc + suyu::recomp::insn_test::kInsnStride) != nullptr);
+            ExpectTrue((std::string(name) + " AOT taken target registered").c_str(),
+                       Lookup(g_entry + suyu::recomp::insn_test::kOffInsn +
+                                  18 * suyu::recomp::insn_test::kInsnStride) != nullptr);
+        }
     }
 
     suyu::recomp::insn_test::XorShift64 rng(suyu::recomp::insn_test::RandomSeed());
@@ -1768,7 +1787,9 @@ void ScenarioInsnCorrectness(StackFixture& f) {
         FillThreadRegs(init, x);
         init.pc = g_entry + blk.offset;
         SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
+        const auto aot_metrics_before = Core::GetRecompExecutionMetrics();
         const InsnSnap aot = RunInsnBackend(f, g_entry + blk.offset, true, init);
+        const auto aot_metrics_after = Core::GetRecompExecutionMetrics();
         SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
         const InsnSnap dyn = RunInsnBackend(f, g_entry + blk.offset, false, init);
         if (!aot.halt_svc || !dyn.halt_svc) {
@@ -1781,8 +1802,9 @@ void ScenarioInsnCorrectness(StackFixture& f) {
                  " dyn=" + std::to_string(dyn.svc));
         }
         SameGprsNzcv(aot.ctx, dyn.ctx, tag);
-        if (std::string_view(blk.name) == "logic_flags") {
-            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS write C=V=0.
+        if (std::string_view(blk.name) == "logic_flags" ||
+            std::string_view(blk.name) == "p0_logic_flags") {
+            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS/BICS write C=V=0.
             // This fails if AOT left those bits stale even when N/Z match.
             if ((Nzcv(aot.ctx) & 0x30000000u) != 0) {
                 Fail(std::string(tag) + " AOT ANDS left C/V stale nzcv=" +
@@ -1795,6 +1817,35 @@ void ScenarioInsnCorrectness(StackFixture& f) {
         }
         if (aot.mem0 != dyn.mem0 || aot.mem8 != dyn.mem8) {
             Fail(std::string(tag) + " mem mismatch");
+        }
+        const std::string_view name = blk.name;
+        if (name == "b_cbz" || name == "b_cbnz" || name == "b_tbz" || name == "b_tbnz" ||
+            name == "b_beq") {
+            bool taken = false;
+            u64 fallthrough_marker = 0;
+            if (name == "b_cbz") {
+                taken = x[0] == 0;
+                fallthrough_marker = 0xC1;
+            } else if (name == "b_cbnz") {
+                taken = x[0] != 0;
+                fallthrough_marker = 0xC2;
+            } else if (name == "b_tbz") {
+                taken = (x[0] & (1ULL << 3)) == 0;
+                fallthrough_marker = 0xC3;
+            } else if (name == "b_tbnz") {
+                taken = (x[0] & (1ULL << 3)) != 0;
+                fallthrough_marker = 0xC4;
+            } else {
+                taken = x[0] == x[1];
+                fallthrough_marker = 0xC5;
+            }
+            const u64 marker = Gpr(aot.ctx, taken ? 11 : 10);
+            ExpectEq((std::string(tag) + " branch marker").c_str(), marker,
+                     taken ? 0xB7 : fallthrough_marker);
+            ExpectEq((std::string(tag) + " AOT branch fallback lookup delta").c_str(),
+                     aot_metrics_after.fallback_lookup_miss -
+                         aot_metrics_before.fallback_lookup_miss,
+                     0);
         }
     };
 
@@ -1821,6 +1872,16 @@ void ScenarioInsnCorrectness(StackFixture& f) {
             edge[1] = 0x8000000000000000ULL;
             edge[2] = 1;
         }
+        if (std::string_view(blk.name) == "b_cbz" || std::string_view(blk.name) == "b_tbz") {
+            edge[0] = 0; // taken: CBZ X0==0, TBZ bit 3 clear
+        } else if (std::string_view(blk.name) == "b_cbnz") {
+            edge[0] = 1; // taken: CBNZ X0!=0
+        } else if (std::string_view(blk.name) == "b_tbnz") {
+            edge[0] = 8; // taken: TBNZ bit 3 set
+        } else if (std::string_view(blk.name) == "b_beq") {
+            edge[0] = 0x1234;
+            edge[1] = 0x1234; // taken: X0==X1
+        }
         one(blk, edge, (std::string(blk.name) + " edge").c_str());
 
         u64 wrap[32]{};
@@ -1833,6 +1894,17 @@ void ScenarioInsnCorrectness(StackFixture& f) {
             wrap[1] = g_entry + kOffInsnScratch;
             wrap[2] = ~0ULL;
             wrap[3] = 0xFF;
+        }
+        if (std::string_view(blk.name) == "b_cbz") {
+            wrap[0] = 1; // not-taken: CBZ X0!=0
+        } else if (std::string_view(blk.name) == "b_cbnz" ||
+                   std::string_view(blk.name) == "b_tbnz") {
+            wrap[0] = 0; // not-taken: CBNZ X0==0, TBNZ bit 3 clear
+        } else if (std::string_view(blk.name) == "b_tbz") {
+            wrap[0] = 8; // not-taken: TBZ bit 3 set
+        } else if (std::string_view(blk.name) == "b_beq") {
+            wrap[0] = 1;
+            wrap[1] = 2; // not-taken: X0!=X1
         }
         one(blk, wrap, (std::string(blk.name) + " wrap").c_str());
 
