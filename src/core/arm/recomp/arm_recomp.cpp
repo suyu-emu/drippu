@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -176,6 +177,80 @@ std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
 struct RecompProcessState {
     suyu::recomp::RecompICache icache;
     std::atomic<bool> execution_started{false};
+
+    // Invalidation is process-wide, while each ArmRecomp is per physical
+    // core.  A lookup can race an invalidation between returning its AOT
+    // function and calling it, so keep a tiny reader gate around generated
+    // execution.  The normal path is two atomics; writers serialize only
+    // while publishing an invalidation and wait for in-flight blocks to leave.
+    // Even epochs are quiescent; an odd epoch is a writer waiting/publishing.
+    // The generation check closes the ABA window where a reader observes
+    // false, gets delayed through a complete invalidation, then increments
+    // the active count and incorrectly executes its stale function pointer.
+    std::atomic<u64> invalidation_epoch{0};
+    std::atomic<u32> active_aot_executions{0};
+    std::mutex invalidation_lock;
+    std::mutex active_aot_wait_lock;
+    std::condition_variable active_aot_wait;
+
+    void MarkExecutionStarted() {
+        // Order the lifecycle transition with loader notifications. A range
+        // notification that wins this lock is still pre-execution; any later
+        // notification observes runtime execution and is retained.
+        if (execution_started.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::scoped_lock lock{invalidation_lock};
+        if (!execution_started.load(std::memory_order_relaxed)) {
+            execution_started.store(true, std::memory_order_release);
+        }
+    }
+
+    bool TryEnterAotExecution() {
+        const u64 epoch = invalidation_epoch.load(std::memory_order_seq_cst);
+        if (epoch & 1) {
+            return false;
+        }
+        active_aot_executions.fetch_add(1, std::memory_order_seq_cst);
+        if (invalidation_epoch.load(std::memory_order_seq_cst) != epoch) {
+            LeaveAotExecution();
+            return false;
+        }
+        return true;
+    }
+
+    void LeaveAotExecution() {
+        if (active_aot_executions.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+            active_aot_wait.notify_all();
+        }
+    }
+
+    std::unique_lock<std::mutex> BeginInvalidation() {
+        std::unique_lock lock{invalidation_lock};
+        invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
+        std::unique_lock wait_lock{active_aot_wait_lock};
+        active_aot_wait.wait(wait_lock,
+                             [this] { return active_aot_executions.load(std::memory_order_seq_cst) == 0; });
+        return lock;
+    }
+
+    std::unique_lock<std::mutex> BeginRangeInvalidation(bool fallback_present) {
+        std::unique_lock lock{invalidation_lock};
+        if (!fallback_present && !execution_started.load(std::memory_order_acquire)) {
+            return {};
+        }
+        // Keep the lifecycle decision and odd-epoch publication under one
+        // lock. A reader cannot start between the runtime check and the gate.
+        invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
+        std::unique_lock wait_lock{active_aot_wait_lock};
+        active_aot_wait.wait(wait_lock,
+                             [this] { return active_aot_executions.load(std::memory_order_seq_cst) == 0; });
+        return lock;
+    }
+
+    void EndInvalidation() {
+        invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
+    }
 };
 
 std::mutex g_process_states_lock;
@@ -1257,6 +1332,24 @@ struct ArmRecomp::Impl {
             g_counters.permanent_aot_reject.fetch_add(1, std::memory_order_relaxed);
         }
     }
+
+    // LookupAot runs before the generated function is called. Re-check under
+    // the process-wide reader gate so an invalidation racing that gap either
+    // waits for an in-flight block or sends this slice to Dynarmic.
+    bool TryEnterAot(u64 pc) {
+        if (!process_state->TryEnterAotExecution()) {
+            return false;
+        }
+        if (!icache.AllowsAotAt(pc)) {
+            process_state->LeaveAotExecution();
+            return false;
+        }
+        return true;
+    }
+
+    void LeaveAot() {
+        process_state->LeaveAotExecution();
+    }
 };
 
 ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
@@ -1399,7 +1492,6 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         LOG_ERROR(Core_ARM, "No recompiled code registered; cannot run thread");
         return HaltReason::BreakLoop;
     }
-
     impl->RefreshPageTable();
 
     HostRecompSession().EnsureModuleBasesRegistered(
@@ -1418,6 +1510,9 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
+    // Publish the runtime lifecycle only after loader/module setup has
+    // completed, but before the first LookupAot in this slice.
+    impl->process_state->MarkExecutionStarted();
     if (impl->in_fallback) {
         // PC may have moved (new scheduling slice, harness scenario, SVC
         // resume) onto covered AOT since we last ran the JIT. Check before
@@ -1593,12 +1688,20 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // The budget bounds that chain, and what is left of it afterwards says
         // how many blocks actually ran - without which every count here would
         // report chains rather than blocks.
+        if (!impl->TryEnterAot(impl->ctx.pc)) {
+            g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
+            if (!EnterFallback()) {
+                g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
+                return HaltReason::PrefetchAbort;
+            }
+            return RunFallback(thread);
+        }
         impl->ctx.chain_budget = impl->icache.AllowsAotChaining() ? kChainBudget : 0;
         {
             ScopedNs timer{g_counters.aot_time_ns};
-            impl->process_state->execution_started.store(true, std::memory_order_release);
             block(&impl->ctx);
         }
+        impl->LeaveAot();
         {
             const int spent = kChainBudget - impl->ctx.chain_budget;
             if (spent > 1) {
@@ -1663,6 +1766,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
+    impl->process_state->MarkExecutionStarted();
     // Same resume contract as RunThread: leftover pending_svc is from a prior
     // halt the kernel already serviced. A debugger step of a non-SVC AOT block
     // must not report SupervisorCall because that field was still set.
@@ -1697,12 +1801,20 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     // Do not honour a leftover chain budget from RunThread: a debugger step
     // must not race through a direct-call chain.
     impl->ctx.chain_budget = 0;
+    if (!impl->TryEnterAot(impl->ctx.pc)) {
+        g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
+        if (!EnterFallback()) {
+            g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
+            return HaltReason::PrefetchAbort;
+        }
+        return StepFallback(thread);
+    }
     g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
     {
         ScopedNs timer{g_counters.aot_time_ns};
-        impl->process_state->execution_started.store(true, std::memory_order_release);
         block(&impl->ctx);
     }
+    impl->LeaveAot();
 
     if (impl->ctx.halted == kHaltUnhandled) {
         impl->ctx.halted = 0;
@@ -1731,7 +1843,11 @@ void ArmRecomp::ClearInstructionCache() {
     // Permanent AOT reject: guest code may have changed under the image the
     // static pass translated. Further RunThread/StepThread must use the JIT.
     g_counters.clear_instruction_cache.fetch_add(1, std::memory_order_relaxed);
-    impl->NoteIcacheClear(false);
+    {
+        auto invalidation = impl->process_state->BeginInvalidation();
+        impl->NoteIcacheClear(false);
+        impl->process_state->EndInvalidation();
+    }
     impl->ctx.chain_budget = 0;
     if (impl->fallback) {
         impl->fallback->ClearInstructionCache();
@@ -1751,8 +1867,10 @@ void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
     // loader's protection notification is not evidence that guest bytes
     // changed. Once Dynarmic is live, retain only this affected range as a
     // JIT island; unrelated AOT entry PCs remain eligible.
-    if (impl->fallback || impl->process_state->execution_started.load(std::memory_order_acquire)) {
+    auto invalidation = impl->process_state->BeginRangeInvalidation(impl->fallback != nullptr);
+    if (invalidation.owns_lock()) {
         impl->icache.InvalidateRange(addr, size);
+        impl->process_state->EndInvalidation();
     }
     if (impl->fallback) {
         impl->fallback->InvalidateCacheRange(addr, size);

@@ -191,11 +191,11 @@ constexpr u64 kOffCoreDispatch = 0x2008; // TLS + safe GetCurrentProcessorNumber
 // 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
 constexpr u64 kOffBench = 0x2400;
 constexpr u64 kOffChainEntry = 0x3000;
-constexpr u64 kOffChainTarget = 0x4010;
+constexpr u64 kOffChainTarget = 0x5010;
 constexpr int kBenchAdds = 512;
 constexpr u32 kBenchSvcImm = 3;
-constexpr u64 kCodeBytes = 5 * Kernel::PageSize;
-constexpr u64 kImageBytes = 6 * Kernel::PageSize;
+constexpr u64 kCodeBytes = 6 * Kernel::PageSize;
+constexpr u64 kImageBytes = 7 * Kernel::PageSize;
 constexpr u64 kOffBenchScratch = kCodeBytes; // data-segment word STR/LDR bounce
 constexpr u64 kOffInsnScratch = kCodeBytes + 0x40;
 
@@ -1205,7 +1205,7 @@ void WriteGuestImage(std::vector<u8>& image) {
     }
     // Guest twin for the direct-chain regression: B reaches the target's
     // MOVZ/SVC bytes when the target is forced through Dynarmic.
-    put(kOffChainEntry, 0x14000404u); // B +0x1010 to kOffChainTarget
+    put(kOffChainEntry, 0x14000804u); // B +0x2010 to kOffChainTarget
     put(kOffChainTarget, kMovzX0Cafe);
     put(kOffChainTarget + 4, kSvc77);
     for (const auto& blk : suyu::recomp::insn_test::ReferenceBlocks()) {
@@ -2384,18 +2384,17 @@ void ScenarioRangeInvalidation(StackFixture& f) {
     const auto aot_hr = f.arm->RunThread(f.thread);
     ExpectTrue("range precondition AOT", True(aot_hr & Core::HaltReason::SupervisorCall));
 
-    // Reject just the page containing the benchmark block. The neighbouring
-    // plain_svc block remains statically executable and AllowsAot() stays true globally.
-    // Invalidate an instruction in the middle of the benchmark block. The
-    // page-conservative cache rejects the containing block, not just entries
-    // whose PC equals the changed byte.
-    f.arm->InvalidateCacheRange(g_entry + kOffBench + 4, 1);
+    // Invalidate a byte on the next page while the benchmark block starts on
+    // the preceding page. The page-conservative cache must reject the whole
+    // cross-page block, not just an entry whose PC equals the changed byte.
+    const u64 cross_page_code = g_entry + kOffBench + Kernel::PageSize + 4;
+    f.arm->InvalidateCacheRange(cross_page_code, 1);
     ExpectTrue("range invalidation preserves global AOT", recomp->AllowsAot());
     for (std::size_t i = 1; i < Core::Hardware::NUM_CPU_CORES; ++i) {
         if (auto* idle = f.process->GetArmInterface(i)) {
             // Invalidate through an otherwise idle core. The process-wide
             // cache must make the next core-0 lookup reject the stale block.
-            idle->InvalidateCacheRange(g_entry + kOffBench + 4, 1);
+            idle->InvalidateCacheRange(cross_page_code, 1);
             break;
         }
     }

@@ -50,9 +50,10 @@ public:
                 ? std::numeric_limits<std::uint64_t>::max()
                 : original_start + static_cast<std::uint64_t>(length);
         start = original_start & ~(page_size - 1);
-        // A compiled block can begin on the preceding page and cross into the
-        // modified page. Without block extent metadata, conservatively reject
-        // that preceding page too so stale cross-page AOT cannot survive.
+        // Generated blocks are split at page boundaries, but legacy/manual
+        // images may still contain a block that crosses into the modified
+        // page. Without block extent metadata for those images, conservatively
+        // reject the preceding page too so stale cross-page AOT cannot survive.
         if (start >= page_size) {
             start -= page_size;
         }
