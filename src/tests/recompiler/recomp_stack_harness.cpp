@@ -410,34 +410,53 @@ DisasmCounts CountBlockBenchOps(const std::string& fn) {
         if (colon == std::string::npos) {
             continue;
         }
-        const auto tab = line.rfind('\t');
-        if (tab == std::string::npos) {
-            continue;
-        }
         if (addr != 0) {
             fn_lo = std::min(fn_lo, addr);
             fn_hi = std::max(fn_hi, addr);
         }
-        std::string rest = line.substr(tab + 1);
+        std::string rest = line.substr(colon + 1);
         while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front()))) {
             rest.erase(rest.begin());
         }
-        const auto first = rest.find(' ');
+        // Strip encoded instruction words. GNU objdump prints two-digit byte
+        // tokens; Apple's objdump prints one eight-digit AArch64 instruction.
+        while (!rest.empty()) {
+            const auto end = rest.find_first_of(" \t");
+            const auto token_size = end == std::string::npos ? rest.size() : end;
+            const std::string_view token{rest.data(), token_size};
+            const bool encoded = (token.size() == 2 || token.size() == 8) &&
+                                 std::all_of(token.begin(), token.end(), [](const char ch) {
+                                     return std::isxdigit(static_cast<unsigned char>(ch));
+                                 });
+            if (!encoded) {
+                break;
+            }
+            rest.erase(0, end);
+            while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front()))) {
+                rest.erase(rest.begin());
+            }
+        }
+        const auto first = rest.find_first_of(" \t");
         const std::string mnem = first == std::string::npos ? rest : rest.substr(0, first);
         const std::string args = first == std::string::npos ? std::string{} : rest.substr(first);
         if (mnem == "add" || mnem == "addq") {
-            if (args.find("%rsp") == std::string::npos && args.find("%rbp") == std::string::npos) {
+            if (args.find("%rsp") == std::string::npos && args.find("%rbp") == std::string::npos &&
+                args.find(", sp") == std::string::npos && args.find("sp,") == std::string::npos) {
                 ++c.add;
             }
         } else if (mnem == "shl" || mnem == "shlq" || mnem == "sal" || mnem == "salq") {
             if (HasImmToken(args, "$0x9") || HasImmToken(args, "$9")) {
                 ++c.shl9;
             }
+        } else if (mnem == "lsl") {
+            if (HasImmToken(args, "#0x9") || HasImmToken(args, "#9")) {
+                ++c.shl9;
+            }
         } else if (mnem == "imul" || mnem == "imulq") {
             if (HasImmToken(args, "$0x200") || HasImmToken(args, "$512")) {
                 ++c.imul512;
             }
-        } else if (mnem == "call" || mnem == "callq") {
+        } else if (mnem == "call" || mnem == "callq" || mnem == "bl" || mnem == "blr") {
             ++c.call;
             if (line.find("recomp_store64") != std::string::npos) {
                 ++c.store64;
@@ -445,13 +464,20 @@ DisasmCounts CountBlockBenchOps(const std::string& fn) {
             if (line.find("recomp_load64") != std::string::npos) {
                 ++c.load64;
             }
-        } else if (!mnem.empty() && mnem[0] == 'j') {
+        } else if ((!mnem.empty() && mnem[0] == 'j') || mnem == "b" ||
+                   mnem.starts_with("b.") || mnem == "cbz" || mnem == "cbnz" ||
+                   mnem == "tbz" || mnem == "tbnz") {
             size_t t = 0;
             while (t < args.size() && std::isspace(static_cast<unsigned char>(args[t]))) {
                 ++t;
             }
             u64 target = 0;
-            if (t < args.size()) {
+            const auto arm_target = args.find("0x");
+            const auto symbol = args.find('<');
+            if (arm_target != std::string::npos &&
+                (symbol == std::string::npos || arm_target < symbol)) {
+                target = std::strtoull(args.c_str() + arm_target + 2, nullptr, 16);
+            } else if (t < args.size()) {
                 target = std::strtoull(args.c_str() + t, nullptr, 16);
             }
             if (addr != 0 && target != 0) {
@@ -645,8 +671,13 @@ std::string PopenDump(const std::string& cmd) {
 }
 
 std::string ExtractObjdumpFn(const std::string& dump, const char* name) {
-    const std::string tag = std::string("<") + name + ">:";
-    const auto tag_at = dump.find(tag);
+    std::string tag = std::string("<") + name + ">:";
+    auto tag_at = dump.find(tag);
+    if (tag_at == std::string::npos) {
+        // Mach-O tools expose C symbols with their leading underscore.
+        tag = std::string("<_") + name + ">:";
+        tag_at = dump.find(tag);
+    }
     if (tag_at == std::string::npos) {
         return {};
     }
@@ -699,7 +730,8 @@ void PinClangDumpNotFalseFolded(const fs::path& blocks_c) {
         g_aot_compile.clang_dump_reason = "clang not found";
         return;
     }
-    const fs::path out = blocks_c.parent_path() / "libstack_aot_clang.so";
+    const fs::path out =
+        blocks_c.parent_path() / (std::string("libstack_aot_clang") + SUYU_SMOKE_SHARED_LIBRARY_SUFFIX);
     const int rc = RunArgs({clang, "-O3", "-fPIC", "-shared", "-std=c11", "-o", out.string(),
                             blocks_c.string()});
     if (rc != 0 || !fs::exists(out)) {
@@ -1102,16 +1134,21 @@ bool BuildAndLoadAot(const fs::path& root) {
     }
     g_aot_compile.cmake_build_ns = NsSince(t_build);
 
+    const std::string library_name =
+        std::string("libstack_aot") + SUYU_SMOKE_SHARED_LIBRARY_SUFFIX;
+    const std::string unprefixed_name =
+        std::string("stack_aot") + SUYU_SMOKE_SHARED_LIBRARY_SUFFIX;
     fs::path so;
-    for (const auto& p :
-         {build / "libstack_aot.so", build / "stack_aot.so", build / "Release" / "libstack_aot.so"}) {
+    for (const auto& p : {build / library_name, build / unprefixed_name,
+                          build / "Release" / library_name,
+                          build / "Release" / unprefixed_name}) {
         if (fs::exists(p)) {
             so = p;
             break;
         }
     }
     if (so.empty()) {
-        Fail("libstack_aot.so not found");
+        Fail(library_name + " not found");
         return false;
     }
     std::error_code ec;
@@ -1223,6 +1260,11 @@ void WriteGuestImage(std::vector<u8>& image) {
 
 struct StackFixture {
     Core::System system;
+    // The synthetic fixture does not run Core::System's normal game-loader
+    // path, so its optional per-game PerfStats object is never constructed.
+    // Keep an owned tracker for benchmark frame accounting instead of
+    // dereferencing that disengaged optional through System::GetPerfStats().
+    Core::PerfStats perf_stats{0};
     Kernel::KProcess* process = nullptr;
     Kernel::KThread* thread = nullptr;
     Kernel::KThread* thread_b = nullptr;
@@ -2198,11 +2240,11 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
 
         const auto frame_t0 = std::chrono::steady_clock::now();
-        f.system.GetPerfStats().BeginSystemFrame();
+        f.perf_stats.BeginSystemFrame();
         const auto slice_t0 = std::chrono::steady_clock::now();
         const auto hr = f.arm->RunThread(f.thread);
         const u64 ns = NsSince(slice_t0);
-        f.system.GetPerfStats().EndSystemFrame();
+        f.perf_stats.EndSystemFrame();
         ++r.frame_events;
         r.frame_event_time_ns += NsSince(frame_t0);
         times.push_back(ns);
@@ -2230,7 +2272,7 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
     }
     g_force_miss_pc = 0;
     r.perf_stats_frametime_seconds =
-        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
+        f.perf_stats.GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
     r.mem_after = ReadMem();
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;
@@ -2586,11 +2628,11 @@ ModeResult RunRepresentativeWorkload(StackFixture& f, const char* id, const char
             f.arm->SetTpidrroEl0(0xC0FFEE);
         }
         const auto frame_t0 = std::chrono::steady_clock::now();
-        f.system.GetPerfStats().BeginSystemFrame();
+        f.perf_stats.BeginSystemFrame();
         const auto slice_t0 = std::chrono::steady_clock::now();
         const auto hr = f.arm->RunThread(f.thread);
         const u64 ns = NsSince(slice_t0);
-        f.system.GetPerfStats().EndSystemFrame();
+        f.perf_stats.EndSystemFrame();
         times.push_back(ns);
         ++r.frame_events;
         r.frame_event_time_ns += NsSince(frame_t0);
@@ -2615,7 +2657,7 @@ ModeResult RunRepresentativeWorkload(StackFixture& f, const char* id, const char
     }
     g_force_miss_pc = 0;
     r.perf_stats_frametime_seconds =
-        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
+        f.perf_stats.GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
     r.mem_after = ReadMem();
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;

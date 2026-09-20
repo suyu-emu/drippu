@@ -59,6 +59,7 @@ std::string Quote(const std::string& s) {
 }
 #endif
 
+#ifdef _WIN32
 std::string QuoteWinArg(std::string_view arg) {
     // CommandLineToArgvW rules: quote if empty or if space/tab/quote present;
     // double backslashes that precede a quote; double trailing backslashes
@@ -101,6 +102,7 @@ std::string JoinWindowsCommandLine(const std::vector<std::string>& args) {
     }
     return line;
 }
+#endif
 
 int RunArgs(const std::vector<std::string>& args) {
     if (args.empty()) {

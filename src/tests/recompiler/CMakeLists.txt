@@ -87,7 +87,7 @@ if (NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # frontend_common supplies PlayTimeManager referenced from core's NS services
     # once System symbols pull that translation unit into the link.
     target_link_libraries(recomp_stack_harness PRIVATE core common frontend_common dynarmic::dynarmic
-                          ${CMAKE_DL_LIBS})
+                          ${PLATFORM_LIBRARIES} ${CMAKE_DL_LIBS})
     target_include_directories(recomp_stack_harness PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     add_test(NAME recomp_stack_harness COMMAND recomp_stack_harness)
     set_tests_properties(recomp_stack_harness PROPERTIES

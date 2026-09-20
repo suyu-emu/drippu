@@ -32,7 +32,10 @@ public:
     }
 
     std::string GetHost() {
-        return socket.local_endpoint().address().to_string();
+        // The socket is bound to the wildcard address so it can receive on
+        // every interface. macOS does not route outbound UDP to 0.0.0.0;
+        // clients must address the local test server through loopback.
+        return boost::asio::ip::address_v4::loopback().to_string();
     }
 
     void Run(const std::vector<InputCommon::CemuhookUDP::Response::TouchPad> touch_movement_path) {

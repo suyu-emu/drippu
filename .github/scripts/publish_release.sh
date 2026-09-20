@@ -19,10 +19,10 @@ if [ ! -d "$artifacts_dir" ]; then
   exit 1
 fi
 
-mapfile -d '' -t files < <(
-  find "$artifacts_dir" -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) \
-    -print0 | sort -z
-)
+files=()
+while IFS= read -r file; do
+  files+=("$file")
+done < <(find "$artifacts_dir" -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) | sort)
 if [ "${#files[@]}" -eq 0 ]; then
   echo "No artifacts to release"
   exit 1
@@ -42,26 +42,37 @@ required=(
   app-genshinSpoof-release.apk
 )
 
-declare -A artifact_by_name=()
+artifact_names=()
 for file in "${files[@]}"; do
   name="$(basename "$file")"
-  if [ -n "${artifact_by_name[$name]+present}" ]; then
-    echo "duplicate release artifact name: $name"
-    exit 1
+  if [ "${#artifact_names[@]}" -gt 0 ]; then
+    for existing in "${artifact_names[@]}"; do
+      if [ "$existing" = "$name" ]; then
+        echo "duplicate release artifact name: $name"
+        exit 1
+      fi
+    done
   fi
-  artifact_by_name[$name]="$file"
+  artifact_names+=("$name")
 done
 
 missing=0
 for name in "${required[@]}"; do
-  if [ -z "${artifact_by_name[$name]+present}" ]; then
+  found=0
+  for existing in "${artifact_names[@]}"; do
+    if [ "$existing" = "$name" ]; then
+      found=1
+      break
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
     echo "missing required artifact: $name"
     missing=1
   fi
 done
 if [ "$missing" -ne 0 ]; then
   echo "found:"
-  printf '  %s\n' "${!artifact_by_name[@]}" | sort
+  printf '  %s\n' "${artifact_names[@]}" | sort
   exit 1
 fi
 
@@ -87,7 +98,11 @@ sums="$(mktemp)"
 trap 'rm -f "$notes" "$sums"' EXIT
 
 for file in "${files[@]}"; do
-  digest="$(sha256sum "$file" | awk '{print $1}')"
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum "$file" | awk '{print $1}')"
+  else
+    digest="$(shasum -a 256 "$file" | awk '{print $1}')"
+  fi
   printf '%s  %s\n' "$digest" "$(basename "$file")"
 done | sort -k2 >"$sums"
 
@@ -148,10 +163,10 @@ fi
   echo '<summary>Build toolchains</summary>'
   echo
   echo '```text'
-  mapfile -d '' -t toolchains < <(
-    find "$artifacts_dir" -type f \( -name 'toolchain.txt' -o -name 'toolchain-*.txt' \) \
-      -print0 | sort -z
-  )
+  toolchains=()
+  while IFS= read -r toolchain; do
+    toolchains+=("$toolchain")
+  done < <(find "$artifacts_dir" -type f \( -name 'toolchain.txt' -o -name 'toolchain-*.txt' \) | sort)
   if [ "${#toolchains[@]}" -eq 0 ]; then
     echo 'No per-job toolchain metadata was uploaded.'
   else

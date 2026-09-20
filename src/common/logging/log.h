@@ -27,6 +27,16 @@ constexpr const char* TrimSourcePath(std::string_view source) {
 
 } // namespace Common::Log
 
+// logging/types.h includes the legacy logging facade. Replace its macros
+// explicitly so including this trimmed-path facade does not emit redefinition
+// diagnostics on Clang.
+#undef LOG_TRACE
+#undef LOG_DEBUG
+#undef LOG_INFO
+#undef LOG_WARNING
+#undef LOG_ERROR
+#undef LOG_CRITICAL
+
 #ifdef _DEBUG
 #define LOG_TRACE(log_class, ...)                                                                  \
     Common::Log::FmtLogMessage(Common::Log::Class::log_class, Common::Log::Level::Trace,           \

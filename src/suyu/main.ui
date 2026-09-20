@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>suyu</string>
+   <string>drippu</string>
   </property>
   <property name="windowIcon">
    <iconset resource="suyu.qrc">

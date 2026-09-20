@@ -35,6 +35,7 @@ set_tests_properties(tests PROPERTIES TIMEOUT 180)
 # Header-only exporter smoke; also configurable as a standalone CMake project
 # from src/tests/recompiler (PR CI does that so it needs no emulator deps).
 add_subdirectory(recompiler)
+add_dependencies(tests exporter_smoke homebrew_harness recomp_stack_harness)
 
 # needed for vma
 if (NOT MSVC)

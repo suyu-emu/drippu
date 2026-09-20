@@ -13,7 +13,7 @@
 #define BUILD_DATE "@BUILD_DATE@"
 #define BUILD_FULLNAME "@BUILD_FULLNAME@"
 #define BUILD_VERSION "@BUILD_VERSION@"
-#define BUILD_ID "@BUILD_ID@"
+#define SCM_BUILD_ID "@BUILD_ID@"
 #define TITLE_BAR_FORMAT_IDLE "@TITLE_BAR_FORMAT_IDLE@"
 #define TITLE_BAR_FORMAT_RUNNING "@TITLE_BAR_FORMAT_RUNNING@"
 #define IS_DEV_BUILD @IS_DEV_BUILD@
@@ -36,7 +36,7 @@ constexpr const char g_build_name[] = BUILD_NAME;
 constexpr const char g_build_date[] = BUILD_DATE;
 constexpr const char g_build_fullname[] = BUILD_FULLNAME;
 constexpr const char g_build_version[] = BUILD_VERSION;
-constexpr const char g_build_id[] = BUILD_ID;
+constexpr const char g_build_id[] = SCM_BUILD_ID;
 constexpr const char g_title_bar_format_idle[] = TITLE_BAR_FORMAT_IDLE;
 constexpr const char g_title_bar_format_running[] = TITLE_BAR_FORMAT_RUNNING;
 constexpr const char g_compiler_id[] = COMPILER_ID;

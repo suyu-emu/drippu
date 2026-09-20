@@ -8420,8 +8420,8 @@ int main(int argc, char* argv[]) {
 
     // Init settings params
     // Keep organization/application names stable for config paths; display as drippu.
-    QCoreApplication::setOrganizationName(QStringLiteral("suyu team"));
-    QCoreApplication::setApplicationName(QStringLiteral("suyu"));
+    QCoreApplication::setOrganizationName(QStringLiteral("drippu"));
+    QCoreApplication::setApplicationName(QStringLiteral("drippu"));
     QApplication::setApplicationDisplayName(QStringLiteral("drippu"));
 
 #ifdef _WIN32
