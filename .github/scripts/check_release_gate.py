@@ -298,7 +298,9 @@ def run_publish_shell(
     commit: str = "deadbeefcafebabe0123456789abcdef01234567",
 ) -> PublishTrace:
     scripts = publish_scripts(spec)
-    with tempfile.TemporaryDirectory(prefix="suyu-release-gate-") as tmp:
+    # Keep a space in the real execution path so every publish simulation
+    # exercises the quoting required by Windows Git Bash and POSIX shells.
+    with tempfile.TemporaryDirectory(prefix="suyu release gate-") as tmp:
         tmp_path = Path(tmp)
         artifacts_dir = tmp_path / "artifacts"
         bin_dir = tmp_path / "bin"
