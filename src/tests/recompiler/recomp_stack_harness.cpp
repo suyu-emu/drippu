@@ -39,11 +39,13 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -58,6 +60,7 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_image_abi.h"
+#include "core/arm/recomp/recomp_icache.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
@@ -187,10 +190,16 @@ constexpr u64 kOffCoreDispatch = 0x2008; // TLS + safe GetCurrentProcessorNumber
 // Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003).
 // 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
 constexpr u64 kOffBench = 0x2400;
+// Keep the direct-chain entry outside the benchmark's 0x2400..0x3c10 span.
+// A range invalidation deliberately sends that benchmark through guest RX;
+// overlapping the entry's B instruction silently redirected it to the chain
+// fixture instead of exercising the benchmark fallback.
+constexpr u64 kOffChainEntry = 0x0400;
+constexpr u64 kOffChainTarget = 0x5010;
 constexpr int kBenchAdds = 512;
 constexpr u32 kBenchSvcImm = 3;
-constexpr u64 kCodeBytes = 5 * Kernel::PageSize;
-constexpr u64 kImageBytes = 6 * Kernel::PageSize;
+constexpr u64 kCodeBytes = 6 * Kernel::PageSize;
+constexpr u64 kImageBytes = 7 * Kernel::PageSize;
 constexpr u64 kOffBenchScratch = kCodeBytes; // data-segment word STR/LDR bounce
 constexpr u64 kOffInsnScratch = kCodeBytes + 0x40;
 
@@ -234,6 +243,8 @@ BlockFn g_block_plain = nullptr;
 BlockFn g_block_step_no_svc = nullptr;
 BlockFn g_block_core_dispatch = nullptr;
 BlockFn g_block_bench = nullptr;
+BlockFn g_block_chain_entry = nullptr;
+BlockFn g_block_chain_target = nullptr;
 BlockFn g_block_insn[suyu::recomp::insn_test::kInsnBlockCount]{};
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
@@ -767,6 +778,12 @@ Core::RecompBlockFn Lookup(u64 pc) {
     if (pc == g_entry + kOffBench) {
         return g_block_bench;
     }
+    if (pc == g_entry + kOffChainEntry) {
+        return g_block_chain_entry;
+    }
+    if (pc == g_entry + kOffChainTarget) {
+        return g_block_chain_target;
+    }
     if (pc >= g_entry + suyu::recomp::insn_test::kOffInsn) {
         const u64 rel = pc - (g_entry + suyu::recomp::insn_test::kOffInsn);
         const u64 idx = rel / suyu::recomp::insn_test::kInsnStride;
@@ -983,6 +1000,18 @@ void block_bench(GuestContext* c) {
     src << R"C(}
 )C";
 
+    // Direct-chain regression fixture. The entry block calls its target
+    // directly while the chain budget permits it; after invalidation the
+    // shared runtime disables chaining and the target must be reached through
+    // the dispatcher/JIT rather than stale generated code.
+    src << "void block_chain_target(GuestContext* c) {\n"
+        << "    c->x[0] = 0xCAFEULL; c->pending_svc = 77; c->pc = g_module_base + 0x"
+        << std::hex << kOffChainTarget + 4 << std::dec << "ULL;\n}\n"
+        << "void block_chain_entry(GuestContext* c) {\n"
+        << "    if (--c->chain_budget <= 0) { c->pc = g_module_base + 0x" << std::hex
+        << kOffChainTarget << std::dec << "ULL; return; }\n"
+        << "    return block_chain_target(c);\n}\n";
+
     const auto insn_blocks = suyu::recomp::insn_test::ReferenceBlocks();
     for (size_t bi = 0; bi < insn_blocks.size(); ++bi) {
         src << "void block_insn_" << bi << "(GuestContext* c) {\n";
@@ -1114,6 +1143,8 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
     g_block_core_dispatch = reinterpret_cast<BlockFn>(dlsym(g_so, "block_core_dispatch"));
     g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
+    g_block_chain_entry = reinterpret_cast<BlockFn>(dlsym(g_so, "block_chain_entry"));
+    g_block_chain_target = reinterpret_cast<BlockFn>(dlsym(g_so, "block_chain_target"));
     for (int i = 0; i < suyu::recomp::insn_test::kInsnBlockCount; ++i) {
         const std::string sym = "block_insn_" + std::to_string(i);
         g_block_insn[i] = reinterpret_cast<BlockFn>(dlsym(g_so, sym.c_str()));
@@ -1130,12 +1161,14 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
     ExpectTrue("dlsym block_core_dispatch", g_block_core_dispatch != nullptr);
     ExpectTrue("dlsym block_bench", g_block_bench != nullptr);
+    ExpectTrue("dlsym block_chain_entry", g_block_chain_entry != nullptr);
+    ExpectTrue("dlsym block_chain_target", g_block_chain_target != nullptr);
     ExpectTrue("dlsym g_recomp_hm_load_calls", g_hm_load_calls != nullptr);
     ExpectTrue("dlsym g_recomp_hm_store_calls", g_hm_store_calls != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
            g_block_plain && g_block_step_no_svc && g_block_core_dispatch && g_block_bench &&
-           g_hm_load_calls &&
-           g_hm_store_calls && g_block_insn[0] &&
+           g_hm_load_calls && g_hm_store_calls && g_block_chain_entry && g_block_chain_target &&
+           g_block_insn[0] &&
            g_block_insn[suyu::recomp::insn_test::kInsnBlockCount - 1];
 #endif
 }
@@ -1174,6 +1207,11 @@ void WriteGuestImage(std::vector<u8>& image) {
     for (const auto& [off, enc] : BenchInsns()) {
         put(off, enc);
     }
+    // Guest twin for the direct-chain regression: B reaches the target's
+    // MOVZ/SVC bytes when the target is forced through Dynarmic.
+    put(kOffChainEntry, 0x14001304u); // B +0x4c10 to kOffChainTarget
+    put(kOffChainTarget, kMovzX0Cafe);
+    put(kOffChainTarget + 4, kSvc77);
     for (const auto& blk : suyu::recomp::insn_test::ReferenceBlocks()) {
         u64 off = blk.offset;
         for (u32 enc : blk.insns) {
@@ -1605,10 +1643,17 @@ void ScenarioInvalidation(StackFixture& f) {
 
     // ClearInstructionCache permanently refuses Translate AOT; also flush any
     // Dynarmic fallback that may already exist on each core.
+    // The instruction cache is shared by every ArmRecomp belonging to the
+    // process, so verify every view before the first clear publishes the
+    // process-wide rejection.
     for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
         if (auto* iface = f.process->GetArmInterface(i)) {
             ExpectTrue("inv Clear target is ArmRecomp", iface->IsRecompBackend());
             ExpectTrue("AllowsAot before Clear", AsRecomp(iface)->AllowsAot());
+        }
+    }
+    for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+        if (auto* iface = f.process->GetArmInterface(i)) {
             iface->ClearInstructionCache();
             ExpectTrue("AllowsAot false after Clear only", !AsRecomp(iface)->AllowsAot());
         }
@@ -2032,6 +2077,7 @@ nlohmann::json MetricsToJson(const Core::RecompExecutionMetrics& m) {
           {"unhandled_opcode", m.fallback_unhandled_opcode},
           {"icache_rejected", m.fallback_icache_rejected},
           {"no_fallback_available", m.fallback_no_backend}}},
+        {"aot_range_rejects", m.aot_range_rejects},
         {"svc_calls", m.svc_calls},
     };
 }
@@ -2053,6 +2099,7 @@ Core::RecompExecutionMetrics MetricsDelta(const Core::RecompExecutionMetrics& af
     d.fallback_icache_rejected =
         sub(after.fallback_icache_rejected, before.fallback_icache_rejected);
     d.fallback_no_backend = sub(after.fallback_no_backend, before.fallback_no_backend);
+    d.aot_range_rejects = sub(after.aot_range_rejects, before.aot_range_rejects);
     d.svc_calls = sub(after.svc_calls, before.svc_calls);
     return d;
 }
@@ -2182,6 +2229,8 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         }
     }
     g_force_miss_pc = 0;
+    r.perf_stats_frametime_seconds =
+        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
     r.mem_after = ReadMem();
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;
@@ -2255,6 +2304,7 @@ nlohmann::json ModeToJson(const ModeResult& r) {
          {{"count", r.frame_events},
           {"wall_time_ns", r.frame_event_time_ns},
           {"source", "Core::PerfStats BeginSystemFrame/EndSystemFrame event boundary"},
+          {"perf_stats_frametime_seconds", r.perf_stats_frametime_seconds},
           {"note", "Standalone harness has no renderer/display; these are explicit emulated frame-event boundaries, not renamed RunThread slices."}}},
         {"host_mem_callbacks",
          {{"load", r.hm_load_calls},
@@ -2264,7 +2314,131 @@ nlohmann::json ModeToJson(const ModeResult& r) {
     };
 }
 
+void ScenarioRangeCacheSelfCheck() {
+    suyu::recomp::RecompICache cache;
+    ExpectTrue("empty range cache allows AOT", cache.AllowsAotAt(0x4000));
+    cache.InvalidateRange(0x4004, 1);
+    ExpectTrue("middle-byte invalidation rejects containing page", !cache.AllowsAotAt(0x4FFC));
+    ExpectTrue("middle-byte invalidation leaves next page usable", cache.AllowsAotAt(0x5000));
+    suyu::recomp::RecompICache cross_page;
+    cross_page.InvalidateRange(0x4FFF, 2);
+    ExpectTrue("cross-page invalidation rejects first page", !cross_page.AllowsAotAt(0x4FFE));
+    ExpectTrue("cross-page invalidation rejects second page", !cross_page.AllowsAotAt(0x5000));
+    ExpectTrue("cross-page invalidation leaves third page usable", cross_page.AllowsAotAt(0x6000));
+    cache.InvalidateRange(0x5000, 0x1000);
+    ExpectTrue("adjacent invalidation merges", cache.InvalidatedRangeCount() == 1);
+    cache.InvalidateRange(std::numeric_limits<u64>::max() - 2, 16);
+    ExpectTrue("overflow invalidation remains bounded", !cache.AllowsAotAt(std::numeric_limits<u64>::max() - 1));
+    suyu::recomp::RecompICache concurrent;
+    std::thread first([&] { concurrent.InvalidateRange(0x10000, 1); });
+    std::thread second([&] { concurrent.InvalidateRange(0x20000, 1); });
+    first.join();
+    second.join();
+    ExpectTrue("concurrent invalidation writers retain both ranges",
+               concurrent.InvalidatedRangeCount() == 2);
+}
+
 void AddRepresentativeWorkloads(nlohmann::json& doc, StackFixture& f, int iters);
+
+void ScenarioDirectChainInvalidation(StackFixture& f) {
+    const int before = g_fails;
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("direct-chain ArmRecomp", recomp != nullptr);
+    if (!recomp) {
+        return;
+    }
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffChainEntry;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto aot_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("direct-chain pre-invalidation SVC", True(aot_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("direct-chain pre-invalidation SVC number", f.arm->GetSvcNumber(), 77);
+    Kernel::Svc::ThreadContext aot_ctx{};
+    f.arm->GetContext(aot_ctx);
+    ExpectEq("direct-chain pre-invalidation result", aot_ctx.r[0], 0xCAFE);
+
+    // Invalidate the target bytes before the next entry. Page-conservative
+    // invalidation also rejects a source block on the preceding page when
+    // needed; the important property is that no direct generated call can
+    // execute the stale target after the process-wide chain gate is closed.
+    f.arm->InvalidateCacheRange(g_entry + kOffChainTarget, 8);
+    ExpectTrue("direct-chain invalidation keeps global AOT mode", recomp->AllowsAot());
+    ctx = {};
+    ctx.pc = g_entry + kOffChainEntry;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto jit_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("direct-chain post-invalidation SVC", True(jit_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("direct-chain post-invalidation SVC number", f.arm->GetSvcNumber(), 77);
+    Kernel::Svc::ThreadContext jit_ctx{};
+    f.arm->GetContext(jit_ctx);
+    ExpectEq("direct-chain post-invalidation result", jit_ctx.r[0], 0xCAFE);
+    const auto metrics = Core::GetRecompExecutionMetrics();
+    ExpectTrue("direct-chain stale target rejected", metrics.fallback_icache_rejected > 0);
+    ScenarioPass("direct AOT chain target observes process-wide invalidation", before);
+}
+
+void ScenarioRangeInvalidation(StackFixture& f) {
+    const int before = g_fails;
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("range invalidate ArmRecomp", recomp != nullptr);
+    if (!recomp) {
+        return;
+    }
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffBench;
+    ctx.r[1] = 1;
+    ctx.r[3] = g_entry + kOffBenchScratch;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto before_metrics = Core::GetRecompExecutionMetrics();
+    const auto aot_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("range precondition AOT", True(aot_hr & Core::HaltReason::SupervisorCall));
+
+    // Invalidate a byte on the next page while the benchmark block starts on
+    // the preceding page. The page-conservative cache must reject the whole
+    // cross-page block, not just an entry whose PC equals the changed byte.
+    const u64 cross_page_code = g_entry + kOffBench + Kernel::PageSize + 4;
+    f.arm->InvalidateCacheRange(cross_page_code, 1);
+    ExpectTrue("range invalidation preserves global AOT", recomp->AllowsAot());
+    for (std::size_t i = 1; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+        if (auto* idle = f.process->GetArmInterface(i)) {
+            // Invalidate through an otherwise idle core. The process-wide
+            // cache must make the next core-0 lookup reject the stale block.
+            idle->InvalidateCacheRange(cross_page_code, 1);
+            break;
+        }
+    }
+    ctx = {};
+    ctx.pc = g_entry + kOffBench;
+    ctx.r[1] = 1;
+    ctx.r[3] = g_entry + kOffBenchScratch;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto jit_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("range invalidation falls back only affected block",
+               True(jit_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("range invalidation affected SVC", f.arm->GetSvcNumber(), kBenchSvcImm);
+    Kernel::Svc::ThreadContext affected{};
+    f.arm->GetContext(affected);
+    ExpectEq("range invalidation affected result", affected.r[0], static_cast<u64>(kBenchAdds));
+    const auto after_metrics = Core::GetRecompExecutionMetrics();
+    ExpectTrue("range invalidation recorded rejection",
+               after_metrics.aot_range_rejects > before_metrics.aot_range_rejects);
+    ExpectTrue("range invalidation recorded icache fallback",
+               after_metrics.fallback_icache_rejected > before_metrics.fallback_icache_rejected);
+
+    // A block outside the changed range still takes the AOT path.
+    ctx = {};
+    ctx.pc = g_entry + kOffPlain;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto unaffected_before = Core::GetRecompExecutionMetrics();
+    const auto unaffected_hr = f.arm->RunThread(f.thread);
+    const auto unaffected_after = Core::GetRecompExecutionMetrics();
+    ExpectTrue("unaffected range remains AOT",
+               True(unaffected_hr & Core::HaltReason::SupervisorCall) &&
+                   unaffected_after.aot_block_executions > unaffected_before.aot_block_executions);
+    ScenarioPass("range-specific AOT invalidation keeps unaffected blocks usable", before);
+}
 
 void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const ModeResult& jit,
                          int iters, StackFixture& f) {
@@ -2548,11 +2722,11 @@ void PrintGaps() {
            "    registered core and real PhysicalCore::RunThread/Svc::Call dispatch)\n"
         << "  - Real NSO/NRO homebrew load (this uses a self-contained synthetic CodeSet)\n"
         << "  - gdbstub StepThread against a live title\n"
-        << "  - GPU frame times (this harness has no renderer; slice = RunThread until SVC)\n"
+        << "  - Renderer GPU frame times (standalone harness records Core::PerfStats frame-event boundaries)\n"
         << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
         << "  - AOT .so size includes non-bench integration blocks\n"
         << "  - Bench slice is ADD+STR+LDR (anti-fold), not a pure ALU stream\n"
-        << "  - #5 compatibility, #6 opts, #7 release-gate\n"
+        << "  - #5 compatibility, #7 release-gate\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
@@ -2561,7 +2735,7 @@ void PrintGaps() {
         << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json),\n"
         << "  JudgeAotBenchDump FAILs discriminating PLT dump (counts lock PLT vs loop);\n"
         << "  live gcc -O3 PASS; named store/load PLT not required; host_mem callbacks "
-           "512 x iters.\n"
+           "512 x iters; range invalidation keeps unaffected AOT blocks live.\n"
         << "  #4 Translate AOT vs Dynarmic instruction correctness (edge + random inputs).\n";
 }
 
@@ -2574,6 +2748,7 @@ int main() {
     std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark + insn correctness)\n";
 
     ScenarioFoldPinSelfCheck();
+    ScenarioRangeCacheSelfCheck();
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const fs::path root =
@@ -2599,6 +2774,8 @@ int main() {
     ScenarioForceMissRegistered(*fix);
     ScenarioUnhandledFallback(*fix);
     ScenarioInsnCorrectness(*fix);
+    ScenarioDirectChainInvalidation(*fix);
+    ScenarioRangeInvalidation(*fix);
     // ClearInstructionCache permanently refuses AOT; run after the above.
     ScenarioInvalidation(*fix);
     ScenarioRestart(*fix);
