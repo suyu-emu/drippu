@@ -2332,7 +2332,7 @@ ModeResult RunRepresentativeWorkload(StackFixture& f, const char* id, const char
     g_force_miss_pc = 0;
     r.perf_stats_frametime_seconds =
         f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
-    r.mem_after = r.mem_after_first;
+    r.mem_after = ReadMem();
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;
     r.compile_ns = r.slices.first_ns > r.slices.median_ns
