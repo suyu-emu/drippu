@@ -1437,6 +1437,27 @@ void ScenarioPhysicalCoreDispatch(StackFixture& f) {
     const int before = g_fails;
     auto& kernel = f.system.Kernel();
 
+    // Feed both fixture threads through the real priority queue before this
+    // host thread is registered as an emulated core. Keeping the outer lock
+    // held lets the harness inspect both deterministic selection boundaries
+    // without updating scheduler execution state or yielding to a CpuManager
+    // guest fiber that it does not own.
+    f.thread->SetPriority(20);
+    f.thread_b->SetPriority(10);
+    {
+        Kernel::KScopedSchedulerLock lock(kernel);
+        f.thread->SetState(kernel, Kernel::ThreadState::Runnable);
+        ExpectTrue("scheduler selected initial fixture thread on core 0",
+                   kernel.GlobalSchedulerContext().GetScheduledFront(0) == f.thread);
+
+        f.thread_b->SetState(kernel, Kernel::ThreadState::Runnable);
+        ExpectTrue("scheduler selected higher-priority fixture thread on core 0",
+                   kernel.GlobalSchedulerContext().GetScheduledFront(0) == f.thread_b);
+
+        f.thread->SetState(kernel, Kernel::ThreadState::Initialized);
+        f.thread_b->SetState(kernel, Kernel::ThreadState::Initialized);
+    }
+
     // Run on a registered emulated core so PhysicalCore::RunThread's Svc::Call
     // observes the same current core/process context as CpuManager's guest
     // loop. SVC #0x10 is a side-effect-free kernel service and therefore makes
@@ -1463,25 +1484,6 @@ void ScenarioPhysicalCoreDispatch(StackFixture& f) {
     run(f.thread_b, GetInteger(f.thread_b->GetTlsAddress()), "scheduler thread B");
     ExpectTrue("scheduler thread TLS values distinct",
                GetInteger(f.thread->GetTlsAddress()) != GetInteger(f.thread_b->GetTlsAddress()));
-
-    // Feed both fixture threads through the real priority queue. Calling the
-    // fiber-based rescheduler from this standalone process would yield to a
-    // CpuManager guest fiber that the harness does not own, so stop at the
-    // scheduler's deterministic selection boundary and assert its choice.
-    f.thread->SetPriority(20);
-    f.thread_b->SetPriority(10);
-    f.thread->SetState(kernel, Kernel::ThreadState::Runnable);
-    f.thread_b->SetState(kernel, Kernel::ThreadState::Runnable);
-    {
-        Kernel::KScopedSchedulerLock lock(kernel);
-        const u64 cores = Kernel::KScheduler::UpdateHighestPriorityThreads(kernel);
-        ExpectTrue("scheduler priority update requested core 0", (cores & 1) != 0);
-        ExpectTrue("scheduler selects higher-priority fixture thread",
-                   Kernel::KScheduler::GetPriorityQueue(kernel).GetScheduledFront(0) ==
-                       f.thread_b);
-    }
-    f.thread->SetState(kernel, Kernel::ThreadState::Initialized);
-    f.thread_b->SetState(kernel, Kernel::ThreadState::Initialized);
     Kernel::SetCurrentThread(kernel, f.thread);
     ScenarioPass("PhysicalCore scheduler dispatch -> ArmRecomp -> Svc::Call (A/B TLS)", before);
 }
