@@ -32,7 +32,7 @@ inline QString HackerDesc() {
 }
 
 QPixmap LoadBrandLogo(int target_size) {
-    QPixmap logo(QStringLiteral(":/img/drippu.svg"));
+    QPixmap logo(QStringLiteral(":/img/suyu.svg"));
     if (!logo.isNull()) {
         return logo.scaled(target_size, target_size, Qt::KeepAspectRatio,
                            Qt::SmoothTransformation);
