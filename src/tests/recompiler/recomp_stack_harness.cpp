@@ -2118,7 +2118,7 @@ nlohmann::json ModeToJson(const ModeResult& r) {
         };
     }
     return {
-        {"backend", r.id},
+        {"backend", r.backend},
         {"execution_backend", r.backend},
         {"description", r.description},
         {"slices", SliceStatsToJson(r.slices)},
