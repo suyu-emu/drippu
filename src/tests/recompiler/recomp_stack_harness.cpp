@@ -891,6 +891,13 @@ void recomp_set_flags(GuestContext* c,int is_sub,uint64_t a,uint64_t b,uint64_t 
     if(is_sub){ c->c=(a>=b); c->v=(((a^b)&(a^r))&s)?1:0; }
     else { c->c=(r<a); c->v=((~(a^b)&(a^r))&s)?1:0; }
 }
+int recomp_cond(GuestContext* c,unsigned cond){
+    int n=c->n,z=c->z,cc=c->c,v=c->v,res;
+    switch(cond>>1){case 0:res=z;break;case 1:res=cc;break;case 2:res=n;break;
+    case 3:res=v;break;case 4:res=cc&&!z;break;case 5:res=(n==v);break;
+    case 6:res=(n==v)&&!z;break;default:res=1;}
+    return ((cond&1)&&cond!=15)?!res:res;
+}
 uint64_t recomp_umulh(uint64_t a,uint64_t b){
     uint64_t al=a&0xFFFFFFFFULL, ah=a>>32, bl=b&0xFFFFFFFFULL, bh=b>>32;
     uint64_t ll=al*bl, lh=al*bh, hl=ah*bl, hh=ah*bh;
