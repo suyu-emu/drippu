@@ -2120,11 +2120,16 @@ nlohmann::json ModeToJson(const ModeResult& r) {
         {"description", r.description},
         {"slices", SliceStatsToJson(r.slices)},
         {"startup_ns", r.startup_ns},
-        {"compile_ns", r.compile_ns},
+        {"compile_ns", std::string_view(r.backend) == "hybrid_aot"
+                           ? nlohmann::json(nullptr)
+                           : nlohmann::json(r.compile_ns)},
         {"compile_ns_meaning",
          std::string_view(r.backend) == "hybrid_aot"
-             ? "AOT Translate + cmake configure/build of libstack_aot.so + dlopen"
+             ? "unavailable per workload; see top-level aot_compile shared aggregate"
              : "approx first-JIT compile: first_slice_ns - median_ns"},
+        {"compile_ns_scope", std::string_view(r.backend) == "hybrid_aot"
+                                 ? "shared_aggregate"
+                                 : "workload"},
         {"memory",
          {{"sampler", "/proc/self/status"},
           {"rss_kb_before", r.mem_before.vmrss_kb},
