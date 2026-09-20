@@ -52,6 +52,104 @@ MISSING_TOOLS=0
 check_tool "cmake" || MISSING_TOOLS=$((MISSING_TOOLS + 1))
 check_tool "git" || MISSING_TOOLS=$((MISSING_TOOLS + 1))
 
+# Check for a working C compiler. We honor CC, then probe the common compiler
+# names (not just gcc), and support the MSVC-style command line on Windows. We
+# then actually compile, link, and run a trivial program: a compiler binary
+# that exists but cannot build (missing linker, missing libc headers,
+# broken snap install, ...) must fail here with a clear message, not later
+# inside cmake with an inscrutable error.
+check_c_compiler() {
+    local -a compiler=()
+    local candidate
+    local compiler_name=""
+
+    if [ -n "${CC:-}" ]; then
+        if command -v "$CC" &> /dev/null; then
+            # Keep an executable path containing spaces as one argument.
+            compiler=("$CC")
+            compiler_name="$CC"
+        else
+            # CMake also permits required compiler arguments in CC.
+            read -r -a compiler <<< "$CC"
+            compiler_name="${compiler[0]:-}"
+        fi
+        if [ -z "$compiler_name" ] || ! command -v "$compiler_name" &> /dev/null; then
+            print_error "configured C compiler CC='$CC' was not found"
+            compiler=()
+        fi
+    else
+        local -a candidates=(cc gcc clang)
+        case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*) candidates+=(clang-cl cl) ;;
+        esac
+        for candidate in "${candidates[@]}"; do
+            if command -v "$candidate" &> /dev/null; then
+                compiler=("$candidate")
+                compiler_name="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ "${#compiler[@]}" -eq 0 ]; then
+        if [ -z "${CC:-}" ]; then
+            print_error "no C compiler found (looked for cc, gcc, clang, and Windows toolchains in PATH)"
+        fi
+        print_error "install a toolchain for your platform, e.g.:"
+        print_error "  Debian/Ubuntu: sudo apt install build-essential"
+        print_error "  Fedora:        sudo dnf install gcc"
+        print_error "  Arch:          sudo pacman -S base-devel"
+        print_error "  macOS:         xcode-select --install"
+        print_error "  Windows:       Visual Studio Build Tools (\"Desktop development with C++\")"
+        print_error "                 or MSYS2: pacman -S mingw-w64-ucrt-x86_64-gcc"
+        return 1
+    fi
+
+    local compiler_path
+    compiler_path="$(command -v "$compiler_name")"
+    compiler[0]="$compiler_path"
+    print_success "C compiler found: ${CC:-$compiler_name} ($compiler_path)"
+
+    local tmpdir
+    if ! tmpdir="$(mktemp -d)"; then
+        print_error "could not create a temporary directory for the C compiler check"
+        return 1
+    fi
+    printf '%s\n' 'int main(void){return 0;}' > "$tmpdir/cc_probe.c"
+
+    local executable="cc_probe"
+    case "${compiler_name##*/}" in
+        cl|cl.exe|clang-cl|clang-cl.exe)
+            executable="cc_probe.exe"
+            if ! (cd "$tmpdir" && "${compiler[@]}" -nologo -Fecc_probe.exe cc_probe.c) &> "$tmpdir/cc_probe.log"; then
+                print_error "C compiler '${CC:-$compiler_name}' exists but cannot compile a trivial program:"
+                sed 's/^/    /' "$tmpdir/cc_probe.log" | head -n 20
+                rm -rf -- "$tmpdir"
+                return 1
+            fi
+            ;;
+        *)
+            if ! (cd "$tmpdir" && "${compiler[@]}" -o cc_probe cc_probe.c) &> "$tmpdir/cc_probe.log"; then
+                print_error "C compiler '${CC:-$compiler_name}' exists but cannot compile a trivial program:"
+                sed 's/^/    /' "$tmpdir/cc_probe.log" | head -n 20
+                rm -rf -- "$tmpdir"
+                return 1
+            fi
+            ;;
+    esac
+
+    if ! "$tmpdir/$executable" >> "$tmpdir/cc_probe.log" 2>&1; then
+        print_error "C compiler '${CC:-$compiler_name}' produced a binary that does not run (broken toolchain?)"
+        sed 's/^/    /' "$tmpdir/cc_probe.log" | head -n 20
+        rm -rf -- "$tmpdir"
+        return 1
+    fi
+    rm -rf -- "$tmpdir"
+    print_success "C compiler '${CC:-$compiler_name}' passed the compile, link, and run smoke test"
+    return 0
+}
+check_c_compiler || MISSING_TOOLS=$((MISSING_TOOLS + 1))
+
 if [ $MISSING_TOOLS -gt 0 ]; then
     print_error "Please install missing tools before continuing"
     exit 1
