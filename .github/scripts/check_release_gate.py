@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import os
+import copy
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -280,6 +282,15 @@ def write_executable(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
+def shell_path(path: Path) -> str:
+    """Render a temporary Windows path in the POSIX form Git Bash accepts."""
+    if os.name == "nt":
+        rendered = "/" + path.drive[0].lower() + path.as_posix()[2:]
+    else:
+        rendered = str(path)
+    return shlex.quote(rendered)
+
+
 def run_publish_shell(
     spec: JobSpec,
     artifacts: dict[str, bytes],
@@ -287,7 +298,9 @@ def run_publish_shell(
     commit: str = "deadbeefcafebabe0123456789abcdef01234567",
 ) -> PublishTrace:
     scripts = publish_scripts(spec)
-    with tempfile.TemporaryDirectory(prefix="suyu-release-gate-") as tmp:
+    # Keep a space in the real execution path so every publish simulation
+    # exercises the quoting required by Windows Git Bash and POSIX shells.
+    with tempfile.TemporaryDirectory(prefix="suyu release gate-") as tmp:
         tmp_path = Path(tmp)
         artifacts_dir = tmp_path / "artifacts"
         bin_dir = tmp_path / "bin"
@@ -372,10 +385,10 @@ exit 0
 """
         write_executable(
             bin_dir / "gh",
-            gh_stub.replace("__LOG__", str(log_path))
-            .replace("__NOTES__", str(notes_path))
-            .replace("__CHECKSUMS__", str(checksum_path))
-            .replace("__UPLOADED__", str(uploaded_dir)),
+            gh_stub.replace("__LOG__", shell_path(log_path))
+            .replace("__NOTES__", shell_path(notes_path))
+            .replace("__CHECKSUMS__", shell_path(checksum_path))
+            .replace("__UPLOADED__", shell_path(uploaded_dir)),
         )
         git_stub = """#!/bin/bash
 LOG=__LOG__
@@ -385,7 +398,7 @@ if [ "${1:-}" = "push" ] && [ "${2:-}" = "--delete" ]; then
 fi
 exec /usr/bin/git "$@"
 """
-        write_executable(bin_dir / "git", git_stub.replace("__LOG__", str(log_path)))
+        write_executable(bin_dir / "git", git_stub.replace("__LOG__", shell_path(log_path)))
 
         env = os.environ.copy()
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
@@ -405,6 +418,16 @@ exec /usr/bin/git "$@"
                 .replace("${{ github.run_id }}", "1")
                 .replace("${{ github.server_url }}", "https://github.com")
             )
+            # Git Bash login profiles rebuild PATH from the Windows process
+            # environment, which can hide the temporary gh/git stubs above.
+            # Re-export the POSIX form explicitly so the publish simulation is
+            # deterministic on Windows developer machines as well as CI.
+            if os.name == "nt":
+                bin_posix = "/" + bin_dir.drive[0].lower() + bin_dir.as_posix()[2:]
+                rendered = f"export PATH={shlex.quote(bin_posix)}:$PATH\n{rendered}"
+                rendered = rendered.replace(
+                    "gh release", f"{shlex.quote(bin_posix + '/gh')} release"
+                )
             proc = subprocess.run(
                 ["bash", "-lc", rendered],
                 cwd=tmp_path,
@@ -498,6 +521,52 @@ def workflow_has_test_suite_job(doc: dict[str, Any], text: str) -> bool:
         if spec.job_id == "tests" and spec.job_id != "exporter-smoke":
             return True
     return False
+
+
+def enabled_run_lines(spec: JobSpec) -> list[str]:
+    """Return executable lines from enabled run steps, excluding comments."""
+    lines: list[str] = []
+    for step in spec.steps:
+        if not isinstance(step, dict):
+            continue
+        raw_if = step.get("if")
+        if isinstance(raw_if, str) and unwrap_expression(raw_if).strip().lower() in {"false", "0"}:
+            continue
+        run = step_run_script(step)
+        if run is None:
+            continue
+        lines.extend(
+            line.strip()
+            for line in run.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return lines
+
+
+def workflow_has_artifact_verification(doc: dict[str, Any]) -> bool:
+    """Require native package checks in their owning jobs before publishing."""
+    jobs = parse_jobs(doc)
+    expected = {
+        "build-windows": "verify_release_artifacts.py desktop --platform windows",
+        "build-linux": "verify_release_artifacts.py desktop --platform linux",
+        "build-macos": "verify_release_artifacts.py desktop --platform macos",
+        "build-android": "verify_release_artifacts.py apk --platform android",
+        "build-libretro": "verify_release_artifacts.py libretro --platform linux",
+        "build-libretro-windows": "verify_release_artifacts.py libretro --platform windows",
+    }
+    for job_id, marker in expected.items():
+        spec = jobs.get(job_id)
+        if spec is None or not any(marker in line for line in enabled_run_lines(spec)):
+            return False
+
+    aggregate = jobs.get("verify-release-artifacts")
+    if aggregate is None or not any(
+        "check_release_gate.py" in line for line in enabled_run_lines(aggregate)
+    ):
+        return False
+
+    publish = jobs.get(PUBLISH_JOB_ID)
+    return publish is not None and "verify-release-artifacts" in publish.needs
 
 
 def publish_deletes_a_release(spec: JobSpec) -> bool:
@@ -630,6 +699,46 @@ def main() -> int:
     check.expect(
         workflow_has_test_suite_job(doc, text),
         "release workflow builds and runs the test suite",
+    )
+    check.expect(
+        workflow_has_artifact_verification(doc),
+        "release workflow verifies desktop and libretro packages before publishing",
+    )
+    commented = copy.deepcopy(doc)
+    commented_step = commented["jobs"]["build-linux"]["steps"]
+    for step in commented_step:
+        if isinstance(step, dict) and "verify_release_artifacts.py desktop --platform linux" in str(step.get("run", "")):
+            step["run"] = "# verify_release_artifacts.py desktop --platform linux"
+            break
+    check.expect(
+        not workflow_has_artifact_verification(commented),
+        "commented-out package checks do not satisfy the release gate",
+    )
+    unrelated = copy.deepcopy(doc)
+    unrelated["jobs"]["build-windows"]["steps"] = []
+    unrelated["jobs"]["unrelated-marker-job"] = {
+        "steps": [{"run": "verify_release_artifacts.py desktop --platform windows"}],
+    }
+    check.expect(
+        not workflow_has_artifact_verification(unrelated),
+        "package checks in unrelated jobs do not satisfy the release gate",
+    )
+    missing_publish_dependency = copy.deepcopy(doc)
+    missing_publish_dependency["jobs"][PUBLISH_JOB_ID]["needs"] = [
+        need
+        for need in missing_publish_dependency["jobs"][PUBLISH_JOB_ID]["needs"]
+        if need != "verify-release-artifacts"
+    ]
+    check.expect(
+        not workflow_has_artifact_verification(missing_publish_dependency),
+        "publishing must depend on the aggregate artifact verification job",
+    )
+    path_with_spaces = shell_path(Path("C:/Temp/release gate/trace.log"))
+    check.expect(
+        "release gate" in path_with_spaces
+        and path_with_spaces.startswith("'")
+        and path_with_spaces.endswith("'"),
+        "converted temporary paths are shell-quoted when they contain spaces",
     )
 
     commit = "cafebabedeadbeef0123456789abcdef01234567"

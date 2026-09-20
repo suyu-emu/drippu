@@ -242,6 +242,16 @@ int CmakeBuild(const fs::path& src, const fs::path& build, const char* target,
                bool iso_c11) {
     std::vector<std::string> cfg{SUYU_SMOKE_CMAKE, "-S", src.string(), "-B",
                                  build.string(), "-DCMAKE_BUILD_TYPE=Release"};
+    // Forward the parent sanitizer configuration into each generated project.
+    // An empty value deliberately adds no cache entries for normal smoke runs.
+    const char* sanitizer_flags = SUYU_SMOKE_SANITIZER_FLAGS;
+    if (sanitizer_flags && sanitizer_flags[0] != '\0') {
+        const std::string flags{sanitizer_flags};
+        cfg.push_back("-DCMAKE_C_FLAGS=" + flags);
+        cfg.push_back("-DCMAKE_CXX_FLAGS=" + flags);
+        cfg.push_back("-DCMAKE_EXE_LINKER_FLAGS=" + flags);
+        cfg.push_back("-DCMAKE_SHARED_LINKER_FLAGS=" + flags);
+    }
     const std::string gen = SUYU_SMOKE_GENERATOR;
     if (!gen.empty()) {
         cfg.push_back("-G");
@@ -645,6 +655,29 @@ int main(void) {
         return;
     }
     pass("page-edge load/store (discontig/tracked/unmapped) via RuntimeC");
+}
+
+void TestDiscoverBlocksPageBoundaries() {
+    // A generated AOT block must never cross a guest page: range invalidation
+    // tracks entry pages, so splitting here makes that metadata sufficient for
+    // every compiled block rather than relying on a conservative neighbour.
+    std::vector<u32> text(0x2008 / sizeof(u32), 0xD503201F); // AArch64 NOP
+    const auto blocks = suyu::recomp::DiscoverBlocks(
+        reinterpret_cast<const u8*>(text.data()), text.size() * sizeof(u32), 0x1000);
+    if (blocks.size() != 3 || blocks[0].vaddr != 0x1000 || blocks[0].size != 0x1000 ||
+        blocks[1].vaddr != 0x2000 || blocks[1].size != 0x1000 || blocks[2].vaddr != 0x3000 ||
+        blocks[2].size != 8) {
+        std::ostringstream detail;
+        detail << "DiscoverBlocks did not split AOT blocks at guest page boundaries (count="
+               << blocks.size();
+        for (const auto& block : blocks) {
+            detail << " [" << std::hex << block.vaddr << "," << block.size << "]";
+        }
+        detail << ")";
+        fail(detail.str());
+        return;
+    }
+    pass("DiscoverBlocks splits AOT blocks at guest page boundaries");
 }
 
 void TestSdivProbes(const fs::path& root) {
@@ -1766,6 +1799,7 @@ int main() {
     TestEmitProjectCompile(root);
     TestMultiModuleLink(root);
     TestMemoryBoundaries(root);
+    TestDiscoverBlocksPageBoundaries();
     TestSdivProbes(root);
     TestBranchProbes(root);
     TestFpControl(root);

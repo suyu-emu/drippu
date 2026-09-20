@@ -60,6 +60,8 @@ Thumbs.db
 eden-windows-msvc
 artifacts
 *.AppImage*
+*.jks
+*.keystore
 /install*
 vulkansdk*.exe
 *.tar.zst

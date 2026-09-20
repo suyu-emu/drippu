@@ -45,6 +45,10 @@ public:
     ThreadList const& GetThreadList() const noexcept {
         return m_thread_list;
     }
+    /// Returns the thread selected for a core. Callers must hold the scheduler lock.
+    KThread* GetScheduledFront(s32 core) const noexcept {
+        return m_priority_queue.GetScheduledFront(core);
+    }
     LockType& SchedulerLock() noexcept {
         return m_scheduler_lock;
     }

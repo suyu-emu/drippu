@@ -13,7 +13,9 @@
 # Backlog #4: homebrew_harness runs Translate C vs independent ARM arithmetic
 # (edge + random). recomp_stack_harness compares Translate AOT vs Dynarmic.
 # -DSUYU_ENABLE_SANITIZERS=ON (standalone) or -DYUZU_ENABLE_SANITIZERS=ON (tree)
-# builds ASan+UBSan and forwards the flags into nested probe/AOT compiles.
+# builds ASan+UBSan and forwards the flags into nested probe/AOT compiles. CI
+# runs this natively on both x86-64 and ARM64 so generated code is checked with
+# the host ABI it will execute under.
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -38,9 +40,6 @@ if (DEFINED YUZU_ENABLE_SANITIZERS AND YUZU_ENABLE_SANITIZERS)
     set(SUYU_ENABLE_SANITIZERS ON)
 endif()
 if (SUYU_ENABLE_SANITIZERS)
-    if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-        message(WARNING "SUYU_ENABLE_SANITIZERS: host is ${CMAKE_SYSTEM_PROCESSOR}; CI only runs this on x86-64")
-    endif()
     if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address,undefined)

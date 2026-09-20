@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Real-stack homebrew integration harness: ArmRecomp (process ArmInterface via
-// SetRecompLookup) + in-tree Dynarmic fallback + PhysicalCore::LoadContext TLS.
+// Real-stack synthetic-homebrew integration harness: ArmRecomp (process
+// ArmInterface via SetRecompLookup) + in-tree Dynarmic fallback + the kernel
+// scheduler's PhysicalCore dispatch and SVC path.
 //
 // AOT blocks are Translate()'d from real guest encodings and compiled into a
 // shared library (SUYU_HOSTED_RECOMP helpers). Matching AArch64 bytes are
@@ -21,11 +22,13 @@
 // have store=0; that is not a fold. Live pin is: not shl/imul, plus runtime
 // host_mem callback counts (512 × iters).
 //
-// Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
-// safe live HLE). Does not load copyrighted titles or keys.
+// The fixture is a small custom CodeSet image, not an NSO/NRO. It is entirely
+// generated in this test and contains no firmware, keys, or copyrighted data.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <regex>
@@ -36,10 +39,13 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -54,7 +60,9 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_image_abi.h"
+#include "core/arm/recomp/recomp_icache.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/hardware_properties.h"
 #include "core/file_sys/program_metadata.h"
@@ -64,8 +72,10 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/memory_types.h"
 #include "core/hle/kernel/physical_core.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/memory.h"
+#include "core/perf_stats.h"
 #include "core/recompiler/arm64_to_c.h"
 #include "smoke_config.h"
 #include "tests/recompiler/insn_correctness.h"
@@ -87,7 +97,7 @@ void Pass(const std::string& msg) {
     std::cout << "PASS: " << msg << std::endl;
 }
 
-void ExpectEq(const char* name, u64 got, u64 want) {
+void ExpectEq(const std::string& name, u64 got, u64 want) {
     if (got != want) {
         Fail(std::string(name) + ": got=" + std::to_string(got) + " want=" + std::to_string(want));
     } else {
@@ -95,7 +105,7 @@ void ExpectEq(const char* name, u64 got, u64 want) {
     }
 }
 
-void ExpectTrue(const char* name, bool cond) {
+void ExpectTrue(const std::string& name, bool cond) {
     if (!cond) {
         Fail(std::string(name) + " was false");
     } else {
@@ -176,13 +186,20 @@ constexpr u64 kOffAotProof = 0x1400;
 constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
 constexpr u64 kOffStepNoSvc = 0x1C00; // MOVZ #7 only — leftover pending_svc pin
 constexpr u64 kOffCrossPage = 0x1FFC;
+constexpr u64 kOffCoreDispatch = 0x2008; // TLS + safe GetCurrentProcessorNumber SVC
 // Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003).
 // 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
 constexpr u64 kOffBench = 0x2400;
+// Keep the direct-chain entry outside the benchmark's 0x2400..0x3c10 span.
+// A range invalidation deliberately sends that benchmark through guest RX;
+// overlapping the entry's B instruction silently redirected it to the chain
+// fixture instead of exercising the benchmark fallback.
+constexpr u64 kOffChainEntry = 0x0400;
+constexpr u64 kOffChainTarget = 0x5010;
 constexpr int kBenchAdds = 512;
 constexpr u32 kBenchSvcImm = 3;
-constexpr u64 kCodeBytes = 5 * Kernel::PageSize;
-constexpr u64 kImageBytes = 6 * Kernel::PageSize;
+constexpr u64 kCodeBytes = 6 * Kernel::PageSize;
+constexpr u64 kImageBytes = 7 * Kernel::PageSize;
 constexpr u64 kOffBenchScratch = kCodeBytes; // data-segment word STR/LDR bounce
 constexpr u64 kOffInsnScratch = kCodeBytes + 0x40;
 
@@ -201,6 +218,8 @@ constexpr u32 kMovzX0Cafe = 0xD2800000u | (0xCAFEu << 5);
 constexpr u32 kSvc77 = 0xD40009A1u;
 constexpr u32 kMovzX0_7 = 0xD28000E0u;
 constexpr u32 kSvc1 = 0xD4000021u;
+constexpr u32 kSvcGetCurrentProcessor = 0xD4000201u; // SVC #0x10
+constexpr u32 kMovzX1_55 = 0xD2800AA1u;
 constexpr u32 kMovzX0_0 = 0xD2800000u;
 constexpr u32 kAddX0X0X1 = 0x8B010000u; // ADD X0, X0, X1
 constexpr u32 kStrX0X3 = 0xF9000060u;   // STR X0, [X3] — opaque store breaks x0 recurrence
@@ -222,7 +241,10 @@ BlockFn g_block_miss_park = nullptr;
 BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
 BlockFn g_block_step_no_svc = nullptr;
+BlockFn g_block_core_dispatch = nullptr;
 BlockFn g_block_bench = nullptr;
+BlockFn g_block_chain_entry = nullptr;
+BlockFn g_block_chain_target = nullptr;
 BlockFn g_block_insn[suyu::recomp::insn_test::kInsnBlockCount]{};
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
@@ -750,8 +772,17 @@ Core::RecompBlockFn Lookup(u64 pc) {
     if (pc == g_entry + kOffStepNoSvc) {
         return g_block_step_no_svc;
     }
+    if (pc == g_entry + kOffCoreDispatch) {
+        return g_block_core_dispatch;
+    }
     if (pc == g_entry + kOffBench) {
         return g_block_bench;
+    }
+    if (pc == g_entry + kOffChainEntry) {
+        return g_block_chain_entry;
+    }
+    if (pc == g_entry + kOffChainTarget) {
+        return g_block_chain_target;
     }
     if (pc >= g_entry + suyu::recomp::insn_test::kOffInsn) {
         const u64 rel = pc - (g_entry + suyu::recomp::insn_test::kOffInsn);
@@ -784,6 +815,11 @@ std::string BuildAotSource() {
     const std::string t_mov7 = TranslateInsn(kMovzX0_7, kOffPlain);
     const std::string t_svc1 = TranslateInsn(kSvc1, kOffPlain + 4);
     const std::string t_step_mov7 = TranslateInsn(kMovzX0_7, kOffStepNoSvc);
+    const std::string t_core_mov = TranslateInsn(kMovzX0_1234, kOffCoreDispatch + 0);
+    const std::string t_core_tls = TranslateInsn(kMrsX3Tpidrro, kOffCoreDispatch + 4);
+    const std::string t_core_marker = TranslateInsn(kMovzX1_55, kOffCoreDispatch + 8);
+    const std::string t_core_svc =
+        TranslateInsn(kSvcGetCurrentProcessor, kOffCoreDispatch + 12);
 
     std::ostringstream src;
     src << R"C(#include <stdint.h>
@@ -872,6 +908,13 @@ void recomp_set_flags(GuestContext* c,int is_sub,uint64_t a,uint64_t b,uint64_t 
     if(is_sub){ c->c=(a>=b); c->v=(((a^b)&(a^r))&s)?1:0; }
     else { c->c=(r<a); c->v=((~(a^b)&(a^r))&s)?1:0; }
 }
+int recomp_cond(GuestContext* c,unsigned cond){
+    int n=c->n,z=c->z,cc=c->c,v=c->v,res;
+    switch(cond>>1){case 0:res=z;break;case 1:res=cc;break;case 2:res=n;break;
+    case 3:res=v;break;case 4:res=cc&&!z;break;case 5:res=(n==v);break;
+    case 6:res=(n==v)&&!z;break;default:res=1;}
+    return ((cond&1)&&cond!=15)?!res:res;
+}
 uint64_t recomp_umulh(uint64_t a,uint64_t b){
     uint64_t al=a&0xFFFFFFFFULL, ah=a>>32, bl=b&0xFFFFFFFFULL, bh=b>>32;
     uint64_t ll=al*bl, lh=al*bh, hl=ah*bl, hh=ah*bh;
@@ -927,6 +970,11 @@ void block_step_no_svc(GuestContext* c) {
         << "ULL;\n";
     src << R"C(}
 
+void block_core_dispatch(GuestContext* c) {
+)C";
+    src << t_core_mov << t_core_tls << t_core_marker << t_core_svc;
+    src << R"C(}
+
 void block_bench(GuestContext* c) {
 )C";
     const auto bench_insns = BenchInsns();
@@ -951,6 +999,18 @@ void block_bench(GuestContext* c) {
     g_aot_compile.bench_c_bytes = bench_c;
     src << R"C(}
 )C";
+
+    // Direct-chain regression fixture. The entry block calls its target
+    // directly while the chain budget permits it; after invalidation the
+    // shared runtime disables chaining and the target must be reached through
+    // the dispatcher/JIT rather than stale generated code.
+    src << "void block_chain_target(GuestContext* c) {\n"
+        << "    c->x[0] = 0xCAFEULL; c->pending_svc = 77; c->pc = g_module_base + 0x"
+        << std::hex << kOffChainTarget + 4 << std::dec << "ULL;\n}\n"
+        << "void block_chain_entry(GuestContext* c) {\n"
+        << "    if (--c->chain_budget <= 0) { c->pc = g_module_base + 0x" << std::hex
+        << kOffChainTarget << std::dec << "ULL; return; }\n"
+        << "    return block_chain_target(c);\n}\n";
 
     const auto insn_blocks = suyu::recomp::insn_test::ReferenceBlocks();
     for (size_t bi = 0; bi < insn_blocks.size(); ++bi) {
@@ -1081,7 +1141,10 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_aot_proof = reinterpret_cast<BlockFn>(dlsym(g_so, "block_aot_proof"));
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
+    g_block_core_dispatch = reinterpret_cast<BlockFn>(dlsym(g_so, "block_core_dispatch"));
     g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
+    g_block_chain_entry = reinterpret_cast<BlockFn>(dlsym(g_so, "block_chain_entry"));
+    g_block_chain_target = reinterpret_cast<BlockFn>(dlsym(g_so, "block_chain_target"));
     for (int i = 0; i < suyu::recomp::insn_test::kInsnBlockCount; ++i) {
         const std::string sym = "block_insn_" + std::to_string(i);
         g_block_insn[i] = reinterpret_cast<BlockFn>(dlsym(g_so, sym.c_str()));
@@ -1096,12 +1159,16 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym block_aot_proof", g_block_aot_proof != nullptr);
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
     ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
+    ExpectTrue("dlsym block_core_dispatch", g_block_core_dispatch != nullptr);
     ExpectTrue("dlsym block_bench", g_block_bench != nullptr);
+    ExpectTrue("dlsym block_chain_entry", g_block_chain_entry != nullptr);
+    ExpectTrue("dlsym block_chain_target", g_block_chain_target != nullptr);
     ExpectTrue("dlsym g_recomp_hm_load_calls", g_hm_load_calls != nullptr);
     ExpectTrue("dlsym g_recomp_hm_store_calls", g_hm_store_calls != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
-           g_block_plain && g_block_step_no_svc && g_block_bench && g_hm_load_calls &&
-           g_hm_store_calls && g_block_insn[0] &&
+           g_block_plain && g_block_step_no_svc && g_block_core_dispatch && g_block_bench &&
+           g_hm_load_calls && g_hm_store_calls && g_block_chain_entry && g_block_chain_target &&
+           g_block_insn[0] &&
            g_block_insn[suyu::recomp::insn_test::kInsnBlockCount - 1];
 #endif
 }
@@ -1133,9 +1200,18 @@ void WriteGuestImage(std::vector<u8>& image) {
     put(kOffPlain, kMovzX0_7);
     put(kOffPlain + 4, kSvc1);
     put(kOffStepNoSvc, kMovzX0_7);
+    put(kOffCoreDispatch + 0, kMovzX0_1234);
+    put(kOffCoreDispatch + 4, kMrsX3Tpidrro);
+    put(kOffCoreDispatch + 8, kMovzX1_55);
+    put(kOffCoreDispatch + 12, kSvcGetCurrentProcessor);
     for (const auto& [off, enc] : BenchInsns()) {
         put(off, enc);
     }
+    // Guest twin for the direct-chain regression: B reaches the target's
+    // MOVZ/SVC bytes when the target is forced through Dynarmic.
+    put(kOffChainEntry, 0x14001304u); // B +0x4c10 to kOffChainTarget
+    put(kOffChainTarget, kMovzX0Cafe);
+    put(kOffChainTarget + 4, kSvc77);
     for (const auto& blk : suyu::recomp::insn_test::ReferenceBlocks()) {
         u64 off = blk.offset;
         for (u32 enc : blk.insns) {
@@ -1407,6 +1483,61 @@ void ScenarioSvcTlsCrossPage(StackFixture& f) {
     ScenarioPass("Translate AOT SVC/TLS/cross-page via ApplicationMemory", before);
 }
 
+void ScenarioPhysicalCoreDispatch(StackFixture& f) {
+    const int before = g_fails;
+    auto& kernel = f.system.Kernel();
+
+    // Feed both fixture threads through the real priority queue before this
+    // host thread is registered as an emulated core. Keeping the outer lock
+    // held lets the harness inspect both deterministic selection boundaries
+    // without updating scheduler execution state or yielding to a CpuManager
+    // guest fiber that it does not own.
+    f.thread->SetPriority(20);
+    f.thread_b->SetPriority(10);
+    {
+        Kernel::KScopedSchedulerLock lock(kernel);
+        f.thread->SetState(kernel, Kernel::ThreadState::Runnable);
+        ExpectTrue("scheduler selected initial fixture thread on core 0",
+                   kernel.GlobalSchedulerContext().GetScheduledFront(0) == f.thread);
+
+        f.thread_b->SetState(kernel, Kernel::ThreadState::Runnable);
+        ExpectTrue("scheduler selected higher-priority fixture thread on core 0",
+                   kernel.GlobalSchedulerContext().GetScheduledFront(0) == f.thread_b);
+
+        f.thread->SetState(kernel, Kernel::ThreadState::Initialized);
+        f.thread_b->SetState(kernel, Kernel::ThreadState::Initialized);
+    }
+
+    // Run on a registered emulated core so PhysicalCore::RunThread's Svc::Call
+    // observes the same current core/process context as CpuManager's guest
+    // loop. SVC #0x10 is a side-effect-free kernel service and therefore makes
+    // a redistributable, deterministic real-dispatch fixture.
+    f.system.RegisterCoreThread(0);
+    const auto run = [&](Kernel::KThread* t, u64 expected_tls, const char* label) {
+        Kernel::SetCurrentThread(kernel, t);
+        auto& ctx = t->GetContext();
+        ctx = {};
+        ctx.pc = g_entry + kOffCoreDispatch;
+        kernel.PhysicalCore(0).LoadContext(t);
+        kernel.PhysicalCore(0).RunThread(kernel, t);
+
+        f.arm = t->GetOwnerProcess()->GetArmInterface(0);
+        ExpectEq((std::string(label) + " SVC number").c_str(), f.arm->GetSvcNumber(), 0x10);
+        Kernel::Svc::ThreadContext out{};
+        f.arm->GetContext(out);
+        ExpectEq((std::string(label) + " SVC result core").c_str(), out.r[0], 0);
+        ExpectEq((std::string(label) + " TLS").c_str(), out.r[3], expected_tls);
+        ExpectEq((std::string(label) + " marker").c_str(), out.r[1], 0x55);
+    };
+
+    run(f.thread, GetInteger(f.thread->GetTlsAddress()), "scheduler thread A");
+    run(f.thread_b, GetInteger(f.thread_b->GetTlsAddress()), "scheduler thread B");
+    ExpectTrue("scheduler thread TLS values distinct",
+               GetInteger(f.thread->GetTlsAddress()) != GetInteger(f.thread_b->GetTlsAddress()));
+    Kernel::SetCurrentThread(kernel, f.thread);
+    ScenarioPass("PhysicalCore scheduler dispatch -> ArmRecomp -> Svc::Call (A/B TLS)", before);
+}
+
 void ScenarioLeftoverSvcStep(StackFixture& f) {
     const int before = g_fails;
     // ScenarioSvcTlsCrossPage left pending_svc=42. LoadContext does not clear it.
@@ -1512,10 +1643,17 @@ void ScenarioInvalidation(StackFixture& f) {
 
     // ClearInstructionCache permanently refuses Translate AOT; also flush any
     // Dynarmic fallback that may already exist on each core.
+    // The instruction cache is shared by every ArmRecomp belonging to the
+    // process, so verify every view before the first clear publishes the
+    // process-wide rejection.
     for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
         if (auto* iface = f.process->GetArmInterface(i)) {
             ExpectTrue("inv Clear target is ArmRecomp", iface->IsRecompBackend());
             ExpectTrue("AllowsAot before Clear", AsRecomp(iface)->AllowsAot());
+        }
+    }
+    for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+        if (auto* iface = f.process->GetArmInterface(i)) {
             iface->ClearInstructionCache();
             ExpectTrue("AllowsAot false after Clear only", !AsRecomp(iface)->AllowsAot());
         }
@@ -1557,6 +1695,36 @@ void ScenarioRestart(StackFixture& f) {
     f.arm->GetContext(ctx);
     ExpectEq("restart tpidrro", ctx.r[3], 0xABCD1234ULL);
     ScenarioPass("new process ArmRecomp (fresh icache) re-runs Translate AOT", before);
+}
+
+void ScenarioSaveLoad(StackFixture& f) {
+    const int before = g_fails;
+    // A compatibility baseline must prove that a guest checkpoint can be
+    // captured and restored without losing the backend, PC, or TLS state. The
+    // checkpoint uses the same ThreadContext representation the kernel saves
+    // when a scheduler unloads a thread; no title data is involved.
+    f.PrepThreadForTlsSvc(f.thread);
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    Kernel::Svc::ThreadContext checkpoint{};
+    f.arm->GetContext(checkpoint);
+    const u64 tls = GetInteger(f.thread->GetTlsAddress());
+
+    const auto first = f.arm->RunThread(f.thread);
+    ExpectTrue("save/load initial SVC", True(first & Core::HaltReason::SupervisorCall));
+    Kernel::Svc::ThreadContext mutated{};
+    f.arm->GetContext(mutated);
+    ExpectTrue("save/load execution changed context", mutated.pc != checkpoint.pc);
+
+    f.arm->SetContext(checkpoint);
+    f.arm->SetTpidrroEl0(tls);
+    const auto restored = f.arm->RunThread(f.thread);
+    ExpectTrue("save/load restored SVC", True(restored & Core::HaltReason::SupervisorCall));
+    ExpectEq("save/load restored SVC number", f.arm->GetSvcNumber(), 42);
+    Kernel::Svc::ThreadContext restored_ctx{};
+    f.arm->GetContext(restored_ctx);
+    ExpectEq("save/load restored TLS", restored_ctx.r[3], tls);
+    ExpectEq("save/load restored x0", restored_ctx.r[0], 0x1234);
+    ScenarioPass("ThreadContext save/load restores AOT execution and TLS", before);
 }
 
 void ScenarioStepMiss(StackFixture& f) {
@@ -1672,6 +1840,18 @@ void ScenarioInsnCorrectness(StackFixture& f) {
                  f.system.ApplicationMemory().Read32(pc), blocks[bi].insns.front());
         ExpectTrue(("AOT registered " + std::string(blocks[bi].name)).c_str(),
                    Lookup(pc) == g_block_insn[bi] && g_block_insn[bi] != nullptr);
+        const std::string_view name = blocks[bi].name;
+        if (name == "b_cbz" || name == "b_cbnz" || name == "b_tbz" || name == "b_tbnz" ||
+            name == "b_beq") {
+            ExpectEq((std::string(name) + " stride-sized AOT layout").c_str(),
+                     static_cast<u64>(blocks[bi].insns.size()),
+                     suyu::recomp::insn_test::kInsnStride / 4);
+            ExpectTrue((std::string(name) + " AOT fallthrough registered").c_str(),
+                       Lookup(pc + suyu::recomp::insn_test::kInsnStride) != nullptr);
+            ExpectTrue((std::string(name) + " AOT taken target registered").c_str(),
+                       Lookup(g_entry + suyu::recomp::insn_test::kOffInsn +
+                                  18 * suyu::recomp::insn_test::kInsnStride) != nullptr);
+        }
     }
 
     suyu::recomp::insn_test::XorShift64 rng(suyu::recomp::insn_test::RandomSeed());
@@ -1682,7 +1862,9 @@ void ScenarioInsnCorrectness(StackFixture& f) {
         FillThreadRegs(init, x);
         init.pc = g_entry + blk.offset;
         SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
+        const auto aot_metrics_before = Core::GetRecompExecutionMetrics();
         const InsnSnap aot = RunInsnBackend(f, g_entry + blk.offset, true, init);
+        const auto aot_metrics_after = Core::GetRecompExecutionMetrics();
         SeedInsnScratch(f, 0x1111222233334444ULL, 0x80);
         const InsnSnap dyn = RunInsnBackend(f, g_entry + blk.offset, false, init);
         if (!aot.halt_svc || !dyn.halt_svc) {
@@ -1695,8 +1877,9 @@ void ScenarioInsnCorrectness(StackFixture& f) {
                  " dyn=" + std::to_string(dyn.svc));
         }
         SameGprsNzcv(aot.ctx, dyn.ctx, tag);
-        if (std::string_view(blk.name) == "logic_flags") {
-            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS write C=V=0.
+        if (std::string_view(blk.name) == "logic_flags" ||
+            std::string_view(blk.name) == "p0_logic_flags") {
+            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS/BICS write C=V=0.
             // This fails if AOT left those bits stale even when N/Z match.
             if ((Nzcv(aot.ctx) & 0x30000000u) != 0) {
                 Fail(std::string(tag) + " AOT ANDS left C/V stale nzcv=" +
@@ -1709,6 +1892,35 @@ void ScenarioInsnCorrectness(StackFixture& f) {
         }
         if (aot.mem0 != dyn.mem0 || aot.mem8 != dyn.mem8) {
             Fail(std::string(tag) + " mem mismatch");
+        }
+        const std::string_view name = blk.name;
+        if (name == "b_cbz" || name == "b_cbnz" || name == "b_tbz" || name == "b_tbnz" ||
+            name == "b_beq") {
+            bool taken = false;
+            u64 fallthrough_marker = 0;
+            if (name == "b_cbz") {
+                taken = x[0] == 0;
+                fallthrough_marker = 0xC1;
+            } else if (name == "b_cbnz") {
+                taken = x[0] != 0;
+                fallthrough_marker = 0xC2;
+            } else if (name == "b_tbz") {
+                taken = (x[0] & (1ULL << 3)) == 0;
+                fallthrough_marker = 0xC3;
+            } else if (name == "b_tbnz") {
+                taken = (x[0] & (1ULL << 3)) != 0;
+                fallthrough_marker = 0xC4;
+            } else {
+                taken = x[0] == x[1];
+                fallthrough_marker = 0xC5;
+            }
+            const u64 marker = Gpr(aot.ctx, taken ? 11 : 10);
+            ExpectEq((std::string(tag) + " branch marker").c_str(), marker,
+                     taken ? 0xB7 : fallthrough_marker);
+            ExpectEq((std::string(tag) + " AOT branch fallback lookup delta").c_str(),
+                     aot_metrics_after.fallback_lookup_miss -
+                         aot_metrics_before.fallback_lookup_miss,
+                     0);
         }
     };
 
@@ -1735,6 +1947,16 @@ void ScenarioInsnCorrectness(StackFixture& f) {
             edge[1] = 0x8000000000000000ULL;
             edge[2] = 1;
         }
+        if (std::string_view(blk.name) == "b_cbz" || std::string_view(blk.name) == "b_tbz") {
+            edge[0] = 0; // taken: CBZ X0==0, TBZ bit 3 clear
+        } else if (std::string_view(blk.name) == "b_cbnz") {
+            edge[0] = 1; // taken: CBNZ X0!=0
+        } else if (std::string_view(blk.name) == "b_tbnz") {
+            edge[0] = 8; // taken: TBNZ bit 3 set
+        } else if (std::string_view(blk.name) == "b_beq") {
+            edge[0] = 0x1234;
+            edge[1] = 0x1234; // taken: X0==X1
+        }
         one(blk, edge, (std::string(blk.name) + " edge").c_str());
 
         u64 wrap[32]{};
@@ -1747,6 +1969,17 @@ void ScenarioInsnCorrectness(StackFixture& f) {
             wrap[1] = g_entry + kOffInsnScratch;
             wrap[2] = ~0ULL;
             wrap[3] = 0xFF;
+        }
+        if (std::string_view(blk.name) == "b_cbz") {
+            wrap[0] = 1; // not-taken: CBZ X0!=0
+        } else if (std::string_view(blk.name) == "b_cbnz" ||
+                   std::string_view(blk.name) == "b_tbnz") {
+            wrap[0] = 0; // not-taken: CBNZ X0==0, TBNZ bit 3 clear
+        } else if (std::string_view(blk.name) == "b_tbz") {
+            wrap[0] = 8; // not-taken: TBZ bit 3 set
+        } else if (std::string_view(blk.name) == "b_beq") {
+            wrap[0] = 1;
+            wrap[1] = 2; // not-taken: X0!=X1
         }
         one(blk, wrap, (std::string(blk.name) + " wrap").c_str());
 
@@ -1844,6 +2077,7 @@ nlohmann::json MetricsToJson(const Core::RecompExecutionMetrics& m) {
           {"unhandled_opcode", m.fallback_unhandled_opcode},
           {"icache_rejected", m.fallback_icache_rejected},
           {"no_fallback_available", m.fallback_no_backend}}},
+        {"aot_range_rejects", m.aot_range_rejects},
         {"svc_calls", m.svc_calls},
     };
 }
@@ -1865,6 +2099,7 @@ Core::RecompExecutionMetrics MetricsDelta(const Core::RecompExecutionMetrics& af
     d.fallback_icache_rejected =
         sub(after.fallback_icache_rejected, before.fallback_icache_rejected);
     d.fallback_no_backend = sub(after.fallback_no_backend, before.fallback_no_backend);
+    d.aot_range_rejects = sub(after.aot_range_rejects, before.aot_range_rejects);
     d.svc_calls = sub(after.svc_calls, before.svc_calls);
     return d;
 }
@@ -1915,6 +2150,7 @@ nlohmann::json SliceStatsToJson(const SliceStats& s) {
 
 struct ModeResult {
     const char* id = "";
+    const char* backend = "";
     const char* description = "";
     SliceStats slices{};
     u64 startup_ns{};
@@ -1928,11 +2164,19 @@ struct ModeResult {
     Core::RecompExecutionMetrics exec{};
     u64 hm_load_calls{};
     u64 hm_store_calls{};
+    u64 expected_x0{};
+    u32 expected_svc{};
+    u64 frame_events{};
+    u64 frame_event_time_ns{};
+    double perf_stats_frametime_seconds{};
 };
 
 ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
     ModeResult r;
     r.id = hybrid_aot ? "hybrid_aot" : "jit";
+    r.backend = hybrid_aot ? "hybrid_aot" : "jit";
+    r.expected_x0 = kBenchAdds;
+    r.expected_svc = kBenchSvcImm;
     r.description = hybrid_aot
                         ? "ArmRecomp Translate AOT lookup hit; Dynarmic fallback must not run"
                         : "ArmRecomp force-miss of the same PC; Dynarmic executes guest RX";
@@ -1953,9 +2197,14 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         ctx.r[3] = g_entry + kOffBenchScratch;
         f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
 
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto frame_t0 = std::chrono::steady_clock::now();
+        f.system.GetPerfStats().BeginSystemFrame();
+        const auto slice_t0 = std::chrono::steady_clock::now();
         const auto hr = f.arm->RunThread(f.thread);
-        const u64 ns = NsSince(t0);
+        const u64 ns = NsSince(slice_t0);
+        f.system.GetPerfStats().EndSystemFrame();
+        ++r.frame_events;
+        r.frame_event_time_ns += NsSince(frame_t0);
         times.push_back(ns);
         if (i == 0) {
             r.mem_after_first = ReadMem();
@@ -1980,6 +2229,8 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         }
     }
     g_force_miss_pc = 0;
+    r.perf_stats_frametime_seconds =
+        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
     r.mem_after = ReadMem();
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;
@@ -2002,7 +2253,7 @@ nlohmann::json ModeToJson(const ModeResult& r) {
     const std::int64_t rss_first_delta = static_cast<std::int64_t>(r.mem_after_first.vmrss_kb) -
                                 static_cast<std::int64_t>(r.mem_before.vmrss_kb);
     nlohmann::json generated;
-    if (std::string_view(r.id) == "hybrid_aot") {
+    if (std::string_view(r.backend) == "hybrid_aot") {
         generated = {
             {"aot_so_bytes", g_aot_compile.so_bytes},
             {"aot_so_path", g_aot_compile.so_path},
@@ -2018,15 +2269,21 @@ nlohmann::json ModeToJson(const ModeResult& r) {
         };
     }
     return {
-        {"backend", r.id},
+        {"backend", r.backend},
+        {"execution_backend", r.backend},
         {"description", r.description},
         {"slices", SliceStatsToJson(r.slices)},
         {"startup_ns", r.startup_ns},
-        {"compile_ns", r.compile_ns},
+        {"compile_ns", std::string_view(r.backend) == "hybrid_aot"
+                           ? nlohmann::json(nullptr)
+                           : nlohmann::json(r.compile_ns)},
         {"compile_ns_meaning",
-         std::string_view(r.id) == "hybrid_aot"
-             ? "AOT Translate + cmake configure/build of libstack_aot.so + dlopen"
+         std::string_view(r.backend) == "hybrid_aot"
+             ? "unavailable per workload; see top-level aot_compile shared aggregate"
              : "approx first-JIT compile: first_slice_ns - median_ns"},
+        {"compile_ns_scope", std::string_view(r.backend) == "hybrid_aot"
+                                 ? "shared_aggregate"
+                                 : "workload"},
         {"memory",
          {{"sampler", "/proc/self/status"},
           {"rss_kb_before", r.mem_before.vmrss_kb},
@@ -2040,9 +2297,15 @@ nlohmann::json ModeToJson(const ModeResult& r) {
          {{"x0", r.x0},
           {"svc", r.svc},
           {"halt_supervisor_call", r.halt_svc},
-          {"expected_x0", kBenchAdds},
-          {"expected_svc", kBenchSvcImm}}},
+          {"expected_x0", r.expected_x0},
+          {"expected_svc", r.expected_svc}}},
         {"execution_metrics_delta", MetricsToJson(r.exec)},
+        {"frame_events",
+         {{"count", r.frame_events},
+          {"wall_time_ns", r.frame_event_time_ns},
+          {"source", "Core::PerfStats BeginSystemFrame/EndSystemFrame event boundary"},
+          {"perf_stats_frametime_seconds", r.perf_stats_frametime_seconds},
+          {"note", "Standalone harness has no renderer/display; these are explicit emulated frame-event boundaries, not renamed RunThread slices."}}},
         {"host_mem_callbacks",
          {{"load", r.hm_load_calls},
           {"store", r.hm_store_calls},
@@ -2051,12 +2314,138 @@ nlohmann::json ModeToJson(const ModeResult& r) {
     };
 }
 
+void ScenarioRangeCacheSelfCheck() {
+    suyu::recomp::RecompICache cache;
+    ExpectTrue("empty range cache allows AOT", cache.AllowsAotAt(0x4000));
+    cache.InvalidateRange(0x4004, 1);
+    ExpectTrue("middle-byte invalidation rejects containing page", !cache.AllowsAotAt(0x4FFC));
+    ExpectTrue("middle-byte invalidation leaves next page usable", cache.AllowsAotAt(0x5000));
+    suyu::recomp::RecompICache cross_page;
+    cross_page.InvalidateRange(0x4FFF, 2);
+    ExpectTrue("cross-page invalidation rejects first page", !cross_page.AllowsAotAt(0x4FFE));
+    ExpectTrue("cross-page invalidation rejects second page", !cross_page.AllowsAotAt(0x5000));
+    ExpectTrue("cross-page invalidation leaves third page usable", cross_page.AllowsAotAt(0x6000));
+    cache.InvalidateRange(0x5000, 0x1000);
+    ExpectTrue("adjacent invalidation merges", cache.InvalidatedRangeCount() == 1);
+    cache.InvalidateRange(std::numeric_limits<u64>::max() - 2, 16);
+    ExpectTrue("overflow invalidation remains bounded", !cache.AllowsAotAt(std::numeric_limits<u64>::max() - 1));
+    suyu::recomp::RecompICache concurrent;
+    std::thread first([&] { concurrent.InvalidateRange(0x10000, 1); });
+    std::thread second([&] { concurrent.InvalidateRange(0x20000, 1); });
+    first.join();
+    second.join();
+    ExpectTrue("concurrent invalidation writers retain both ranges",
+               concurrent.InvalidatedRangeCount() == 2);
+}
+
+void AddRepresentativeWorkloads(nlohmann::json& doc, StackFixture& f, int iters);
+
+void ScenarioDirectChainInvalidation(StackFixture& f) {
+    const int before = g_fails;
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("direct-chain ArmRecomp", recomp != nullptr);
+    if (!recomp) {
+        return;
+    }
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffChainEntry;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto aot_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("direct-chain pre-invalidation SVC", True(aot_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("direct-chain pre-invalidation SVC number", f.arm->GetSvcNumber(), 77);
+    Kernel::Svc::ThreadContext aot_ctx{};
+    f.arm->GetContext(aot_ctx);
+    ExpectEq("direct-chain pre-invalidation result", aot_ctx.r[0], 0xCAFE);
+
+    // Invalidate the target bytes before the next entry. Page-conservative
+    // invalidation also rejects a source block on the preceding page when
+    // needed; the important property is that no direct generated call can
+    // execute the stale target after the process-wide chain gate is closed.
+    f.arm->InvalidateCacheRange(g_entry + kOffChainTarget, 8);
+    ExpectTrue("direct-chain invalidation keeps global AOT mode", recomp->AllowsAot());
+    ctx = {};
+    ctx.pc = g_entry + kOffChainEntry;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto jit_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("direct-chain post-invalidation SVC", True(jit_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("direct-chain post-invalidation SVC number", f.arm->GetSvcNumber(), 77);
+    Kernel::Svc::ThreadContext jit_ctx{};
+    f.arm->GetContext(jit_ctx);
+    ExpectEq("direct-chain post-invalidation result", jit_ctx.r[0], 0xCAFE);
+    const auto metrics = Core::GetRecompExecutionMetrics();
+    ExpectTrue("direct-chain stale target rejected", metrics.fallback_icache_rejected > 0);
+    ScenarioPass("direct AOT chain target observes process-wide invalidation", before);
+}
+
+void ScenarioRangeInvalidation(StackFixture& f) {
+    const int before = g_fails;
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("range invalidate ArmRecomp", recomp != nullptr);
+    if (!recomp) {
+        return;
+    }
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffBench;
+    ctx.r[1] = 1;
+    ctx.r[3] = g_entry + kOffBenchScratch;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto before_metrics = Core::GetRecompExecutionMetrics();
+    const auto aot_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("range precondition AOT", True(aot_hr & Core::HaltReason::SupervisorCall));
+
+    // Invalidate a byte on the next page while the benchmark block starts on
+    // the preceding page. The page-conservative cache must reject the whole
+    // cross-page block, not just an entry whose PC equals the changed byte.
+    const u64 cross_page_code = g_entry + kOffBench + Kernel::PageSize + 4;
+    f.arm->InvalidateCacheRange(cross_page_code, 1);
+    ExpectTrue("range invalidation preserves global AOT", recomp->AllowsAot());
+    for (std::size_t i = 1; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+        if (auto* idle = f.process->GetArmInterface(i)) {
+            // Invalidate through an otherwise idle core. The process-wide
+            // cache must make the next core-0 lookup reject the stale block.
+            idle->InvalidateCacheRange(cross_page_code, 1);
+            break;
+        }
+    }
+    ctx = {};
+    ctx.pc = g_entry + kOffBench;
+    ctx.r[1] = 1;
+    ctx.r[3] = g_entry + kOffBenchScratch;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto jit_hr = f.arm->RunThread(f.thread);
+    ExpectTrue("range invalidation falls back only affected block",
+               True(jit_hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("range invalidation affected SVC", f.arm->GetSvcNumber(), kBenchSvcImm);
+    Kernel::Svc::ThreadContext affected{};
+    f.arm->GetContext(affected);
+    ExpectEq("range invalidation affected result", affected.r[0], static_cast<u64>(kBenchAdds));
+    const auto after_metrics = Core::GetRecompExecutionMetrics();
+    ExpectTrue("range invalidation recorded rejection",
+               after_metrics.aot_range_rejects > before_metrics.aot_range_rejects);
+    ExpectTrue("range invalidation recorded icache fallback",
+               after_metrics.fallback_icache_rejected > before_metrics.fallback_icache_rejected);
+
+    // A block outside the changed range still takes the AOT path.
+    ctx = {};
+    ctx.pc = g_entry + kOffPlain;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto unaffected_before = Core::GetRecompExecutionMetrics();
+    const auto unaffected_hr = f.arm->RunThread(f.thread);
+    const auto unaffected_after = Core::GetRecompExecutionMetrics();
+    ExpectTrue("unaffected range remains AOT",
+               True(unaffected_hr & Core::HaltReason::SupervisorCall) &&
+                   unaffected_after.aot_block_executions > unaffected_before.aot_block_executions);
+    ScenarioPass("range-specific AOT invalidation keeps unaffected blocks usable", before);
+}
+
 void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const ModeResult& jit,
-                         int iters) {
+                         int iters, StackFixture& f) {
     const int before = g_fails;
     std::ostringstream entry_pc;
     entry_pc << "0x" << std::hex << (g_entry + kOffBench);
-    const nlohmann::json doc{
+    nlohmann::json doc{
         {"schema_version", 1},
         {"kind", "recomp_benchmark"},
         {"clock", "steady_clock"},
@@ -2092,7 +2481,9 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"expected_svc", kBenchSvcImm},
           {"iters", iters}}},
         {"aot_compile",
-         {{"translate_ns", g_aot_compile.translate_ns},
+         {{"scope", "shared_aot_image"},
+          {"per_workload", "unavailable"},
+          {"translate_ns", g_aot_compile.translate_ns},
           {"bench_translate_ns", g_aot_compile.bench_translate_ns},
           {"cmake_configure_ns", g_aot_compile.cmake_configure_ns},
           {"cmake_build_ns", g_aot_compile.cmake_build_ns},
@@ -2125,6 +2516,7 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
             {"excerpt", g_aot_compile.disasm_excerpt}}}}},
         {"modes", {{"hybrid_aot", ModeToJson(aot)}, {"jit", ModeToJson(jit)}}},
     };
+    AddRepresentativeWorkloads(doc, f, std::max(4, std::min(iters, 16)));
 
     if (path.has_parent_path()) {
         fs::create_directories(path.parent_path());
@@ -2158,6 +2550,110 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
     std::cout << "recomp_benchmark.json path: " << path << "\n";
     std::cout << "=== recomp_benchmark.json ===\n" << json << std::endl;
     ScenarioPass("JIT vs hybrid AOT benchmark JSON from identical guest fixture", before);
+}
+
+// Keep a small suite of workloads alongside the anti-folding ALU/memory loop.
+// These are deliberately self-contained guest blocks already used by the
+// integration scenarios: a TLS/SVC transition and a minimal compute/SVC
+// workload exercise different transition and state-marshalling paths while
+// remaining deterministic on every host.
+ModeResult RunRepresentativeWorkload(StackFixture& f, const char* id, const char* description,
+                                     u64 pc, u64 expected_x0, u32 expected_svc, int iters,
+                                     bool tls, bool force_miss) {
+    ModeResult r;
+    r.id = id;
+    r.backend = force_miss ? "jit" : "hybrid_aot";
+    r.description = description;
+    r.expected_x0 = expected_x0;
+    r.expected_svc = expected_svc;
+    g_force_miss_pc = force_miss ? pc : 0;
+    const auto before = Core::GetRecompExecutionMetrics();
+    r.mem_before = ReadMem();
+    std::vector<u64> times;
+    times.reserve(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
+        auto& ctx = f.thread->GetContext();
+        ctx = {};
+        ctx.pc = pc;
+        if (tls) {
+            ctx.r[4] = g_entry + kOffCrossPage;
+        }
+        f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+        if (tls) {
+            // LoadContext publishes the thread's TPIDRRO. Set the test value
+            // afterwards so the generated MRS observes it, exactly as the
+            // production context-switch contract requires.
+            f.arm->SetTpidrroEl0(0xC0FFEE);
+        }
+        const auto frame_t0 = std::chrono::steady_clock::now();
+        f.system.GetPerfStats().BeginSystemFrame();
+        const auto slice_t0 = std::chrono::steady_clock::now();
+        const auto hr = f.arm->RunThread(f.thread);
+        const u64 ns = NsSince(slice_t0);
+        f.system.GetPerfStats().EndSystemFrame();
+        times.push_back(ns);
+        ++r.frame_events;
+        r.frame_event_time_ns += NsSince(frame_t0);
+        r.halt_svc = r.halt_svc || True(hr & Core::HaltReason::SupervisorCall);
+        r.svc = f.arm->GetSvcNumber();
+        Kernel::Svc::ThreadContext out{};
+        f.arm->GetContext(out);
+        r.x0 = out.r[0];
+        if (tls) {
+            if (out.r[1] != expected_x0 || out.r[3] != 0xC0FFEE ||
+                f.system.ApplicationMemory().Read64(g_entry + kOffCrossPage) != 0xABCD) {
+                Fail(std::string(id) + " TLS/cross-page effects mismatch");
+            }
+        }
+        if (i == 0) {
+            r.mem_after_first = ReadMem();
+        }
+        if (!True(hr & Core::HaltReason::SupervisorCall) || r.svc != expected_svc ||
+            r.x0 != expected_x0) {
+            Fail(std::string(id) + " result mismatch");
+        }
+    }
+    g_force_miss_pc = 0;
+    r.perf_stats_frametime_seconds =
+        f.system.GetPerfStats().GetAndResetStats(f.system.CoreTiming().GetGlobalTimeUs()).frametime;
+    r.mem_after = ReadMem();
+    r.slices = SummarizeSlices(std::move(times));
+    r.startup_ns = r.slices.first_ns;
+    r.compile_ns = r.slices.first_ns > r.slices.median_ns
+                       ? r.slices.first_ns - r.slices.median_ns
+                       : 0;
+    r.exec = MetricsDelta(Core::GetRecompExecutionMetrics(), before);
+    return r;
+}
+
+void AddRepresentativeWorkloads(nlohmann::json& doc, StackFixture& f, int iters) {
+    nlohmann::json suite = nlohmann::json::object();
+    for (const auto& spec : std::array{
+             std::tuple{"tls_svc", "TLS register and cross-page store followed by SVC", kOffTlsSvc,
+                        u64{0x1234}, u32{42}, true},
+             std::tuple{"plain_svc", "minimal MOVZ plus SVC transition", kOffPlain, u64{7},
+                        u32{1}, false},
+         }) {
+        const auto [id, description, off, expected_x0, expected_svc, tls] = spec;
+        // AOT first, then force the identical PC through Dynarmic. Both modes
+        // therefore report real RunThread timings for the same guest bytes.
+        auto aot = RunRepresentativeWorkload(f, id, description, g_entry + off, expected_x0,
+                                             expected_svc, iters, tls, false);
+        const std::string jit_id = std::string(id) + "_jit";
+        auto jit = RunRepresentativeWorkload(f, jit_id.c_str(), description, g_entry + off,
+                                             expected_x0, expected_svc, iters, tls, true);
+        ExpectTrue(std::string(id) + " AOT blocks", aot.exec.aot_block_executions >=
+                                                     static_cast<u64>(iters));
+        ExpectEq(std::string(id) + " AOT no JIT", aot.exec.dynarmic_run_slices, 0);
+        ExpectTrue(std::string(id) + " JIT slices", jit.exec.dynarmic_run_slices >=
+                                                     static_cast<u64>(iters));
+        ExpectEq(std::string(id) + " JIT no AOT", jit.exec.aot_block_executions, 0);
+        suite[id] = {{"description", description},
+                     {"iters", iters},
+                     {"aot", ModeToJson(aot)},
+                     {"jit", ModeToJson(jit)}};
+    }
+    doc["representative_workloads"] = std::move(suite);
 }
 
 void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
@@ -2214,7 +2710,7 @@ void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
     ExpectEq("both modes x0", aot.x0, jit.x0);
     ExpectEq("both modes svc", static_cast<u64>(aot.svc), static_cast<u64>(jit.svc));
 
-    ExportBenchmarkJson(json_path, aot, jit, iters);
+    ExportBenchmarkJson(json_path, aot, jit, iters, f);
     ScenarioPass("identical JIT vs hybrid AOT workload (slice/startup/compile/memory/size)",
                  before);
 }
@@ -2222,15 +2718,15 @@ void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
 void PrintGaps() {
     std::cout
         << "GAPS (honest / out of scope):\n"
-        << "  - Full PhysicalCore::RunThread -> Svc::Call HLE (needs safe SVC + services)\n"
-        << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
-        << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
+        << "  - Multi-core KScheduler fiber world / CpuManager guest loop (the fixture uses a\n"
+           "    registered core and real PhysicalCore::RunThread/Svc::Call dispatch)\n"
+        << "  - Real NSO/NRO homebrew load (this uses a self-contained synthetic CodeSet)\n"
         << "  - gdbstub StepThread against a live title\n"
-        << "  - GPU frame times (this harness has no renderer; slice = RunThread until SVC)\n"
+        << "  - Renderer GPU frame times (standalone harness records Core::PerfStats frame-event boundaries)\n"
         << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
         << "  - AOT .so size includes non-bench integration blocks\n"
         << "  - Bench slice is ADD+STR+LDR (anti-fold), not a pure ALU stream\n"
-        << "  - #5 compatibility, #6 opts, #7 release-gate\n"
+        << "  - #5 compatibility, #7 release-gate\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
@@ -2239,7 +2735,7 @@ void PrintGaps() {
         << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json),\n"
         << "  JudgeAotBenchDump FAILs discriminating PLT dump (counts lock PLT vs loop);\n"
         << "  live gcc -O3 PASS; named store/load PLT not required; host_mem callbacks "
-           "512 x iters.\n"
+           "512 x iters; range invalidation keeps unaffected AOT blocks live.\n"
         << "  #4 Translate AOT vs Dynarmic instruction correctness (edge + random inputs).\n";
 }
 
@@ -2252,6 +2748,7 @@ int main() {
     std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark + insn correctness)\n";
 
     ScenarioFoldPinSelfCheck();
+    ScenarioRangeCacheSelfCheck();
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const fs::path root =
@@ -2269,14 +2766,20 @@ int main() {
     ScenarioAotLiveProof(*fix); // before Clear: proves Lookup + AOT != Dynarmic twin
     ScenarioSvcTlsCrossPage(*fix);
     ScenarioLeftoverSvcStep(*fix);
+    // ScenarioLeftoverSvcStep consumes the pending SVC produced above. Keep
+    // any scenario that may leave a pending SVC after that consumer.
+    ScenarioPhysicalCoreDispatch(*fix);
     ScenarioLoadContextTls(*fix);
     // Force-miss + unhandled need AllowsAot (registered Translate blocks).
     ScenarioForceMissRegistered(*fix);
     ScenarioUnhandledFallback(*fix);
     ScenarioInsnCorrectness(*fix);
+    ScenarioDirectChainInvalidation(*fix);
+    ScenarioRangeInvalidation(*fix);
     // ClearInstructionCache permanently refuses AOT; run after the above.
     ScenarioInvalidation(*fix);
     ScenarioRestart(*fix);
+    ScenarioSaveLoad(*fix);
     ScenarioStepMiss(*fix);
 
     const fs::path json_path = [](const fs::path& work) {

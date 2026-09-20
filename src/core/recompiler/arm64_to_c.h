@@ -167,6 +167,15 @@ inline std::vector<Block> DiscoverBlocks(const u8* text, size_t n_bytes, u64 bas
     if (n == 0) return {};
     std::vector<bool> start(n, false);
     start[0] = true;
+    // Range invalidation is page-granular. Make every page boundary a block
+    // root so an AOT block's entry page fully covers its generated guest
+    // instructions; otherwise a block beginning near the end of one page
+    // could execute stale instructions from a later invalidated page.
+    for (u32 i = 1; i < n; ++i) {
+        if ((base + static_cast<u64>(i) * 4) % 0x1000 == 0) {
+            start[i] = true;
+        }
+    }
     // The module entry has to begin a block in its own right. Nothing branches
     // to it from inside the image, and for a real NSO it isn't offset 0
     // either - .text opens with a MOD0 header - so without this the entry

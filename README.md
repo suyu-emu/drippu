@@ -2,14 +2,14 @@
 
 <h1 align="center">
   <br>
-  <img src="dist/drippu.svg" alt="drippu" height="128">
+  <img src="dist/readme/drippu-icon.png" alt="drippu icon" height="128">
   <br>
   <b>drippu</b>
   <br>
 </h1>
 
 <h4 align="center">
-Nintendo Switch emulator and native recompiler — a continued fork of suyu, based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
+Nintendo Switch emulator and native recompiler — the experimental edition of suyu, built on the shared Eden/yuzu lineage.
 </h4>
 
 <p align="center">
@@ -20,11 +20,11 @@ Nintendo Switch emulator and native recompiler — a continued fork of suyu, bas
 
 ---
 
-> **drippu is an active fork continuation of the suyu codebase** (formerly published as suyu v0.04).
+> **drippu is the experimental edition of suyu, maintained by the [suyu Emulator organization](https://github.com/suyu-emu).**
 >
-> Development continues here under GPL-3.0-or-later. This repository is not a final archive — builds, fixes, and platform work may continue from this tree.
+> This is where the project explores emulator, recompiler, UI, and platform work that may change quickly. Expect rough edges and evolving behavior.
 >
-> The project inherits suyu’s codebase and history (itself based on Eden / yuzu). Binary and internal target names may still say `suyu` in places; the product presents as **drippu**.
+> drippu shares suyu’s codebase and history (itself based on Eden / yuzu). Binary and internal target names may still say `suyu` in places; the product presents as **drippu**.
 
 ## About
 
@@ -33,11 +33,11 @@ drippu is a Nintendo Switch emulator and AArch64 native recompiler written in C+
 - **HLE/emulation mode** — full hardware-level emulation via the drippu core (GPU, CPU, audio, services)
 - **Recompiler mode** — ahead-of-time static recompilation of Switch AArch64 game code to native x86-64 executables, bundled with drippu's HLE backend
 
-Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with improvements to UI, recompiler, and platform support carried forward from suyu and continued in drippu.
+Part of the suyu project and based on [Eden](https://git.eden-emu.dev/eden-emu/eden), drippu is a space for experimental UI, recompiler, and platform work.
 
 ## Status
 
-Continued development under the drippu name. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, macOS, Android) when configured.
+drippu is maintained by the suyu Emulator organization as its experimental project. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, macOS, Android) when configured.
 
 Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs through
 Vulkan/MoltenVK with the bundled MoltenVK library; see [macOS](#macos). Android is inherited

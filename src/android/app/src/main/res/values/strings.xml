@@ -429,7 +429,7 @@
     <string name="user_data_import_success">User data imported successfully</string>
     <string name="user_data_export_cancelled">Export cancelled</string>
     <string name="user_data_import_failed_description">Make sure the user data folders are at the root of the zip folder and contain a config file at config/config.ini and try again.</string>
-    <string name="github_link" translatable="false">https://github.com/SourCreamCulture/drippu</string>
+    <string name="github_link" translatable="false">https://github.com/suyu-emu/drippu</string>
     <string name="reddit_link" translatable="false">https://www.reddit.com/r/suyu/</string>
 
     <!-- General settings strings -->

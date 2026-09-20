@@ -50,6 +50,8 @@ jobs:
         run: cmake --build build --target tests recomp_stack_harness -j4
       - name: Run tests
         working-directory: build
+        env:
+          SUYU_RECOMP_BENCHMARK_JSON: ${{ github.workspace }}/recomp_benchmark.json
         run: |
           set -euo pipefail
           # Do not use Catch2 -s: it dumps millions of PASSED lines (RingBuffer)
@@ -65,8 +67,40 @@ jobs:
           timeout --foreground --kill-after=10s 90s \
             stdbuf -oL -eL ./bin/tests --durations yes --order decl "~[export]"
           echo '=== recomp_stack_harness ==='
-          timeout --foreground --kill-after=10s 60s \
-            stdbuf -oL -eL ./bin/recomp_stack_harness
+          stdbuf -oL -eL python3 "$GITHUB_WORKSPACE/scripts/recompiler_compat_baseline.py" \
+              --harness ./bin/recomp_stack_harness \
+              --output "$GITHUB_WORKSPACE/recomp-compat-baseline.json" \
+              --iterations 32 \
+              --timeout-seconds 60
+      - name: Validate and upload recompiler benchmark baseline
+        run: |
+          python3 scripts/compare_recomp_benchmark.py recomp_benchmark.json \
+            --baseline src/tests/recompiler/benchmarks/recomp_benchmark_baseline.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recomp-benchmark-baseline
+          path: recomp_benchmark.json
+      - name: Validate compatibility baseline
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          record = json.loads(Path('recomp-compat-baseline.json').read_text())
+          assert record['schema_version'] == 1
+          assert record['kind'] == 'recompiler_compatibility_baseline'
+          assert record['repository']['git_sha']
+          assert record['fixture']['redistributable'] is True
+          assert len(record['workloads']) == 4
+          assert all(workload['status'] == 'pass' for workload in record['workloads'])
+          assert record['failures'] == []
+          PY
+      - name: Upload compatibility baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recompiler-compatibility-baseline
+          path: recomp-compat-baseline.json
+          if-no-files-found: error
 
   tests-sanitizer:
     name: Linux x86-64 sanitizers
@@ -90,11 +124,26 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build-recomp-san --output-on-failure
-      - name: ARM64 sanitizer gap
+
+  tests-sanitizer-arm64:
+    name: Linux ARM64 sanitizers
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host arch
+        run: test "$(uname -m)" = aarch64
+      - name: Configure recompiler tests (ASan+UBSan)
         run: |
-          echo "This job is ubuntu-24.04 (x86-64). No ARM64 runner is configured"
-          echo "in this workflow; do not treat a green x86-64 sanitizer job as"
-          echo "ARM64 sanitizer coverage. Full-tree recomp_stack_harness under"
-          echo "sanitizers: cmake -DYUZU_ENABLE_SANITIZERS=ON -DYUZU_TESTS=ON ..."
-          echo "then ctest -R recomp_stack_harness with ASAN_OPTIONS=detect_leaks=0"
-          echo "(the harness intentionally leaks the System fixture)."
+          cmake -S src/tests/recompiler -B build-recomp-san \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSUYU_ENABLE_SANITIZERS=ON \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++
+      - name: Build
+        run: cmake --build build-recomp-san -j2
+      - name: Run exporter_smoke + homebrew_harness (insn correctness)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-recomp-san --output-on-failure
