@@ -92,7 +92,7 @@ void Pass(const std::string& msg) {
     std::cout << "PASS: " << msg << std::endl;
 }
 
-void ExpectEq(const char* name, u64 got, u64 want) {
+void ExpectEq(const std::string& name, u64 got, u64 want) {
     if (got != want) {
         Fail(std::string(name) + ": got=" + std::to_string(got) + " want=" + std::to_string(want));
     } else {
@@ -100,7 +100,7 @@ void ExpectEq(const char* name, u64 got, u64 want) {
     }
 }
 
-void ExpectTrue(const char* name, bool cond) {
+void ExpectTrue(const std::string& name, bool cond) {
     if (!cond) {
         Fail(std::string(name) + " was false");
     } else {
