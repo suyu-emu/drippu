@@ -190,7 +190,11 @@ constexpr u64 kOffCoreDispatch = 0x2008; // TLS + safe GetCurrentProcessorNumber
 // Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003).
 // 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
 constexpr u64 kOffBench = 0x2400;
-constexpr u64 kOffChainEntry = 0x3000;
+// Keep the direct-chain entry outside the benchmark's 0x2400..0x3c10 span.
+// A range invalidation deliberately sends that benchmark through guest RX;
+// overlapping the entry's B instruction silently redirected it to the chain
+// fixture instead of exercising the benchmark fallback.
+constexpr u64 kOffChainEntry = 0x0400;
 constexpr u64 kOffChainTarget = 0x5010;
 constexpr int kBenchAdds = 512;
 constexpr u32 kBenchSvcImm = 3;
@@ -1205,7 +1209,7 @@ void WriteGuestImage(std::vector<u8>& image) {
     }
     // Guest twin for the direct-chain regression: B reaches the target's
     // MOVZ/SVC bytes when the target is forced through Dynarmic.
-    put(kOffChainEntry, 0x14000804u); // B +0x2010 to kOffChainTarget
+    put(kOffChainEntry, 0x14001304u); // B +0x4c10 to kOffChainTarget
     put(kOffChainTarget, kMovzX0Cafe);
     put(kOffChainTarget + 4, kSvc77);
     for (const auto& blk : suyu::recomp::insn_test::ReferenceBlocks()) {
@@ -1639,10 +1643,17 @@ void ScenarioInvalidation(StackFixture& f) {
 
     // ClearInstructionCache permanently refuses Translate AOT; also flush any
     // Dynarmic fallback that may already exist on each core.
+    // The instruction cache is shared by every ArmRecomp belonging to the
+    // process, so verify every view before the first clear publishes the
+    // process-wide rejection.
     for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
         if (auto* iface = f.process->GetArmInterface(i)) {
             ExpectTrue("inv Clear target is ArmRecomp", iface->IsRecompBackend());
             ExpectTrue("AllowsAot before Clear", AsRecomp(iface)->AllowsAot());
+        }
+    }
+    for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+        if (auto* iface = f.process->GetArmInterface(i)) {
             iface->ClearInstructionCache();
             ExpectTrue("AllowsAot false after Clear only", !AsRecomp(iface)->AllowsAot());
         }
