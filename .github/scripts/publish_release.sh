@@ -6,9 +6,11 @@ set -euo pipefail
 artifacts_dir="${ARTIFACTS_DIR:-artifacts}"
 repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 sha="${GITHUB_SHA:?GITHUB_SHA is required}"
+version="${RELEASE_VERSION:-v0.04}"
 short="${sha:0:12}"
 date_utc="$(date -u +%Y%m%d)"
-tag="v0.04-${date_utc}-${short}"
+display_date="$(date -u +%Y-%m-%d)"
+tag="${version}-${date_utc}-${short}"
 server="${GITHUB_SERVER_URL:-https://github.com}"
 run_id="${GITHUB_RUN_ID:-}"
 
@@ -17,7 +19,10 @@ if [ ! -d "$artifacts_dir" ]; then
   exit 1
 fi
 
-mapfile -t files < <(find "$artifacts_dir" -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) | sort)
+mapfile -d '' -t files < <(
+  find "$artifacts_dir" -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) \
+    -print0 | sort -z
+)
 if [ "${#files[@]}" -eq 0 ]; then
   echo "No artifacts to release"
   exit 1
@@ -27,72 +32,137 @@ required=(
   drippu-windows-x64.zip
   drippu-linux-x64.tar.gz
   drippu-macos-arm64.tar.gz
+  drippu-freebsd-x64.tar.gz
   drippu-libretro-core-linux-x64.tar.gz
   drippu-libretro-core-windows-x64.zip
+  drippu-libretro-core-android-arm64.tar.gz
+  app-legacy-release.apk
+  app-mainline-release.apk
+  app-chromeOS-release.apk
+  app-genshinSpoof-release.apk
 )
 
-found_names=()
-for f in "${files[@]}"; do
-  found_names+=("$(basename "$f")")
+declare -A artifact_by_name=()
+for file in "${files[@]}"; do
+  name="$(basename "$file")"
+  if [ -n "${artifact_by_name[$name]+present}" ]; then
+    echo "duplicate release artifact name: $name"
+    exit 1
+  fi
+  artifact_by_name[$name]="$file"
 done
 
 missing=0
 for name in "${required[@]}"; do
-  if ! printf '%s\n' "${found_names[@]}" | grep -Fxq "$name"; then
+  if [ -z "${artifact_by_name[$name]+present}" ]; then
     echo "missing required artifact: $name"
     missing=1
   fi
 done
-if ! printf '%s\n' "${found_names[@]}" | grep -Eq '\.apk$'; then
-  echo "missing required artifact: at least one .apk"
-  missing=1
-fi
 if [ "$missing" -ne 0 ]; then
   echo "found:"
-  printf '  %s\n' "${found_names[@]}"
+  printf '  %s\n' "${!artifact_by_name[@]}" | sort
   exit 1
 fi
+
+friendly_platform() {
+  case "$1" in
+    drippu-windows-x64.zip) echo 'Windows x64' ;;
+    drippu-linux-x64.tar.gz) echo 'Linux x64' ;;
+    drippu-macos-arm64.tar.gz) echo 'macOS Apple Silicon' ;;
+    drippu-freebsd-x64.tar.gz) echo 'FreeBSD x64' ;;
+    drippu-libretro-core-linux-x64.tar.gz) echo 'Libretro core (Linux x64)' ;;
+    drippu-libretro-core-windows-x64.zip) echo 'Libretro core (Windows x64)' ;;
+    drippu-libretro-core-android-arm64.tar.gz) echo 'Libretro core (Android arm64)' ;;
+    app-legacy-release.apk) echo 'Android (legacy)' ;;
+    app-mainline-release.apk) echo 'Android (mainline)' ;;
+    app-chromeOS-release.apk) echo 'Android (ChromeOS)' ;;
+    app-genshinSpoof-release.apk) echo 'Android (Genshin spoof)' ;;
+    *) echo 'Other' ;;
+  esac
+}
 
 notes="$(mktemp)"
 sums="$(mktemp)"
 trap 'rm -f "$notes" "$sums"' EXIT
 
-{
-  for f in "${files[@]}"; do
-    sha256sum "$f"
-  done
-} >"$sums"
+for file in "${files[@]}"; do
+  digest="$(sha256sum "$file" | awk '{print $1}')"
+  printf '%s  %s\n' "$digest" "$(basename "$file")"
+done | sort -k2 >"$sums"
+
+previous_tag=""
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  previous_tag="$(
+    git tag --merged "$sha" --list "${version}-*" --sort=-creatordate |
+      grep -Fvx "$tag" | head -n 1 || true
+  )"
+fi
 
 {
-  echo "drippu v0.04 ${short}"
-  echo
-  echo "commit: ${sha}"
+  echo "Automated prerelease built from [\`${short}\`](${server}/${repo}/commit/${sha})."
   if [ -n "$run_id" ]; then
-    echo "run: ${server}/${repo}/actions/runs/${run_id}"
+    echo "The complete build and verification results are available in [GitHub Actions](${server}/${repo}/actions/runs/${run_id})."
   fi
   echo
-  echo "## Checksums"
+  echo "## Downloads"
   echo
-  cat "$sums"
+  echo '| Platform | Artifact |'
+  echo '| --- | --- |'
+  for name in "${required[@]}"; do
+    printf '| %s | `%s` |\n' "$(friendly_platform "$name")" "$name"
+  done
   echo
-  echo "## Toolchain"
+  echo "## What's changed"
   echo
-  mapfile -t toolchains < <(find "$artifacts_dir" -type f \( -name 'toolchain.txt' -o -name 'toolchain-*.txt' \) | sort)
-  if [ "${#toolchains[@]}" -eq 0 ]; then
-    echo "No per-job toolchain.txt files were uploaded."
-    if command -v cmake >/dev/null 2>&1; then
-      echo
-      echo "Publish runner cmake:"
-      cmake --version
+  if [ -n "$previous_tag" ]; then
+    echo "Changes since [\`${previous_tag}\`](${server}/${repo}/compare/${previous_tag}...${sha}):"
+    echo
+    changes="$(git log --first-parent --format='%H%x09%h%x09%s' "${previous_tag}..${sha}")"
+    if [ -n "$changes" ]; then
+      while IFS=$'\t' read -r commit short_commit subject; do
+        printf -- '- %s ([`%s`](%s/%s/commit/%s))\n' \
+          "$subject" "$short_commit" "$server" "$repo" "$commit"
+      done <<<"$changes"
+    else
+      echo 'No source changes since the previous automated release.'
     fi
   else
-    for t in "${toolchains[@]}"; do
-      echo "### ${t#${artifacts_dir}/}"
-      echo
-      cat "$t"
+    echo 'Initial automated build for this release channel.'
+  fi
+  echo
+  echo '## Verification'
+  echo
+  echo 'All listed platforms built successfully, and every attached archive passed the release artifact checks.'
+  echo 'Download `SHA256SUMS` alongside the artifacts and run `sha256sum -c SHA256SUMS` to verify them.'
+  echo
+  echo '<details>'
+  echo '<summary>SHA-256 checksums</summary>'
+  echo
+  echo '```text'
+  cat "$sums"
+  echo '```'
+  echo '</details>'
+  echo
+  echo '<details>'
+  echo '<summary>Build toolchains</summary>'
+  echo
+  echo '```text'
+  mapfile -d '' -t toolchains < <(
+    find "$artifacts_dir" -type f \( -name 'toolchain.txt' -o -name 'toolchain-*.txt' \) \
+      -print0 | sort -z
+  )
+  if [ "${#toolchains[@]}" -eq 0 ]; then
+    echo 'No per-job toolchain metadata was uploaded.'
+  else
+    for toolchain in "${toolchains[@]}"; do
+      printf '== %s ==\n' "${toolchain#${artifacts_dir}/}"
+      cat "$toolchain"
       echo
     done
   fi
+  echo '```'
+  echo '</details>'
 } >"$notes"
 
 echo "Releasing ${tag}"
@@ -103,7 +173,8 @@ assets=("${files[@]}" SHA256SUMS)
 
 gh release create "$tag" \
   --repo "$repo" \
-  --title "drippu v0.04 ${short}" \
+  --target "$sha" \
+  --title "drippu ${version} automated build - ${display_date}" \
   --notes-file "$notes" \
   --prerelease \
   "${assets[@]}"

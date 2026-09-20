@@ -94,17 +94,19 @@ updates for your app, and app stores will reject them.
 1. Generate a release keystore (once — guard this file with your life; losing
    it means you can never publish updates for the same app ID again):
    ```sh
-   keytool -genkeypair -v -keystore suyu-release.jks -keyalg RSA \
-     -keysize 4096 -validity 10950 -alias suyu-release
+   keytool -genkeypair -v -storetype PKCS12 \
+     -keystore drippu-release.p12 -keyalg RSA -keysize 4096 \
+     -validity 10950 -alias drippu-release
    ```
    The long validity matters: app stores require the key to stay valid well
    past 2033.
-2. Never commit `*.jks` / `*.keystore` files (already git-ignored).
+2. Never commit `*.p12`, `*.pfx`, `*.jks`, or `*.keystore` files (already
+   git-ignored).
 3. Build locally with the keystore:
    ```sh
-   export ANDROID_KEYSTORE_FILE="$PWD/suyu-release.jks"
+   export ANDROID_KEYSTORE_FILE="$PWD/drippu-release.p12"
    export ANDROID_KEYSTORE_PASS="<keystore password>"
-   export ANDROID_KEY_ALIAS="suyu-release"
+   export ANDROID_KEY_ALIAS="drippu-release"
    ./.ci/android/build.sh -t standard -b Release -r
    ```
    Without these variables the build still succeeds but prints a warning that
@@ -113,8 +115,8 @@ updates for your app, and app stores will reject them.
    fails before building if any are missing, and its APK verification rejects
    any artifact that still carries the debug certificate:
    * `ANDROID_KEYSTORE_B64` — base64 of the keystore:
-     `base64 -i suyu-release.jks | pbcopy` (macOS) or
-     `base64 -w0 suyu-release.jks` (Linux)
+     `base64 -i drippu-release.p12 | pbcopy` (macOS) or
+     `base64 -w0 drippu-release.p12` (Linux)
    * `ANDROID_KEY_ALIAS`
    * `ANDROID_KEYSTORE_PASS`
 5. Sanity-check any APK before distributing it:

@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import os
 import copy
+import os
 import re
 import shlex
 import shutil
@@ -22,6 +22,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 PR_CI_YML = REPO_ROOT / ".github" / "workflows" / "exporter-smoke.yml"
+LIBRETRO_SOURCE = REPO_ROOT / "src" / "libretro_core" / "retro_core.cpp"
+ANDROID_BUILD_GRADLE = REPO_ROOT / "src" / "android" / "app" / "build.gradle.kts"
 PUBLISH_JOB_ID = "release"
 ROLLING_TAG = "v0.04-latest"
 STATUS_FUNCS = ("always", "success", "failure", "cancelled")
@@ -264,7 +266,12 @@ def optional_job_ids(jobs: dict[str, JobSpec]) -> list[str]:
 
 def step_run_script(step: dict[str, Any]) -> str | None:
     run = step.get("run")
-    return run if isinstance(run, str) else None
+    if isinstance(run, str):
+        return run
+    action_inputs = step.get("with")
+    if isinstance(action_inputs, dict) and isinstance(action_inputs.get("run"), str):
+        return action_inputs["run"]
+    return None
 
 
 def publish_scripts(spec: JobSpec) -> list[tuple[str, str]]:
@@ -337,7 +344,7 @@ if [ "${1:-}" = "release" ] && [ "${2:-}" = "create" ]; then
   shift 3
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --repo|--title|--notes|--notes-file)
+      --repo|--target|--title|--notes|--notes-file)
         key="$1"
         val="$2"
         shift 2
@@ -550,9 +557,11 @@ def workflow_has_artifact_verification(doc: dict[str, Any]) -> bool:
         "build-windows": "verify_release_artifacts.py desktop --platform windows",
         "build-linux": "verify_release_artifacts.py desktop --platform linux",
         "build-macos": "verify_release_artifacts.py desktop --platform macos",
+        "build-freebsd": "ldd _pkg/drippu",
         "build-android": "verify_release_artifacts.py apk --platform android",
         "build-libretro": "verify_release_artifacts.py libretro --platform linux",
         "build-libretro-windows": "verify_release_artifacts.py libretro --platform windows",
+        "build-libretro-android": "tar -tzf drippu-libretro-core-android-arm64.tar.gz",
     }
     for job_id, marker in expected.items():
         spec = jobs.get(job_id)
@@ -567,6 +576,34 @@ def workflow_has_artifact_verification(doc: dict[str, Any]) -> bool:
 
     publish = jobs.get(PUBLISH_JOB_ID)
     return publish is not None and "verify-release-artifacts" in publish.needs
+
+
+def workflow_requires_android_release_signing(doc: dict[str, Any]) -> bool:
+    spec = parse_jobs(doc).get("build-android")
+    if spec is None or not ANDROID_BUILD_GRADLE.is_file():
+        return False
+    signing_configuration = "\n".join(enabled_run_lines(spec))
+    signing_configuration += "\n" + ANDROID_BUILD_GRADLE.read_text(encoding="utf-8")
+    markers = (
+        "ANDROID_KEYSTORE_B64",
+        "ANDROID_KEY_ALIAS",
+        "ANDROID_KEYSTORE_PASS",
+        'storeType = "PKCS12"',
+        "release.p12",
+        "apksigner",
+        "DEBUG_CERT",
+    )
+    return all(marker in signing_configuration for marker in markers)
+
+
+def libretro_source_handles_directory_creation() -> bool:
+    if not LIBRETRO_SOURCE.is_file():
+        return False
+    source = LIBRETRO_SOURCE.read_text(encoding="utf-8")
+    ignored_create_dir = re.search(
+        r"^\s*Common::FS::CreateDir\([^;]+\);\s*$", source, re.MULTILINE
+    )
+    return ignored_create_dir is None and '"common/logging/log.h"' not in source
 
 
 def publish_deletes_a_release(spec: JobSpec) -> bool:
@@ -602,6 +639,27 @@ def has_toolchain_metadata(trace: PublishTrace) -> bool:
     return any(key in blob for key in keys)
 
 
+def has_portable_checksums(trace: PublishTrace) -> bool:
+    entries = re.findall(r"^[0-9a-f]{64}\s+\*?(.+)$", trace.checksum_text, re.MULTILINE)
+    return bool(entries) and all("/" not in entry and "\\" not in entry for entry in entries)
+
+
+def has_formatted_release_notes(trace: PublishTrace) -> bool:
+    required_sections = ("## Downloads", "## What's changed", "## Verification")
+    return all(section in trace.notes for section in required_sections) and "```text" in trace.notes
+
+
+def release_targets_commit(trace: PublishTrace, commit: str) -> bool:
+    return any(
+        event.kind == "gh"
+        and "release" in event.args
+        and "create" in event.args
+        and "--target" in event.args
+        and commit in event.args
+        for event in trace.events
+    )
+
+
 class Check:
     def __init__(self) -> None:
         self.fails = 0
@@ -617,12 +675,19 @@ class Check:
 def sample_artifacts(missing: set[str] | None = None) -> dict[str, bytes]:
     files = {
         "windows/drippu-windows-x64.zip": b"win",
+        "windows/toolchain.txt": b"compiler=msvc\ncmake=4.1\n",
         "linux/drippu-linux-x64.tar.gz": b"lin",
+        "linux/toolchain.txt": b"compiler=gcc\ncmake=4.1\n",
         "macos/drippu-macos-arm64.tar.gz": b"mac",
-        "android/suyu.apk": b"apk",
+        "macos/toolchain.txt": b"compiler=appleclang\ncmake=4.1\n",
+        "android/app-legacy-release.apk": b"apk-legacy",
+        "android/app-mainline-release.apk": b"apk-mainline",
+        "android/app-chromeOS-release.apk": b"apk-chromeos",
+        "android/app-genshinSpoof-release.apk": b"apk-genshin",
         "libretro/drippu-libretro-core-linux-x64.tar.gz": b"lr",
         "libretro-windows/drippu-libretro-core-windows-x64.zip": b"lrw",
         "freebsd/drippu-freebsd-x64.tar.gz": b"fbsd",
+        "freebsd/toolchain.txt": b"compiler=clang\ncmake=4.1\n",
         "libretro-android/drippu-libretro-core-android-arm64.tar.gz": b"lra",
     }
     if missing:
@@ -664,14 +729,17 @@ def main() -> int:
         "required platform failure does not run Publish Release",
     )
 
-    if optional:
-        opt = optional[0]
-        opt_fail = default_results(jobs, **{opt: "failure"})
-        publishes_after_optional_fail = would_publish(jobs, opt_fail)
-        print(f"publish after optional {opt} failure: {publishes_after_optional_fail}")
+    check.expect(not optional, "release workflow has no failure-tolerant build jobs")
+    for formerly_optional in ("build-freebsd", "build-libretro-android"):
+        platform_fail = default_results(jobs, **{formerly_optional: "failure"})
+        publishes_after_platform_fail = would_publish(jobs, platform_fail)
+        print(
+            f"publish after {formerly_optional} failure: "
+            f"{publishes_after_platform_fail}"
+        )
         check.expect(
-            publishes_after_optional_fail,
-            f"optional {opt} failure still allows Publish Release",
+            formerly_optional in required and not publishes_after_platform_fail,
+            f"{formerly_optional} failure blocks Publish Release",
         )
 
     all_fail = {job_id: "failure" for job_id in jobs if job_id != PUBLISH_JOB_ID}
@@ -703,6 +771,14 @@ def main() -> int:
     check.expect(
         workflow_has_artifact_verification(doc),
         "release workflow verifies desktop and libretro packages before publishing",
+    )
+    check.expect(
+        workflow_requires_android_release_signing(doc),
+        "release workflow requires non-debug Android signing",
+    )
+    check.expect(
+        libretro_source_handles_directory_creation(),
+        "Android libretro source handles directory creation results without logging macro conflicts",
     )
     commented = copy.deepcopy(doc)
     commented_step = commented["jobs"]["build-linux"]["steps"]
@@ -774,17 +850,23 @@ def main() -> int:
     check.expect(empty_trace.created_tag is None, "empty artifacts do not create a release")
     check.expect(empty_trace.exit_code != 0, "empty artifacts fail the publish step")
 
-    print("--- drive: linux artifact missing, jobs reported success ---")
-    partial_trace = run_publish_shell(spec, sample_artifacts(missing={"linux"}), commit=commit)
-    partial_kinds = [event.kind for event in partial_trace.events]
-    print(partial_trace.stdout)
-    print(f"events: {partial_kinds}")
-    print(f"exit: {partial_trace.exit_code}")
-    check.expect(
-        "delete" not in partial_kinds and "create" not in partial_kinds,
-        "missing required linux artifact does not delete or publish",
-    )
-    check.expect(partial_trace.exit_code != 0, "missing required linux artifact fails publish")
+    for missing_job in ("linux", "freebsd", "libretro-android", "android"):
+        print(f"--- drive: {missing_job} artifact missing, jobs reported success ---")
+        partial_trace = run_publish_shell(
+            spec, sample_artifacts(missing={missing_job}), commit=commit
+        )
+        partial_kinds = [event.kind for event in partial_trace.events]
+        print(partial_trace.stdout)
+        print(f"events: {partial_kinds}")
+        print(f"exit: {partial_trace.exit_code}")
+        check.expect(
+            "delete" not in partial_kinds and "create" not in partial_kinds,
+            f"missing required {missing_job} artifact does not delete or publish",
+        )
+        check.expect(
+            partial_trace.exit_code != 0,
+            f"missing required {missing_job} artifact fails publish",
+        )
 
     print("--- drive: required artifacts present ---")
     full_trace = run_publish_shell(spec, sample_artifacts(), commit=commit)
@@ -816,6 +898,18 @@ def main() -> int:
     check.expect(
         has_toolchain_metadata(full_trace),
         "release includes toolchain metadata",
+    )
+    check.expect(
+        has_portable_checksums(full_trace),
+        "release checksums use flat download filenames",
+    )
+    check.expect(
+        has_formatted_release_notes(full_trace),
+        "release notes contain readable Markdown sections and code fences",
+    )
+    check.expect(
+        release_targets_commit(full_trace, commit),
+        "release tag targets the exact verified commit",
     )
 
     print(f"check_release_gate: {check.fails} failure(s)")

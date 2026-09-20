@@ -1,4 +1,4 @@
-name: Release v0.04 latest
+name: Automated drippu release
 
 on:
   schedule:
@@ -14,7 +14,7 @@ jobs:
     name: Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -46,7 +46,7 @@ jobs:
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-windows
           path: cmake_configure.log
@@ -66,7 +66,7 @@ jobs:
       - name: Record toolchain
         shell: bash
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
@@ -77,7 +77,7 @@ jobs:
     name: Linux
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -109,7 +109,7 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-linux
           path: cmake_configure.log
@@ -125,7 +125,7 @@ jobs:
         run: python3 .github/scripts/verify_release_artifacts.py desktop --platform linux --archive drippu-linux-x64.tar.gz
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: |
@@ -136,7 +136,7 @@ jobs:
     name: macOS
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -158,7 +158,7 @@ jobs:
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-macos
           path: cmake_configure.log
@@ -174,7 +174,7 @@ jobs:
         run: python3 .github/scripts/verify_release_artifacts.py desktop --platform macos --archive drippu-macos-arm64.tar.gz
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: |
@@ -183,10 +183,9 @@ jobs:
 
   build-freebsd:
     name: FreeBSD
-    runs-on: ubuntu-latest
-    continue-on-error: true
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -200,15 +199,26 @@ jobs:
             if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
               printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
             fi
-            cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON \
+              -DYUZU_USE_BUNDLED_QT=OFF \
+              -DVulkanHeaders_FORCE_BUNDLED=ON \
+              -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+              -GNinja
             cmake --build build --target suyu suyu-cmd -j4
             rm -rf _pkg && mkdir _pkg
             cp build/bin/suyu _pkg/drippu
-            cp build/bin/suyu-cmd _pkg/drippu-cmd 2>/dev/null || true
+            cp build/bin/suyu-cmd _pkg/drippu-cmd
+            ldd _pkg/drippu _pkg/drippu-cmd | tee freebsd-dependencies.txt
+            ! grep -q 'not found' freebsd-dependencies.txt
             tar -czf drippu-freebsd-x64.tar.gz -C _pkg .
-      - name: Record toolchain
-        run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+            {
+              printf 'commit=%s\n' "$GITHUB_SHA"
+              printf 'runner_os=FreeBSD\nrunner_arch=%s\njob=build-freebsd\n' "$(uname -m)"
+              cmake --version
+              printf 'compiler=c++\n'
+              c++ --version
+            } > toolchain.txt
+      - uses: actions/upload-artifact@v7
         with:
           name: freebsd
           path: |
@@ -219,7 +229,7 @@ jobs:
     name: Android
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -229,7 +239,7 @@ jobs:
           if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
             printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
           fi
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: microsoft
           java-version: '17'
@@ -247,8 +257,8 @@ jobs:
             echo "::error::Android release signing requires ANDROID_KEYSTORE_B64, ANDROID_KEY_ALIAS, and ANDROID_KEYSTORE_PASS."
             exit 1
           fi
-          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$GITHUB_WORKSPACE/release.jks"
-          echo "ANDROID_KEYSTORE_FILE=$GITHUB_WORKSPACE/release.jks" >> "$GITHUB_ENV"
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$GITHUB_WORKSPACE/release.p12"
+          echo "ANDROID_KEYSTORE_FILE=$GITHUB_WORKSPACE/release.p12" >> "$GITHUB_ENV"
       - name: Build APKs
         working-directory: src/android
         env:
@@ -286,7 +296,7 @@ jobs:
           fi
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: android
           path: |
@@ -297,7 +307,7 @@ jobs:
     name: Libretro
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -325,7 +335,7 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-libretro
           path: cmake_configure.log
@@ -340,7 +350,7 @@ jobs:
         run: python3 .github/scripts/verify_release_artifacts.py libretro --platform linux --archive drippu-libretro-core-linux-x64.tar.gz
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: libretro
           path: |
@@ -351,7 +361,7 @@ jobs:
     name: Libretro Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -377,7 +387,7 @@ jobs:
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-libretro-windows
           path: cmake_configure.log
@@ -396,7 +406,7 @@ jobs:
       - name: Record toolchain
         shell: bash
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: libretro-windows
           path: |
@@ -406,9 +416,8 @@ jobs:
   build-libretro-android:
     name: Libretro Android
     runs-on: ubuntu-24.04
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -437,7 +446,7 @@ jobs:
             -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-libretro-android
           path: cmake_configure.log
@@ -453,7 +462,7 @@ jobs:
           test "$(tar -tzf drippu-libretro-core-android-arm64.tar.gz | grep -c '\.so$')" -ge 1
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: libretro-android
           path: |
@@ -468,12 +477,12 @@ jobs:
 
   verify-release-artifacts:
     name: Verify release artifact structure
-    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' }}
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-freebsd.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.build-libretro-android.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' }}
     needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android, exporter-smoke, tests]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Install release-gate dependencies
@@ -495,12 +504,15 @@ jobs:
 
   release:
     name: Publish Release
-    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' && needs.verify-release-artifacts.result == 'success' }}
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-freebsd.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.build-libretro-android.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' && needs.verify-release-artifacts.result == 'success' }}
     needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android, exporter-smoke, tests, verify-release-artifacts]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: List artifacts

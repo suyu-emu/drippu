@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
@@ -42,7 +42,7 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=OFF -DYUZU_TESTS=ON -DYUZU_CMD=OFF -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-tests
           path: cmake_configure.log
@@ -76,7 +76,7 @@ jobs:
         run: |
           python3 scripts/compare_recomp_benchmark.py recomp_benchmark.json \
             --baseline src/tests/recompiler/benchmarks/recomp_benchmark_baseline.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: recomp-benchmark-baseline
           path: recomp_benchmark.json
@@ -96,7 +96,7 @@ jobs:
           PY
       - name: Upload compatibility baseline
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: recompiler-compatibility-baseline
           path: recomp-compat-baseline.json
@@ -107,7 +107,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Host arch
         run: uname -m
       - name: Configure recompiler tests (ASan+UBSan)
@@ -130,7 +130,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Host arch
         run: test "$(uname -m)" = aarch64
       - name: Configure recompiler tests (ASan+UBSan)

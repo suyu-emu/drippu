@@ -62,6 +62,8 @@ artifacts
 *.AppImage*
 *.jks
 *.keystore
+*.p12
+*.pfx
 /install*
 vulkansdk*.exe
 *.tar.zst

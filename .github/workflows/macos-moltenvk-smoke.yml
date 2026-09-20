@@ -16,7 +16,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Host arch
         run: |
           uname -m
@@ -42,7 +42,7 @@ jobs:
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cmake-log-macos-moltenvk-smoke
           path: cmake_configure.log
@@ -80,7 +80,7 @@ jobs:
           fi
       - name: Upload smoke log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-moltenvk-smoke-log
           path: macos-moltenvk-smoke.log
