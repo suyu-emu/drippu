@@ -6,10 +6,6 @@
 #include <QDialog>
 #include <QString>
 
-namespace Ui {
-class ModeSelector;
-}
-
 /// The three operational modes of the application.
 enum class AppMode {
     Gamer,      ///< Default: game library, simple controls, Steam integration
@@ -29,7 +25,7 @@ public:
     /// Returns the mode the user selected (default: Gamer).
     [[nodiscard]] AppMode SelectedMode() const;
 
-    /// Convenience: returns true when the user checked "remember my choice".
+    /// Returns whether the selected profile should be remembered.
     [[nodiscard]] bool RememberChoice() const;
 
     /// Loads the last-selected mode from QSettings (or returns Gamer).
@@ -44,15 +40,13 @@ private slots:
     void OnHackerClicked();
 
 private:
-    void SetupUi();
     void ApplySelection(AppMode mode);
 
     AppMode selected_mode_{AppMode::Gamer};
     bool remember_choice_{true};
 
-    // Owned widgets (created in SetupUi, no .ui file needed)
+    // Owned widgets; this dialog is built directly without a .ui file.
     class QPushButton* btn_gamer_{};
     class QPushButton* btn_programmer_{};
     class QPushButton* btn_hacker_{};
-    class QLabel* lbl_description_{};
 };
