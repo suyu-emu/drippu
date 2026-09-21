@@ -1,0 +1,52 @@
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <string>
+#include <unordered_map>
+
+#include "common/common_types.h"
+
+// Only one game version per title can reach Nextendo's servers; there's no server-side
+// version-gate endpoint, so this table is the source of truth.
+//
+// Lives in common/, not citron/: it's read from both the Qt frontend (game-list "needs
+// update" badge) and core/hle/service/acc (the actual online PID gate) -- same reason
+// Common::NextendoAccount lives here instead of in either layer alone.
+namespace Nextendo::CompatibleTitles {
+
+inline const std::unordered_map<u64, std::string>& Table() {
+    static const std::unordered_map<u64, std::string> table{
+        {0x0100152000022000, "4.0.0"},  // Mario Kart 8 Deluxe
+        {0x01006a800016e000, "13.0.5"}, // Super Smash Bros. Ultimate
+        {0x0100f8f0000a2000, "5.5.2"},  // Splatoon 2 (EU)
+        {0x01003bc0000a0000, "5.5.2"},  // Splatoon 2 (US)
+        {0x01003c700009c800, "5.5.2"},  // Splatoon 2 (JP)
+        {0x01006f8002326000, "3.0.3"},  // Animal Crossing: New Horizons
+        {0x0100dca0064a6000, "1.4.0"},  // Luigi's Mansion 3
+        {0x01009b500007c000, "5.5.1"},  // ARMS
+        {0x0100bde00862a000, "3.1.1"},  // Mario Tennis Aces
+        {0x0100c2500fc20000, "11.3.0"}, // Splatoon 3
+        {0x01009b90006dc000, "3.0.3"},  // Super Mario Maker 2
+        {0x010015100b514000, "1.2.1"},  // Super Mario Bros. Wonder
+        {0x0100277011f1a000, "1.0.2"},  // Super Mario Bros. 35
+        {0x0100770008dd8000, "1.4.0"},  // Monster Hunter Generations Ultimate
+        {0x010047700d540000, "2.0.1"},  // Clubhouse Games: 51 Worldwide Classics
+        {0x0100c6f01c4f8000, "1.3.0"},  // METAL GEAR SOLID: Peace Walker - Master Collection Version
+        {0x01006fe013472000, "1.1.1"},  // Mario Party Superstars
+        {0x0100f9f00c696000, "1.0.15"}, // Crash Team Racing Nitro-Fueled
+    };
+    return table;
+}
+
+inline bool IsVersionOk(u64 program_id, const std::string& installed_version) {
+    const auto& table = Table();
+    const auto it = table.find(program_id);
+    if (it == table.end()) {
+        return true;
+    }
+    return installed_version.empty() || installed_version == it->second;
+}
+
+} // namespace Nextendo::CompatibleTitles

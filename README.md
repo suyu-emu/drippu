@@ -2,7 +2,7 @@
 
 <h1 align="center">
   <br>
-  <img src="dist/readme/drippu-icon.png" alt="drippu icon" height="128">
+  <img src="dist/readme/drippu.svg" alt="drippu icon" height="128">
   <br>
   <b>drippu</b>
   <br>
@@ -20,11 +20,11 @@ Nintendo Switch emulator and native recompiler — the experimental edition of s
 
 ---
 
-> **drippu is the experimental edition of suyu, maintained by the [suyu Emulator organization](https://github.com/suyu-emu).**
+> **drippu (also known as suyu experimental), is a Nintendo Switch Emulation, Modding, Game Development and Recompiler toolkit maintained by the [suyu Emulator organization](https://github.com/suyu-emu). Started by the *new* suyu project leads, drippu acts as an Experimental sandbox for developers to try implementing changes to the codebase that may prove too radical or unstable to (yet) implement into suyu proper.**
 >
-> This is where the project explores emulator, recompiler, UI, and platform work that may change quickly. Expect rough edges and evolving behavior.
+> This is where the project more deeply explores some emulator, recompiler, UI, and platform work that may change quickly and significantly. Expect rough edges and evolving behavior.
 >
-> drippu shares suyu’s codebase and history (itself based on Eden / yuzu). Binary and internal target names may still say `suyu` in places; the product presents as **drippu**.
+> drippu shares suyu’s codebase and history (itself based on yuzu). Binary and internal target names may still say `suyu` in places for now, but the product presents as **drippu** and will do for the foreseeable future.
 
 ## About
 
@@ -37,11 +37,13 @@ Part of the suyu project and based on [Eden](https://git.eden-emu.dev/eden-emu/e
 
 ## Status
 
-drippu is maintained by the suyu Emulator organization as its experimental project. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, macOS, Android) when configured.
+drippu is maintained by the suyu Emulator organization as its experimental project. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, macOS, Android, Libretro and FreeBSD) when configured.
 
 Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs through
 Vulkan/MoltenVK with the bundled MoltenVK library; see [macOS](#macos). Android is inherited
-from upstream. iOS is not included.
+from upstream. iOS is in progress.
+
+For our rough plan, read [ROADMAP.MD](docs/ROADMAP.md).
 
 ## Legal Notice
 

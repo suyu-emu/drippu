@@ -1,0 +1,56 @@
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <QStandardItem>
+#include <QString>
+
+#include "common/common_types.h"
+
+class NextendoFriendItem : public QStandardItem {
+public:
+    static constexpr int PidRole = Qt::UserRole + 1;
+    static constexpr int NameRole = Qt::UserRole + 2;
+    static constexpr int FriendCodeRole = Qt::UserRole + 3;
+    static constexpr int PresenceRole = Qt::UserRole + 4;    // s32: 0 offline, 1 online, 2 in-game
+    static constexpr int GamePresenceRole = Qt::UserRole + 5; // display name of the running game, may be empty
+    static constexpr int AvatarB64Role = Qt::UserRole + 6;
+    static constexpr int IsRequestRole = Qt::UserRole + 7;   // true in the incoming-requests list
+    static constexpr int PillLabelRole = Qt::UserRole + 8;   // overrides the single-pill's default "Remove" text
+    static constexpr int IsMeRole = Qt::UserRole + 9;        // true for the local player's own row; suppresses the pill
+
+    NextendoFriendItem(u64 pid, const QString& name, const QString& friend_code, s32 presence,
+                       const QString& game, const QString& avatar_b64, bool is_request,
+                       const QString& pill_label = QString{}, bool is_me = false) {
+        setEditable(false);
+        setData(QVariant::fromValue<qulonglong>(pid), PidRole);
+        setData(name, NameRole);
+        setData(friend_code, FriendCodeRole);
+        setData(presence, PresenceRole);
+        setData(game, GamePresenceRole);
+        setData(avatar_b64, AvatarB64Role);
+        setData(is_request, IsRequestRole);
+        setData(pill_label, PillLabelRole);
+        setData(is_me, IsMeRole);
+    }
+};
+
+class NextendoHistoryItem : public QStandardItem {
+public:
+    static constexpr int TitleIdRole = Qt::UserRole + 1;
+    static constexpr int NameRole = Qt::UserRole + 2;
+    static constexpr int IconB64Role = Qt::UserRole + 3;
+    static constexpr int SecondsRole = Qt::UserRole + 4;
+    static constexpr int LastPlayedRole = Qt::UserRole + 5; // RFC3339 string, may be empty
+
+    NextendoHistoryItem(const QString& title_id, const QString& name, const QString& icon_b64,
+                        u64 seconds, const QString& last_played) {
+        setEditable(false);
+        setData(title_id, TitleIdRole);
+        setData(name, NameRole);
+        setData(icon_b64, IconB64Role);
+        setData(QVariant::fromValue<qulonglong>(seconds), SecondsRole);
+        setData(last_played, LastPlayedRole);
+    }
+};
