@@ -113,6 +113,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QTreeView>
 #include <QUrl>
 #include <QtConcurrent/QtConcurrent>
+#include <JlCompress.h>
 
 #ifdef HAVE_SDL2
 #include <SDL.h> // For SDL ScreenSaver functions
@@ -4622,11 +4623,76 @@ void GMainWindow::OnInstallFirmware() {
         return;
     }
 
-    const QString firmware_source_location = QFileDialog::getExistingDirectory(
-        this, tr("Select Dumped Firmware Source Location"), {}, QFileDialog::ShowDirsOnly);
-    if (firmware_source_location.isEmpty()) {
+    // Most firmware dumps ship as a ZIP archive, so accept either a .zip file
+    // or an already-unzipped folder instead of forcing the user to extract it
+    // first.
+    QMessageBox source_choice(this);
+    source_choice.setWindowTitle(tr("Install Firmware"));
+    source_choice.setText(tr("Install firmware from a ZIP archive or an unzipped folder?"));
+    QPushButton* zip_button = source_choice.addButton(tr("Choose ZIP File..."), QMessageBox::AcceptRole);
+    QPushButton* folder_button =
+        source_choice.addButton(tr("Choose Folder..."), QMessageBox::AcceptRole);
+    source_choice.addButton(QMessageBox::Cancel);
+    source_choice.exec();
+    QAbstractButton* clicked = source_choice.clickedButton();
+    if (clicked != zip_button && clicked != folder_button) {
         return;
     }
+
+    QString firmware_source_location;
+    std::optional<std::filesystem::path> extracted_temp_dir;
+    if (clicked == zip_button) {
+        const QString zip_path = QFileDialog::getOpenFileName(
+            this, tr("Select Dumped Firmware ZIP"), {}, tr("Zipped Archives (*.zip)"));
+        if (zip_path.isEmpty()) {
+            return;
+        }
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path tmp = fs::temp_directory_path(ec) / "suyu" / "firmware";
+        if (ec) {
+            QMessageBox::critical(this, tr("Firmware install failed"),
+                                  tr("Could not locate the system temporary directory."));
+            return;
+        }
+        fs::remove_all(tmp, ec);
+        ec.clear();
+        fs::create_directories(tmp, ec);
+        if (ec) {
+            QMessageBox::critical(this, tr("Firmware install failed"),
+                                  tr("Could not prepare a temporary directory for the firmware."));
+            return;
+        }
+        QFile zip_file(zip_path);
+        const QStringList extracted =
+            JlCompress::extractDir(&zip_file, QString::fromStdString(tmp.string()));
+        if (extracted.isEmpty()) {
+            fs::remove_all(tmp, ec);
+            QMessageBox::warning(this, tr("Firmware install failed"),
+                                 tr("Could not extract any files from the selected ZIP archive."));
+            return;
+        }
+        extracted_temp_dir = tmp;
+        firmware_source_location = QString::fromStdString(tmp.string());
+    } else {
+        firmware_source_location = QFileDialog::getExistingDirectory(
+            this, tr("Select Dumped Firmware Source Location"), {}, QFileDialog::ShowDirsOnly);
+        if (firmware_source_location.isEmpty()) {
+            return;
+        }
+    }
+    // Always clean up the temporary extraction directory, including on the
+    // early returns below.
+    SCOPE_EXIT {
+        if (extracted_temp_dir) {
+            std::error_code ec;
+            std::filesystem::remove_all(*extracted_temp_dir, ec);
+            if (ec) {
+                LOG_WARNING(Frontend, "Failed to clean up extracted firmware cache: {}",
+                            ec.message());
+            }
+        }
+    };
 
     QProgressDialog progress(tr("Installing Firmware..."), tr("Cancel"), 0, 100, this);
     progress.setWindowModality(Qt::WindowModal);

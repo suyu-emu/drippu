@@ -7,6 +7,7 @@
 #include <thread>
 
 #include <ranges>
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -64,16 +65,24 @@ void MasterSemaphore::Refresh() {
         return;
     }
 
-    u64 this_tick{};
-    u64 counter{};
-    do {
-        this_tick = gpu_tick.load(std::memory_order_acquire);
-        counter = semaphore.GetCounter();
-        if (counter < this_tick) {
-            return;
-        }
-    } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
-                                             std::memory_order_relaxed));
+    try {
+        u64 this_tick{};
+        u64 counter{};
+        do {
+            this_tick = gpu_tick.load(std::memory_order_acquire);
+            counter = semaphore.GetCounter();
+            if (counter < this_tick) {
+                return;
+            }
+        } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
+                                                 std::memory_order_relaxed));
+    } catch (const vk::Exception& e) {
+        // MoltenVK / drivers can fail the counter query on device loss or during
+        // teardown. Never let that escape onto the GPU thread (it would
+        // std::terminate the whole process, as seen on macOS). Log and keep the
+        // last known tick so the next wait retries instead of crashing.
+        LOG_ERROR(Render_Vulkan, "Failed to refresh timeline semaphore counter: {}", e.what());
+    }
 }
 
 void MasterSemaphore::Wait(u64 tick) {
@@ -91,23 +100,33 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
-    // No need to wait if the GPU is ahead of the tick
-    if (IsFree(tick)) {
-        return;
+    try {
+        // No need to wait if the GPU is ahead of the tick
+        if (IsFree(tick)) {
+            return;
+        }
+
+        // Update the GPU tick and try again
+        Refresh();
+
+        if (IsFree(tick)) {
+            return;
+        }
+
+        // If none of the above is hit, fallback to a regular wait
+        while (!semaphore.Wait(tick)) {
+        }
+
+        Refresh();
+    } catch (const vk::Exception& e) {
+        // vkWaitSemaphores throws on anything other than SUCCESS/TIMEOUT
+        // (e.g. VK_ERROR_DEVICE_LOST on MoltenVK). Propagating out of here used
+        // to unwind through Layer::ConfigureDraw / BlitScreen::DrawToFrame /
+        // RendererVulkan::Composite on the GPU thread with no handler, killing
+        // the emulator via std::terminate. Log and skip the frame instead; the
+        // submit path reports device loss separately.
+        LOG_ERROR(Render_Vulkan, "Failed to wait for GPU tick {}: {}", tick, e.what());
     }
-
-    // Update the GPU tick and try again
-    Refresh();
-
-    if (IsFree(tick)) {
-        return;
-    }
-
-    // If none of the above is hit, fallback to a regular wait
-    while (!semaphore.Wait(tick)) {
-    }
-
-    Refresh();
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
@@ -345,8 +364,15 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             wait_queue.pop();
         }
 
-        fence.Wait();
-        fence.Reset();
+        const VkResult fence_result = fence.Wait();
+        if (fence_result != VK_SUCCESS && fence_result != VK_TIMEOUT) {
+            LOG_ERROR(Render_Vulkan, "Fence wait failed with {}", static_cast<int>(fence_result));
+        }
+        try {
+            fence.Reset();
+        } catch (const vk::Exception& e) {
+            LOG_ERROR(Render_Vulkan, "Failed to reset fence: {}", e.what());
+        }
 
         {
             std::scoped_lock lock{free_mutex};

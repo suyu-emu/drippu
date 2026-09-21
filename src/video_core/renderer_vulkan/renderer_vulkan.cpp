@@ -180,7 +180,22 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         render_window.OnFrameDisplayed();
     };
 
-    RenderAppletCaptureLayer(framebuffers);
+    try {
+        RenderAppletCaptureLayer(framebuffers);
+    } catch (const vk::Exception& e) {
+        // The capture layer runs on the GPU thread with no other handler above
+        // it; an uncaught Vulkan error here (e.g. MoltenVK device loss) used to
+        // std::terminate the emulator mid-game on macOS. Skip the frame instead.
+        LOG_ERROR(Render_Vulkan, "Skipping applet capture layer after Vulkan error: {}", e.what());
+        gpu.RendererFrameEndNotify();
+        rasterizer.TickFrame();
+        return;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "Skipping applet capture layer after error: {}", e.what());
+        gpu.RendererFrameEndNotify();
+        rasterizer.TickFrame();
+        return;
+    }
 
     if (is_headless) {
         static unsigned headless_composite_count = 0;
@@ -216,16 +231,24 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         return;
     }
 
-    RenderScreenshot(framebuffers);
-    Frame* frame = present_manager.GetRenderFrame();
+    try {
+        RenderScreenshot(framebuffers);
+        Frame* frame = present_manager.GetRenderFrame();
 
-    scheduler.RequestOutsideRenderPassOperationContext();
-    blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
-                               render_window.GetFramebufferLayout(), swapchain.GetImageCount(),
-                               swapchain.GetImageViewFormat());
-    scheduler.Flush(*frame->render_ready);
-
-    present_manager.Present(frame);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
+                                   render_window.GetFramebufferLayout(), swapchain.GetImageCount(),
+                                   swapchain.GetImageViewFormat());
+        scheduler.Flush(*frame->render_ready);
+        present_manager.Present(frame);
+    } catch (const vk::Exception& e) {
+        // Present runs on the GPU thread; MoltenVK swapchain/present errors
+        // (out-of-date, suboptimal, device loss on resize/display change) must
+        // skip the frame, not terminate the process.
+        LOG_ERROR(Render_Vulkan, "Skipping present after Vulkan error: {}", e.what());
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "Skipping present after error: {}", e.what());
+    }
 
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();

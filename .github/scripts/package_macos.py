@@ -96,16 +96,57 @@ def loader_reference(consumer: Path, bundled: Path) -> str:
     return "@loader_path/" + relative
 
 
+def _executable_path_candidates(
+    dependency: str, consumer: Path, app: Path, cli: Path, frameworks: Path
+) -> list[Path]:
+    """Candidate source files for an @executable_path/ dependency.
+
+    A dylib inside Frameworks can be loaded by either the .app executable
+    (Contents/MacOS) or the sibling CLI (output-dir/drippu-cmd), so
+    @executable_path resolves differently per loader. The bundled copy in
+    Frameworks may also not exist yet when its referrer is processed
+    (order-dependent), so fall back to the Homebrew original by basename.
+    """
+    suffix = dependency.removeprefix("@executable_path/")
+    candidates: list[Path] = []
+    # Resolved against the .app executable (valid for in-bundle loads).
+    candidates.append((app / "Contents" / "MacOS" / suffix).resolve())
+    # Resolved against the sibling CLI (output-dir/<cli>).
+    candidates.append((cli.parent / suffix).resolve())
+    # The common macdeployqt leftover: @executable_path/../Frameworks/<lib>
+    # inside a Frameworks dylib means "my sibling in Frameworks".
+    if suffix.startswith("../Frameworks/"):
+        candidates.append((frameworks / suffix.removeprefix("../Frameworks/")).resolve())
+    # Fall back to the development install by basename so bundling does not
+    # depend on processing order (the Frameworks copy may not exist yet).
+    basename = Path(suffix).name
+    for root in (Path("/opt/homebrew/lib"), Path("/usr/local/lib")):
+        candidates.append(root / basename)
+    return candidates
+
+
 def dependency_source(
     dependency: str, consumer: Path, app: Path, cli: Path, frameworks: Path
 ) -> Path | None:
     if external_dependency(dependency):
         return Path(dependency)
     if dependency.startswith("@executable_path/"):
-        executable_dir = cli.parent if consumer == cli else app / "Contents" / "MacOS"
-        candidate = (executable_dir / dependency.removeprefix("@executable_path/")).resolve()
+        for candidate in _executable_path_candidates(dependency, consumer, app, cli, frameworks):
+            if candidate.exists() and candidate.is_file():
+                return candidate
+    if dependency.startswith("@loader_path/"):
+        # Already loader-relative (correct for Frameworks-internal refs).
+        # Resolve to verify it exists; if it does, nothing needs copying.
+        candidate = (consumer.parent / dependency.removeprefix("@loader_path/")).resolve()
         if candidate.exists():
-            return candidate
+            return None
+        # Broken @loader_path: try the bundled Frameworks copy / Homebrew by basename.
+        basename = Path(dependency.removeprefix("@loader_path/")).name
+        for fallback in (frameworks / basename, Path("/opt/homebrew/lib") / basename,
+                         Path("/usr/local/lib") / basename):
+            if fallback.exists():
+                return fallback
+        return None
     if dependency.startswith("@rpath/"):
         relative = Path(dependency.removeprefix("@rpath/"))
         for root in (frameworks, Path("/opt/homebrew/lib"), Path("/usr/local/lib")):
@@ -147,6 +188,34 @@ def bundle_non_system_libraries(app: Path, cli: Path) -> None:
             if any(external_dependency(install_id.strip()) for install_id in install_ids):
                 run("install_name_tool", "-id", loader_reference(binary, binary), binary)
 
+    # Second pass: macdeployqt (and some Homebrew builds) leave
+    # @executable_path/../Frameworks/<lib> inside Frameworks dylibs. That
+    # resolves for the .app executable but NOT for the sibling CLI
+    # (output-dir/drippu-cmd), whose @executable_path is output-dir/ — this
+    # caused dyld "Library not loaded: @executable_path/../Frameworks/..."
+    # crashes at launch. Rewrite leftovers to @loader_path siblings, which
+    # resolve identically no matter which executable loads them.
+    for binary in macho_files(frameworks):
+        for dependency in dependencies(binary):
+            if not dependency.startswith("@executable_path/"):
+                continue
+            suffix = dependency.removeprefix("@executable_path/")
+            target_name = Path(suffix).name
+            sibling = (binary.parent / target_name).resolve()
+            frameworks_root_hit = frameworks / target_name
+            if sibling.exists() or frameworks_root_hit.exists():
+                run("install_name_tool", "-change", dependency,
+                    f"@loader_path/{target_name}", binary)
+            else:
+                # Try to bundle the missing sibling from Homebrew, then rewrite.
+                for root in (Path("/opt/homebrew/lib"), Path("/usr/local/lib")):
+                    source = root / target_name
+                    if source.exists():
+                        destination = copy_dependency(source, frameworks)
+                        run("install_name_tool", "-change", dependency,
+                            loader_reference(binary, destination), binary)
+                        break
+
     for binary in macho_files(app) + [cli]:
         for path in rpaths(binary):
             if path.startswith(FORBIDDEN_PREFIXES):
@@ -158,8 +227,18 @@ def reference_exists(dependency: str, consumer: Path, app: Path, cli: Path) -> b
     if dependency.startswith("@loader_path/"):
         return (consumer.parent / dependency.removeprefix("@loader_path/")).resolve().exists()
     if dependency.startswith("@executable_path/"):
+        # Frameworks dylibs are loaded by BOTH the .app executable and the
+        # sibling CLI, which have different @executable_path values. Require
+        # the reference to resolve for both loaders; otherwise it is a latent
+        # dyld crash for one of them (and should have been rewritten to
+        # @loader_path by bundle_non_system_libraries).
+        suffix = dependency.removeprefix("@executable_path/")
+        app_hit = (app / "Contents" / "MacOS" / suffix).resolve().exists()
+        cli_hit = (cli.parent / suffix).resolve().exists()
+        if frameworks in consumer.parents:
+            return app_hit and cli_hit
         executable_dir = cli.parent if consumer == cli else app / "Contents" / "MacOS"
-        return (executable_dir / dependency.removeprefix("@executable_path/")).resolve().exists()
+        return (executable_dir / suffix).resolve().exists()
     if dependency.startswith("@rpath/"):
         relative = dependency.removeprefix("@rpath/")
         return (frameworks / relative).exists()
