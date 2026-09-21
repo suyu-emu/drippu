@@ -5,6 +5,12 @@ on:
     - cron: '0 0 1 * *'
     - cron: '0 0 * * 0'
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: Release version (for example, v0.0.5)
+        required: true
+        default: v0.0.5
+        type: string
 
 permissions:
   contents: write
@@ -587,4 +593,5 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.release_version || 'v0.0.5' }}
         run: bash .github/scripts/publish_release.sh
