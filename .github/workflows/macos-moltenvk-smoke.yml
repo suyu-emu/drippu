@@ -31,12 +31,15 @@ jobs:
             printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
           fi
       - name: Install deps
-        run: brew install ninja qt@6 openssl ffmpeg glslang boost
+        run: >-
+          brew install ninja qt@6 openssl ffmpeg glslang boost
+          pkgconf libusb enet sdl3 opus nasm autoconf automake libtool
       - name: Configure
         run: |
           cmake --version
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl);$(brew --prefix ffmpeg)" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl);$(brew --prefix ffmpeg);$(brew --prefix libusb);$(brew --prefix enet);$(brew --prefix sdl3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DYUZU_USE_BUNDLED_MOLTENVK=ON 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0

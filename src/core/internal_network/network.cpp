@@ -214,7 +214,11 @@ SOCKET GetInterruptSocket() {
 }
 
 sockaddr TranslateFromSockAddrIn(SockAddrIn input) {
-    sockaddr_in result;
+    sockaddr_in result{};
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    result.sin_len = sizeof(result);
+#endif
 
     switch (static_cast<Domain>(input.family)) {
     case Domain::INET:

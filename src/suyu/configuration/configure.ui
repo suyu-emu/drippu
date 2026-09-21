@@ -17,7 +17,7 @@
    </size>
   </property>
   <property name="windowTitle">
-   <string>suyu Configuration</string>
+   <string>drippu Configuration</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>

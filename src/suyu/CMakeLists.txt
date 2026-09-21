@@ -386,8 +386,15 @@ if (APPLE)
     set(MACOSX_ICON "../../dist/suyu.icns")
     set_source_files_properties(${MACOSX_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     target_sources(suyu PRIVATE ${MACOSX_ICON})
-    set_target_properties(suyu PROPERTIES MACOSX_BUNDLE TRUE)
-    set_target_properties(suyu PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist)
+    set_target_properties(suyu PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist
+        MACOSX_BUNDLE_GUI_IDENTIFIER dev.drippu.emulator
+        MACOSX_BUNDLE_BUNDLE_NAME drippu
+        MACOSX_BUNDLE_BUNDLE_VERSION 0.4.0
+        MACOSX_BUNDLE_SHORT_VERSION_STRING 0.4.0
+        MACOSX_BUNDLE_COPYRIGHT "Copyright 2026 drippu contributors"
+    )
 
     # MOLTENVK_LIBRARY is resolved in externals/CMakeLists.txt, either from the
     # bundled CPM package (YUZU_USE_BUNDLED_MOLTENVK) or an installed MoltenVK.

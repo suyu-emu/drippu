@@ -51,7 +51,18 @@ def unpack(archive: Path, destination: Path) -> None:
                 target = (destination / member.name).resolve()
                 if destination_root not in target.parents and target != destination_root:
                     fail(f"unsafe tar member: {member.name}")
-                if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                if member.issym():
+                    # macOS frameworks use relative symlinks for Versions/Current
+                    # and their top-level binary/resources. Permit those only when
+                    # the resolved link remains inside the extraction directory.
+                    link_target = (destination / member.name).parent / member.linkname
+                    resolved_link = link_target.resolve()
+                    if member.linkname.startswith("/") or (
+                        destination_root not in resolved_link.parents
+                        and resolved_link != destination_root
+                    ):
+                        fail(f"unsafe tar symlink: {member.name} -> {member.linkname}")
+                elif member.islnk() or member.isdev() or member.isfifo():
                     fail(f"special tar member is not allowed: {member.name}")
             package.extractall(destination)
         return
@@ -156,8 +167,12 @@ def desktop_binaries(root: Path, target: str) -> list[Path]:
 
 def launch_desktop(binary: Path, target: str) -> None:
     env = os.environ.copy()
-    if target in ("linux", "macos"):
-        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    if target == "linux":
+        env["QT_QPA_PLATFORM"] = "offscreen"
+    elif target == "macos":
+        # Release bundles carry the native Cocoa plugin, not Qt's optional
+        # offscreen plugin. GitHub's macOS runner provides a WindowServer.
+        env["QT_QPA_PLATFORM"] = "cocoa"
     command = [str(binary), "--help"]
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
@@ -181,8 +196,10 @@ def launch_desktop(binary: Path, target: str) -> None:
 def smoke_cli(binary: Path, target: str) -> None:
     """Run each packaged command-line binary with a bounded success probe."""
     env = os.environ.copy()
-    if target in ("linux", "macos"):
-        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    if target == "linux":
+        env["QT_QPA_PLATFORM"] = "offscreen"
+    elif target == "macos":
+        env["QT_QPA_PLATFORM"] = "cocoa"
     try:
         result = run([str(binary), "--version"], timeout=12, env=env)
     except OSError as exc:

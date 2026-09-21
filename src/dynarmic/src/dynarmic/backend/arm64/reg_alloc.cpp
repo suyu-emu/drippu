@@ -408,6 +408,7 @@ int RegAlloc::RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* 
         return write_loc;
     } else if constexpr (kind == HostLoc::Kind::Flags) {
         ASSERT(false && "Incorrect function for ReadWrite of flags");
+        return write_loc;
     } else {
         UNREACHABLE();
     }

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <charconv>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -92,12 +93,15 @@ int ParamPackage::Get(const std::string& key, int default_value) const {
         return default_value;
     }
 
-    try {
-        return std::stoi(pair->second);
-    } catch (const std::logic_error&) {
+    int value{};
+    const auto* const begin = pair->second.data();
+    const auto* const end = begin + pair->second.size();
+    const auto [position, error] = std::from_chars(begin, end, value);
+    if (error != std::errc{} || position != end) {
         LOG_ERROR(Common, "failed to convert {} to int", pair->second);
         return default_value;
     }
+    return value;
 }
 
 float ParamPackage::Get(const std::string& key, float default_value) const {

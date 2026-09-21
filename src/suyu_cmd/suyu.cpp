@@ -124,7 +124,7 @@ static void PrintHelp(const char* argv0) {
 }
 
 static void PrintVersion() {
-    std::cout << "suyu" << Common::g_scm_branch << " " << Common::g_scm_desc << std::endl;
+    std::cout << "drippu " << Common::g_scm_branch << " " << Common::g_scm_desc << std::endl;
 }
 
 static void OnStateChanged(const Network::RoomMember::State& state) {
@@ -459,7 +459,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    LOG_INFO(Frontend, "suyu-cmd starting up...");
+    LOG_INFO(Frontend, "drippu-cmd starting up...");
     Common::DetachedTasks detached_tasks;
 
     int option_index = 0;
@@ -818,10 +818,10 @@ int main(int argc, char** argv) {
                  Common::FS::GetSuyuPathString(Common::FS::SuyuPath::KeysDir));
     }
 
-    LOG_INFO(Frontend, "suyu-cmd: Initializing system...");
+    LOG_INFO(Frontend, "drippu-cmd: Initializing system...");
     Core::System system{};
     system.Initialize();
-    LOG_INFO(Frontend, "suyu-cmd: System initialized.");
+    LOG_INFO(Frontend, "drippu-cmd: System initialized.");
 
     InputCommon::InputSubsystem input_subsystem{};
 
@@ -851,7 +851,7 @@ int main(int argc, char** argv) {
     system.CoreTiming().SetTimerResolutionNs(Common::Windows::GetCurrentTimerResolution());
 #endif
 
-    LOG_INFO(Frontend, "suyu-cmd: Window created, loading game...");
+    LOG_INFO(Frontend, "drippu-cmd: Window created, loading game...");
     system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
@@ -888,9 +888,9 @@ int main(int argc, char** argv) {
     } else {
         load_parameters.applet_id = Service::AM::AppletId::Application;
     }
-    LOG_INFO(Frontend, "suyu-cmd: Calling system.Load for '{}'...", filepath);
+    LOG_INFO(Frontend, "drippu-cmd: Calling system.Load for '{}'...", filepath);
     const Core::SystemResultStatus load_result{system.Load(*emu_window, filepath, load_parameters)};
-    LOG_INFO(Frontend, "suyu-cmd: system.Load returned: {}", static_cast<int>(load_result));
+    LOG_INFO(Frontend, "drippu-cmd: system.Load returned: {}", static_cast<int>(load_result));
 
     switch (load_result) {
     case Core::SystemResultStatus::ErrorGetLoader:
@@ -947,7 +947,7 @@ int main(int argc, char** argv) {
     // startup instability it works around was originally seen.
     if (!g_native_export_mode && Settings::values.use_disk_shader_cache.GetValue()) {
         LOG_WARNING(Frontend,
-                    "suyu-cmd: disabling disk shader cache for this run to avoid known startup instability");
+                    "drippu-cmd: disabling disk shader cache for this run to avoid known startup instability");
         Settings::values.use_disk_shader_cache.SetValue(false);
     }
 
@@ -990,10 +990,10 @@ int main(int argc, char** argv) {
     detached_tasks.WaitForAllTasks();
     return 0;
     } catch (const std::exception& e) {
-        LOG_CRITICAL(Frontend, "Unhandled fatal exception in suyu-cmd: {}", e.what());
+        LOG_CRITICAL(Frontend, "Unhandled fatal exception in drippu-cmd: {}", e.what());
         return -1;
     } catch (...) {
-        LOG_CRITICAL(Frontend, "Unhandled unknown fatal exception in suyu-cmd");
+        LOG_CRITICAL(Frontend, "Unhandled unknown fatal exception in drippu-cmd");
         return -1;
     }
 }

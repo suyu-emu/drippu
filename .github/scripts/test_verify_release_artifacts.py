@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -72,6 +74,49 @@ class VerifyReleaseArtifactsTest(unittest.TestCase):
                 package.writestr("../outside", "must not extract")
             with self.assertRaises(RuntimeError):
                 verify.verify(archive, "structure", "generic")
+
+    def test_allows_relative_macos_framework_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "framework.tar.gz"
+            framework_binary = "drippu.app/Contents/Frameworks/QtCore.framework/Versions/A/QtCore"
+            with tarfile.open(archive, "w:gz") as package:
+                binary = tarfile.TarInfo(framework_binary)
+                binary.size = 4
+                package.addfile(binary, io.BytesIO(b"mach"))
+                current = tarfile.TarInfo(
+                    "drippu.app/Contents/Frameworks/QtCore.framework/Versions/Current"
+                )
+                current.type = tarfile.SYMTYPE
+                current.linkname = "A"
+                package.addfile(current)
+                top_level = tarfile.TarInfo(
+                    "drippu.app/Contents/Frameworks/QtCore.framework/QtCore"
+                )
+                top_level.type = tarfile.SYMTYPE
+                top_level.linkname = "Versions/Current/QtCore"
+                package.addfile(top_level)
+
+            extracted = root / "extracted"
+            extracted.mkdir()
+            verify.unpack(archive, extracted)
+            link = extracted / "drippu.app/Contents/Frameworks/QtCore.framework/QtCore"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.read_bytes(), b"mach")
+
+    def test_rejects_tar_symlink_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "bad.tar.gz"
+            with tarfile.open(archive, "w:gz") as package:
+                link = tarfile.TarInfo("escape")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "../outside"
+                package.addfile(link)
+            extracted = root / "extracted"
+            extracted.mkdir()
+            with self.assertRaises(RuntimeError):
+                verify.unpack(archive, extracted)
 
 
 if __name__ == "__main__":
