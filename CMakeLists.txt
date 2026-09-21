@@ -234,6 +234,11 @@ option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
 option(SUYU_BUILD_LIBRETRO_CORE "Build suyu as a libretro core (suyu_libretro.dll)" OFF)
 if (SUYU_BUILD_LIBRETRO_CORE)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    # Let ANDROID-specific code distinguish the libretro core (linked without
+    # the Android app) from the full Android app (yuzu-android). The core
+    # must not depend on AndroidSettings/InitFFmpegOnLoad/battery globals
+    # that only exist in src/android/.../native.cpp.
+    add_compile_definitions(SUYU_BUILD_LIBRETRO_CORE)
 endif()
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 

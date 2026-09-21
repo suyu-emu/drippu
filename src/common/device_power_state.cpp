@@ -8,9 +8,18 @@
 
 #elif defined(__ANDROID__)
 #include <atomic>
+#ifdef SUYU_BUILD_LIBRETRO_CORE
+// The libretro core is linked without the Android app (native.cpp), so the
+// battery globals defined there are unavailable. Provide local defaults;
+// RetroArch frontends don't report battery through these globals.
+std::atomic<int> g_battery_percentage{100};
+std::atomic<bool> g_is_charging{false};
+std::atomic<bool> g_has_battery{true};
+#else
 extern std::atomic<int> g_battery_percentage;
 extern std::atomic<bool> g_is_charging;
 extern std::atomic<bool> g_has_battery;
+#endif
 
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>

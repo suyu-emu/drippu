@@ -425,6 +425,8 @@ target_link_libraries(suyu PRIVATE common core input_common frontend_common netw
 target_link_libraries(suyu PRIVATE Boost::headers glad Qt${QT_MAJOR_VERSION}::Widgets)
 target_link_libraries(suyu PRIVATE Qt${QT_MAJOR_VERSION}::Network)
 target_link_libraries(suyu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
+# For firmware ZIP import (JlCompress::extractDir in main.cpp).
+target_link_libraries(suyu PRIVATE QuaZip::QuaZip)
 
 target_link_libraries(suyu PRIVATE Vulkan::Headers)
 if (NOT WIN32)

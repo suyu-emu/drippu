@@ -427,6 +427,17 @@ namespace Common::Android {
     extern "C" {
 #endif
 
+#ifdef SUYU_BUILD_LIBRETRO_CORE
+    jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+        // The libretro core is loaded by RetroArch, not the suyu Android app,
+        // so the app-specific Java classes (org/yuzu/...) don't exist here.
+        // Store the VM for filesystem/applet helpers that need it and report
+        // success without initializing app classes or FFmpeg JNI.
+        (void)reserved;
+        s_java_vm = vm;
+        return JNI_VERSION;
+    }
+#else
     jint InitFFmpegOnLoad(JavaVM *vm);
 
     jint JNI_OnLoad(JavaVM *vm, void *reserved) {
@@ -610,8 +621,15 @@ namespace Common::Android {
 
         return JNI_VERSION;
     }
+#endif // SUYU_BUILD_LIBRETRO_CORE
 
     void JNI_OnUnload(JavaVM *vm, void *reserved) {
+#ifdef SUYU_BUILD_LIBRETRO_CORE
+        // No app-specific global refs were created in the libretro JNI_OnLoad.
+        (void)vm;
+        (void)reserved;
+        return;
+#else
         JNIEnv *env;
         if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION) != JNI_OK) {
             return;
@@ -639,6 +657,7 @@ namespace Common::Android {
         WebBrowser::CleanupJNI(env);
 
         AndroidMultiplayer::NetworkShutdown();
+#endif
     }
 
 #ifdef __cplusplus

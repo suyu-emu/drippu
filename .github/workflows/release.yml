@@ -266,7 +266,7 @@ jobs:
         with:
           usesh: true
           prepare: |
-            pkg install -y cmake ninja qt6-base qt6-multimedia openssl pulseaudio vulkan-headers pkgconf libX11 libXext libXrandr wayland wayland-protocols libdecor mesa-libs evdev-proto glslang ffmpeg boost-all
+            pkg install -y cmake ninja qt6-base qt6-multimedia openssl pulseaudio vulkan-headers pkgconf libX11 libXext libXrandr libXScrnSaver wayland wayland-protocols libdecor mesa-libs evdev-proto glslang ffmpeg boost-all
           run: |
             f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
             if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then

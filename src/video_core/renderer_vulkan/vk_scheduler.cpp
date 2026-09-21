@@ -268,8 +268,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
 
         std::scoped_lock lock{submit_mutex};
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        const VkResult submit_result = master_semaphore->SubmitQueue(
+            cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value);
+        switch (submit_result) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
@@ -280,9 +281,14 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             break;
         case VK_ERROR_DEVICE_LOST:
             device.ReportLoss();
-            [[fallthrough]];
+            LOG_ERROR(Render_Vulkan, "vkQueueSubmit failed with VK_ERROR_DEVICE_LOST");
+            break;
         default:
-            vk::Check(result);
+            // Never throw from the worker thread: an uncaught vk::Exception here
+            // used to terminate the process mid-game (seen on macOS/MoltenVK).
+            // Log and drop this submission so emulation can skip the frame.
+            LOG_ERROR(Render_Vulkan, "vkQueueSubmit failed with {}",
+                      static_cast<int>(submit_result));
             break;
         }
     });

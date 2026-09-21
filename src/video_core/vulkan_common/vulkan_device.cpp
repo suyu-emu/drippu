@@ -791,7 +791,13 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
 
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
+    if (!nsight_aftermath_tracker) {
+        return;
+    }
+    // Wait for the log to flush and for Nsight Aftermath to dump the results.
+    // Only stall when Aftermath is actually attached; otherwise a transient
+    // MoltenVK device loss would hang the GPU thread for 15s before the
+    // (now non-fatal) error handling below runs.
     std::this_thread::sleep_for(std::chrono::seconds{15});
 }
 

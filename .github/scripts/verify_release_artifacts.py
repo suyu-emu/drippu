@@ -239,10 +239,48 @@ def smoke_libretro(binary: Path, target: str) -> None:
         os.environ["LD_LIBRARY_PATH"] = str(binary.parent) + (
             os.pathsep + old_library_path if old_library_path else ""
         )
+    core = None
     try:
-        core = ctypes.CDLL(str(binary))
-    except OSError as exc:
-        fail(f"could not load packaged libretro core {binary}: {exc}")
+        try:
+            core = ctypes.CDLL(str(binary))
+        except OSError as exc:
+            fail(f"could not load packaged libretro core {binary}: {exc}")
+        try:
+            api_version = core.retro_api_version
+            api_version.restype = ctypes.c_uint
+            if api_version() != 1:
+                fail("libretro API version is not 1")
+            get_info = core.retro_get_system_info
+            get_info.argtypes = [ctypes.POINTER(RetroSystemInfo)]
+            get_info.restype = None
+            info = RetroSystemInfo()
+            get_info(ctypes.byref(info))
+            if not info.library_name or not info.library_version or not info.valid_extensions:
+                fail("retro_get_system_info returned incomplete metadata")
+        except AttributeError as exc:
+            fail(f"packaged libretro core is missing required API: {exc}")
+        finally:
+            if target == "windows" and core is not None:
+                # Windows cannot delete a loaded module, which breaks the
+                # TemporaryDirectory cleanup in verify(). Free the DLL now.
+                try:
+                    ctypes.windll.kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
+                    ctypes.windll.kernel32.FreeLibrary.restype = ctypes.c_int
+                    ctypes.windll.kernel32.FreeLibrary(core._handle)
+                except Exception as exc:
+                    # Best-effort cleanup: the libretro API checks above
+                    # already passed, so a FreeLibrary failure must not fail
+                    # the release. Log it and continue to release the handle.
+                    print(f"warning: FreeLibrary failed for {binary}: {exc}", file=sys.stderr)
+                finally:
+                    # Drop the last Python reference so the file handle is
+                    # released before the temp dir is removed. Antivirus
+                    # scanners may briefly hold the new DLL; gc ensures the
+                    # refcount drops deterministically.
+                    del core
+                    import gc
+
+                    gc.collect()
     finally:
         if target == "linux":
             if old_library_path is None:
@@ -250,21 +288,12 @@ def smoke_libretro(binary: Path, target: str) -> None:
             else:
                 os.environ["LD_LIBRARY_PATH"] = old_library_path
         if dll_directory is not None:
-            dll_directory.close()
-    try:
-        api_version = core.retro_api_version
-        api_version.restype = ctypes.c_uint
-        if api_version() != 1:
-            fail("libretro API version is not 1")
-        get_info = core.retro_get_system_info
-        get_info.argtypes = [ctypes.POINTER(RetroSystemInfo)]
-        get_info.restype = None
-        info = RetroSystemInfo()
-        get_info(ctypes.byref(info))
-        if not info.library_name or not info.library_version or not info.valid_extensions:
-            fail("retro_get_system_info returned incomplete metadata")
-    except AttributeError as exc:
-        fail(f"packaged libretro core is missing required API: {exc}")
+            try:
+                dll_directory.close()
+            except Exception as exc:
+                # Best-effort cleanup: closing the DLL search directory must
+                # not fail verification after the core already passed.
+                print(f"warning: dll_directory.close() failed: {exc}", file=sys.stderr)
 
 
 def verify_structure(root: Path, archive: Path) -> None:
@@ -297,7 +326,17 @@ def verify_structure(root: Path, archive: Path) -> None:
 def verify(archive: Path, mode: str, target: str) -> None:
     if not archive.is_file():
         fail(f"artifact does not exist: {archive}")
-    with tempfile.TemporaryDirectory(prefix="drippu-release-verify-") as temporary:
+    # Python 3.10+ can ignore cleanup errors (e.g. a briefly locked DLL on
+    # Windows when an antivirus scanner holds the freshly extracted core).
+    # The libretro smoke test already frees the DLL explicitly; this is only
+    # a backstop so verification never fails with WinError 5 on rmtree.
+    if sys.version_info >= (3, 10):
+        temporary_dir = tempfile.TemporaryDirectory(
+            prefix="drippu-release-verify-", ignore_cleanup_errors=True
+        )
+    else:
+        temporary_dir = tempfile.TemporaryDirectory(prefix="drippu-release-verify-")
+    with temporary_dir as temporary:
         root = Path(temporary)
         unpack(archive, root)
         if mode == "structure":
