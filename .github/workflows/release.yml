@@ -148,7 +148,7 @@ jobs:
           fi
       - name: Install deps
         run: >-
-          brew install ninja qt@6 openssl ffmpeg glslang molten-vk boost
+          brew install asc ninja qt@6 openssl ffmpeg glslang molten-vk boost
           pkgconf libusb enet sdl3 opus nasm autoconf automake libtool
       - name: Configure
         run: |
@@ -185,11 +185,11 @@ jobs:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_B64: ${{ secrets.ASC_PRIVATE_KEY_B64 }}
         run: |
-          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY ASC_KEY_ID ASC_ISSUER_ID ASC_PRIVATE_KEY_B64; do
             test -n "${!name}" || { echo "Missing required macOS release secret: $name"; exit 1; }
           done
       - name: Import Developer ID certificate
@@ -205,7 +205,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$certificate" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
           echo "MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
       - name: Package
@@ -218,15 +218,14 @@ jobs:
             --output-dir _pkg
       - name: Notarize and staple
         env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_B64: ${{ secrets.ASC_PRIVATE_KEY_B64 }}
+          ASC_BYPASS_KEYCHAIN: "true"
         run: |
           ditto -c -k --keepParent _pkg "$RUNNER_TEMP/drippu-macos-notarization.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/drippu-macos-notarization.zip" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_PASSWORD" \
+          asc notarization submit \
+            --file "$RUNNER_TEMP/drippu-macos-notarization.zip" \
             --wait
           xcrun stapler staple _pkg/drippu.app
           xcrun stapler validate _pkg/drippu.app
