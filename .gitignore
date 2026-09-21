@@ -87,3 +87,6 @@ vcpkg_installed/
 /smash_test.png
 /smash_test3.png
 /search_results.csv
+
+# Python bytecode cache (e.g. from py_compile checks).
+__pycache__/
