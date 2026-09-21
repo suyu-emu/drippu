@@ -429,7 +429,11 @@ target_link_libraries(suyu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 target_link_libraries(suyu PRIVATE QuaZip::QuaZip)
 
 target_link_libraries(suyu PRIVATE Vulkan::Headers)
-if (NOT WIN32)
+if (UNIX AND NOT APPLE)
+    # Qt6Gui_PRIVATE_INCLUDE_DIRS is empty on FreeBSD even though Qt6::GuiPrivate
+    # exists. Linking the private target is what adds the qpa include path.
+    target_link_libraries(suyu PRIVATE Qt${QT_MAJOR_VERSION}::GuiPrivate)
+elseif (NOT WIN32)
     target_include_directories(suyu PRIVATE ${Qt${QT_MAJOR_VERSION}Gui_PRIVATE_INCLUDE_DIRS})
 endif()
 if (UNIX AND NOT APPLE)
