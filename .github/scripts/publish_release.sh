@@ -6,7 +6,11 @@ set -euo pipefail
 artifacts_dir="${ARTIFACTS_DIR:-artifacts}"
 repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 sha="${GITHUB_SHA:?GITHUB_SHA is required}"
-version="${RELEASE_VERSION:-v0.04}"
+version="${RELEASE_VERSION:-v0.0.5}"
+if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Invalid RELEASE_VERSION: $version (expected vMAJOR.MINOR.PATCH)"
+  exit 1
+fi
 short="${sha:0:12}"
 date_utc="$(date -u +%Y%m%d)"
 display_date="$(date -u +%Y-%m-%d)"
