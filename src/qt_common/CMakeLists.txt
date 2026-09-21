@@ -93,11 +93,7 @@ if (ENABLE_OPENGL)
 endif()
 
 if (UNIX AND NOT APPLE)
-    if (DEFINED Qt6Gui_PRIVATE_INCLUDE_DIRS)
-        target_include_directories(qt_common PRIVATE ${Qt6Gui_PRIVATE_INCLUDE_DIRS})
-    else()
-        target_link_libraries(qt_common PRIVATE Qt6::GuiPrivate)
-    endif()
+    target_link_libraries(qt_common PRIVATE Qt6::GuiPrivate)
 endif()
 
 create_target_directory_groups(qt_common)

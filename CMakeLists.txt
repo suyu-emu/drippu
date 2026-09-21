@@ -638,10 +638,9 @@ if (ENABLE_QT)
     # Best practice is to ask for all components at once, so they are from the same version
     set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network Svg)
     if (PLATFORM_LINUX OR PLATFORM_FREEBSD)
-        list(APPEND YUZU_QT_COMPONENTS DBus)
+        list(APPEND YUZU_QT_COMPONENTS DBus GuiPrivate)
         # yes Qt, we get it
         set(QT_NO_PRIVATE_MODULE_WARNING ON)
-        list(APPEND YUZU_QT_OPTIONAL GuiPrivate)
     endif()
 
     if (YUZU_USE_QT_MULTIMEDIA)
