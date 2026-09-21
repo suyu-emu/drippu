@@ -267,8 +267,11 @@ def smoke_libretro(binary: Path, target: str) -> None:
                     ctypes.windll.kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
                     ctypes.windll.kernel32.FreeLibrary.restype = ctypes.c_int
                     ctypes.windll.kernel32.FreeLibrary(core._handle)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Best-effort cleanup: the libretro API checks above
+                    # already passed, so a FreeLibrary failure must not fail
+                    # the release. Log it and continue to release the handle.
+                    print(f"warning: FreeLibrary failed for {binary}: {exc}", file=sys.stderr)
                 finally:
                     # Drop the last Python reference so the file handle is
                     # released before the temp dir is removed. Antivirus
@@ -287,8 +290,10 @@ def smoke_libretro(binary: Path, target: str) -> None:
         if dll_directory is not None:
             try:
                 dll_directory.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Best-effort cleanup: closing the DLL search directory must
+                # not fail verification after the core already passed.
+                print(f"warning: dll_directory.close() failed: {exc}", file=sys.stderr)
 
 
 def verify_structure(root: Path, archive: Path) -> None:
