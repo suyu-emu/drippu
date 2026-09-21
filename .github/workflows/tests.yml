@@ -14,6 +14,10 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
+      - name: Test release packaging checks
+        run: |
+          python3 .github/scripts/test_package_macos.py
+          python3 .github/scripts/test_verify_release_artifacts.py
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1

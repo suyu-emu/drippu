@@ -43,9 +43,31 @@ def macho_files(root: Path) -> list[Path]:
     return sorted((path for path in root.rglob("*") if is_macho(path)), key=str)
 
 
-def dependencies(binary: Path) -> list[str]:
-    lines = run("otool", "-L", binary, capture=True).splitlines()[1:]
+def dependent_libraries(load_entries: list[str], install_name: str | None) -> list[str]:
+    """Drop a Mach-O install name from an ``otool -L`` listing.
+
+    ``otool -L`` prints a dylib's own LC_ID_DYLIB before its real dependents.
+    That install name is not a load command dyld resolves. Homebrew and
+    macdeployqt set it to ``@executable_path/../Frameworks/<self>``, which is
+    valid for the bundled binary and must not be treated as a CLI dependency.
+    """
+    if install_name and load_entries and load_entries[0] == install_name:
+        return load_entries[1:]
+    return list(load_entries)
+
+
+def otool_entries(binary: Path, flag: str) -> list[str]:
+    lines = run("otool", flag, binary, capture=True).splitlines()[1:]
     return [line.strip().split(" (", 1)[0] for line in lines if line.strip()]
+
+
+def install_id(binary: Path) -> str | None:
+    entries = otool_entries(binary, "-D")
+    return entries[0] if entries else None
+
+
+def dependencies(binary: Path) -> list[str]:
+    return dependent_libraries(otool_entries(binary, "-L"), install_id(binary))
 
 
 def rpaths(binary: Path) -> list[str]:
@@ -251,6 +273,9 @@ def validate_portability(app: Path, cli: Path, expected_arch: str) -> None:
         archs = run("lipo", "-archs", binary, capture=True).strip().split()
         if expected_arch and expected_arch not in archs:
             failures.append(f"{binary}: expected architecture {expected_arch}, got {' '.join(archs)}")
+        ident = install_id(binary)
+        if ident and external_dependency(ident):
+            failures.append(f"{binary}: non-portable install id {ident}")
         for dependency in dependencies(binary):
             if external_dependency(dependency):
                 failures.append(f"{binary}: external dependency {dependency}")

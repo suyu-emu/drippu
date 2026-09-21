@@ -11,6 +11,14 @@ add_library(suyu_libretro SHARED
 target_link_libraries(suyu_libretro PRIVATE common core input_common frontend_common audio_core network)
 target_link_libraries(suyu_libretro PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 
+# crueter-ci OpenSSL 4.0.0's static libcrypto.a references poly1305_blocks_sve2
+# with an ADRP relocation (openssl/openssl#31670). LLD rejects that in a shared
+# library unless the symbol binds locally. yuzu-android links the same archive
+# with this flag.
+if (ANDROID)
+    target_link_options(suyu_libretro PRIVATE "-Wl,-Bsymbolic")
+endif()
+
 set_target_properties(suyu_libretro PROPERTIES
     PREFIX ""
     OUTPUT_NAME "suyu_libretro"
