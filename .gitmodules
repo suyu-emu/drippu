@@ -79,6 +79,9 @@
 [submodule "externals/nx-optimizer"]
 	path = externals/nx-optimizer
 	url = https://github.com/MaxLastBreath/nx-optimizer.git
+[submodule "externals/Prelude-Nro"]
+	path = externals/Prelude-Nro
+	url = https://github.com/NextendoNetwork/Prelude-Nro.git
 [submodule "externals/nxapi"]
 	path = externals/nxapi
 	url = https://github.com/samuelthomas2774/nxapi.git
