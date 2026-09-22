@@ -32,6 +32,8 @@
 #include <QtDBus/QDBusMessage>
 #include <QtDBus/QtDBus>
 #include <sys/socket.h>
+#endif
+#ifdef __linux__
 #include "common/linux/gamemode.h"
 #endif
 
@@ -414,6 +416,8 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
       provider{std::make_unique<FileSys::ManualContentProvider>()} {
 #ifdef __unix__
     SetupSigInterrupts();
+#endif
+#ifdef __linux__
     SetGamemodeEnabled(Settings::values.enable_gamemode.GetValue());
 #endif
     system->Initialize();
@@ -2509,7 +2513,7 @@ void GMainWindow::OnEmulationStopped() {
 
     discord_rpc->Update();
 
-#ifdef __unix__
+#ifdef __linux__
     Common::Linux::StopGamemode();
 #endif
 
@@ -3855,7 +3859,7 @@ void GMainWindow::OnStartGame() {
 
     discord_rpc->Update();
 
-#ifdef __unix__
+#ifdef __linux__
     Common::Linux::StartGamemode();
 #endif
 }
@@ -3879,7 +3883,7 @@ void GMainWindow::OnPauseGame() {
     UpdateMenuState();
     AllowOSSleep();
 
-#ifdef __unix__
+#ifdef __linux__
     Common::Linux::StopGamemode();
 #endif
 }
@@ -4156,7 +4160,7 @@ void GMainWindow::OnConfigure() {
     DarkModeState old_dark_mode_state = UISettings::values.dark_mode_state;
     const bool old_discord_presence = UISettings::values.enable_discord_presence.GetValue();
     const auto old_language_index = Settings::values.language_index.GetValue();
-#ifdef __unix__
+#ifdef __linux__
     const bool old_gamemode = Settings::values.enable_gamemode.GetValue();
 #endif
 
@@ -4241,7 +4245,7 @@ void GMainWindow::OnConfigure() {
     if (UISettings::values.enable_discord_presence.GetValue() != old_discord_presence) {
         SetDiscordEnabled(UISettings::values.enable_discord_presence.GetValue());
     }
-#ifdef __unix__
+#ifdef __linux__
     if (Settings::values.enable_gamemode.GetValue() != old_gamemode) {
         SetGamemodeEnabled(Settings::values.enable_gamemode.GetValue());
     }
@@ -8355,7 +8359,7 @@ void GMainWindow::SetDiscordEnabled([[maybe_unused]] bool state) {
     discord_rpc->Update();
 }
 
-#ifdef __unix__
+#ifdef __linux__
 void GMainWindow::SetGamemodeEnabled(bool state) {
     if (emulation_running) {
         Common::Linux::SetGamemodeState(state);

@@ -367,6 +367,8 @@ private:
     void SetupSigInterrupts();
     static void HandleSigInterrupt(int);
     void OnSigInterruptNotifierActivated();
+#endif
+#ifdef __linux__
     void SetGamemodeEnabled(bool state);
 #endif
 
