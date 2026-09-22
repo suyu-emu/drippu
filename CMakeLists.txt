@@ -638,7 +638,15 @@ if (ENABLE_QT)
     # Best practice is to ask for all components at once, so they are from the same version
     set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network Svg)
     if (PLATFORM_LINUX OR PLATFORM_FREEBSD)
-        list(APPEND YUZU_QT_COMPONENTS DBus GuiPrivate)
+        list(APPEND YUZU_QT_COMPONENTS DBus)
+        # Linux distro Qt packages expose private headers through Qt6Gui's
+        # include variables, but may not ship a Qt6GuiPrivate package config.
+        # FreeBSD's Qt package needs the private imported target instead.
+        if (PLATFORM_FREEBSD)
+            list(APPEND YUZU_QT_COMPONENTS GuiPrivate)
+        else()
+            list(APPEND YUZU_QT_OPTIONAL GuiPrivate)
+        endif()
         # yes Qt, we get it
         set(QT_NO_PRIVATE_MODULE_WARNING ON)
     endif()
