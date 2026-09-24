@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -372,6 +373,77 @@ void TestTranslatedShape() {
             pass("full-width SBFM avoids undefined shift");
         }
     }
+}
+
+fs::path FindBuiltExe(const fs::path& build, const char* name);
+
+void TestSbfmBoundaries(const fs::path& root) {
+    struct Case {
+        const char* name;
+        bool is64;
+        u32 immr;
+        u32 imms;
+        u64 input;
+        u64 expected;
+    };
+    // Check the full-width cases and their adjacent sign-extending forms.
+    // W writes must also clear the upper half of X0.
+    const Case cases[] = {
+        {"X extract full", true, 0, 63, 0x8000000000000001ULL, 0x8000000000000001ULL},
+        {"X extract signed", true, 1, 63, 0x8000000000000001ULL, 0xC000000000000000ULL},
+        {"X insert full", true, 32, 31, 0x80000000ULL, 0x8000000000000000ULL},
+        {"X insert signed", true, 32, 30, 0x40000000ULL, 0xC000000000000000ULL},
+        {"W extract full", false, 0, 31, 0xF000000080000001ULL, 0x80000001ULL},
+        {"W extract signed", false, 1, 31, 0x80000001ULL, 0xC0000000ULL},
+        {"W insert full", false, 16, 15, 0x8000ULL, 0x80000000ULL},
+        {"W insert signed", false, 16, 14, 0x4000ULL, 0xC0000000ULL},
+    };
+    std::ostringstream src;
+    src << "#include <stdint.h>\n#include <stdio.h>\n"
+           "typedef struct { uint64_t x[32]; } GuestContext;\n";
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        const Case& test = cases[i];
+        const u32 insn = (test.is64 ? 0x93400000u : 0x13000000u) |
+                         (test.immr << 16) | (test.imms << 10) | (1u << 5);
+        const std::string body = TranslateInsn(insn, 0x1000);
+        if (BodyUnhandled(body)) {
+            fail(std::string("SBFM boundary unhandled: ") + test.name);
+            return;
+        }
+        src << "static void test_" << i << "(GuestContext* c) {\n" << body << "}\n";
+    }
+    src << "int main(void) {\n";
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        const Case& test = cases[i];
+        src << "  { GuestContext c = {{0}}; c.x[1] = 0x" << std::hex << test.input
+            << "ULL; test_" << std::dec << i << "(&c); if (c.x[0] != 0x" << std::hex
+            << test.expected << "ULL) { printf(\"SBFM " << test.name
+            << " got %llx\\n\", (unsigned long long)c.x[0]); return 1; } }\n"
+            << std::dec;
+    }
+    src << "  return 0;\n}\n";
+
+    const fs::path probe_src = root / "sbfm_probe";
+    fs::create_directories(probe_src);
+    if (!WriteFile(probe_src / "probe.c", src.str()) ||
+        !WriteFile(probe_src / "CMakeLists.txt",
+                   "cmake_minimum_required(VERSION 3.13)\n"
+                   "project(suyu_sbfm_probe C)\n"
+                   "set(CMAKE_C_STANDARD 11)\n"
+                   "set(CMAKE_C_EXTENSIONS OFF)\n"
+                   "add_executable(sbfm_probe probe.c)\n")) {
+        return;
+    }
+    const fs::path probe_build = probe_src / "build";
+    if (CmakeBuild(probe_src, probe_build, "sbfm_probe", true) != 0) {
+        return;
+    }
+    const fs::path exe = FindBuiltExe(probe_build, "sbfm_probe");
+    if (exe.empty() || RunArgs({exe.string()}) != 0) {
+        fail("SBFM boundary execution");
+        return;
+    }
+    pass("SBFM full-width and sign-extension boundaries executed");
 }
 
 fs::path FindBuiltExe(const fs::path& build, const char* name) {
@@ -1844,6 +1916,7 @@ int main() {
 
     std::cout << "exporter smoke workdir: " << root << std::endl;
     TestTranslatedShape();
+    TestSbfmBoundaries(root);
     TestEmitProjectCompile(root);
     TestMultiModuleLink(root);
     TestMemoryBoundaries(root);
