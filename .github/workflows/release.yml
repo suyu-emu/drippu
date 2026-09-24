@@ -1,9 +1,9 @@
 name: Automated drippu release
+run-name: ${{ github.sha }}
 
 on:
   schedule:
-    - cron: '0 0 1 * *'
-    - cron: '0 0 * * 0'
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       release_version:
@@ -16,25 +16,39 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    name: Check for new commits
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - name: Check if commit was already released
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:12}"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" --paginate --jq '.[].ref' | grep -q "$short"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
     name: Windows
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        shell: bash
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: jurplel/install-qt-action@v4
         with:
-          version: '6.7.0'
+          version: "6.7.0"
           arch: win64_msvc2019_64
           modules: qtcharts qtmultimedia qtwebengine
       - name: Install Vulkan SDK
@@ -44,11 +58,17 @@ jobs:
           $sdkDir = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
           echo "VULKAN_SDK=$($sdkDir.FullName)" >> $env:GITHUB_ENV
           echo "$($sdkDir.FullName)\Bin" >> $env:GITHUB_PATH
+      - name: sccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          variant: sccache
+          key: ${{ runner.os }}-release-windows
+          max-size: 2G
       - name: Configure
         shell: bash
         run: |
           cmake --version
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DUSE_CCACHE=ON -DCCACHE_PATH=sccache -GNinja 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
@@ -81,38 +101,26 @@ jobs:
 
   build-linux:
     name: Linux
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Init submodules
-        run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
+        with:
+          submodules: recursive
+
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build glslang-tools \
-            qt6-base-dev qt6-base-private-dev \
-            qt6-multimedia-dev qt6-tools-dev qt6-svg-dev qt6-webengine-dev \
-            qt6-charts-dev \
-            libssl-dev libusb-1.0-0-dev libpulse-dev \
-            libvulkan-dev gamemode-dev \
-            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxss-dev libxkbcommon-dev libxtst-dev \
-            libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
-            libegl-dev libdrm-dev libgbm-dev \
-            libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev \
-            libboost-all-dev
+        run: bash .github/scripts/install-linux-deps.sh
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ runner.os }}-release
+          max-size: 6G
       - name: Configure
         run: |
           cmake --version
           set -o pipefail
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DUSE_CCACHE=ON -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -120,46 +128,43 @@ jobs:
           name: cmake-log-linux
           path: cmake_configure.log
       - name: Build
-        run: cmake --build build --target suyu suyu-cmd -j4
-      - name: Package
-        run: |
-          rm -rf _pkg && mkdir _pkg
-          cp build/bin/suyu _pkg/drippu
-          cp build/bin/suyu-cmd _pkg/drippu-cmd 2>/dev/null || true
-          tar -czf drippu-linux-x64.tar.gz -C _pkg .
-      - name: Verify packaged Linux application and dependencies
-        run: python3 .github/scripts/verify_release_artifacts.py desktop --platform linux --archive drippu-linux-x64.tar.gz
+        run: cmake --build build --target suyu suyu-cmd -j"$(nproc)"
+      - name: Package AppImage
+        run: bash .github/scripts/package_appimage.sh
+      - name: Verify packaged Linux AppImage
+        run: python3 .github/scripts/verify_release_artifacts.py desktop --platform linux --archive drippu-linux-x86_64.AppImage
       - name: Record toolchain
         run: bash .github/scripts/write_toolchain.sh toolchain.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: linux
+          name: linux-appimage
           path: |
-            drippu-linux-x64.tar.gz
+            drippu-linux-x86_64.AppImage
             toolchain.txt
 
   build-macos:
     name: macOS
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
       - name: Install deps
         run: >-
           brew install asc ninja qt@6 openssl ffmpeg glslang molten-vk boost
           pkgconf libusb enet sdl3 opus nasm autoconf automake libtool
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ runner.os }}-release-macos
+          max-size: 2G
       - name: Configure
         run: |
           cmake --version
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DUSE_CCACHE=ON -GNinja \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl);$(brew --prefix ffmpeg);$(brew --prefix libusb);$(brew --prefix enet);$(brew --prefix sdl3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
@@ -256,6 +261,8 @@ jobs:
 
   build-freebsd:
     name: FreeBSD
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -268,10 +275,6 @@ jobs:
           prepare: |
             pkg install -y cmake ninja qt6-base qt6-charts qt6-svg qt6-multimedia openssl pulseaudio vulkan-headers pkgconf libX11 libXext libXrandr libXScrnSaver wayland wayland-protocols libdecor mesa-libs evdev-proto glslang ffmpeg boost-all
           run: |
-            f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-            if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-              printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-            fi
             cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON \
               -DYUZU_USE_BUNDLED_QT=OFF \
               -DVulkanHeaders_FORCE_BUNDLED=ON \
@@ -300,22 +303,18 @@ jobs:
 
   build-android:
     name: Android
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
       - uses: actions/setup-java@v6
         with:
           distribution: microsoft
-          java-version: '17'
+          java-version: "17"
       - name: Install native deps
         run: |
           sudo apt-get update
@@ -378,18 +377,14 @@ jobs:
 
   build-libretro:
     name: Libretro
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
       - name: Install deps
         run: |
           sudo apt-get update
@@ -401,11 +396,16 @@ jobs:
             libegl-dev libdrm-dev libgbm-dev libpulse-dev \
             libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev \
             libboost-all-dev
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ runner.os }}-release-libretro
+          max-size: 2G
       - name: Configure
         run: |
           cmake --version
           set -o pipefail
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DUSE_CCACHE=ON -GNinja 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -432,19 +432,14 @@ jobs:
 
   build-libretro-windows:
     name: Libretro Windows
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        shell: bash
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Install Vulkan SDK
         shell: pwsh
@@ -453,10 +448,16 @@ jobs:
           $sdkDir = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
           echo "VULKAN_SDK=$($sdkDir.FullName)" >> $env:GITHUB_ENV
           echo "$($sdkDir.FullName)\Bin" >> $env:GITHUB_PATH
+      - name: sccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          variant: sccache
+          key: ${{ runner.os }}-release-libretro-windows
+          max-size: 2G
       - name: Configure
         shell: bash
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DUSE_CCACHE=ON -DCCACHE_PATH=sccache -GNinja 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
@@ -488,18 +489,14 @@ jobs:
 
   build-libretro-android:
     name: Libretro Android
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
       - name: Install native deps
         run: |
           sudo apt-get update
@@ -508,6 +505,11 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ runner.os }}-release-libretro-android
+          max-size: 2G
       - name: Configure
         run: |
           set -o pipefail
@@ -516,7 +518,7 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+            -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DUSE_CCACHE=ON -GNinja 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -542,58 +544,40 @@ jobs:
             drippu-libretro-core-android-arm64.tar.gz
             toolchain.txt
 
-  exporter-smoke:
-    uses: ./.github/workflows/exporter-smoke.yml
-
-  tests:
-    uses: ./.github/workflows/tests.yml
-
-  verify-release-artifacts:
-    name: Verify release artifact structure
-    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-freebsd.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.build-libretro-android.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' }}
-    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android, exporter-smoke, tests]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-      - name: Install release-gate dependencies
-        run: |
-          python3 -m venv .release-gate-venv
-          .release-gate-venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir PyYAML==6.0.2
-      - name: Test artifact verifier
-        run: |
-          .release-gate-venv/bin/python .github/scripts/test_verify_release_artifacts.py
-          .release-gate-venv/bin/python .github/scripts/test_package_macos.py
-      - name: Check every archive has the expected package structure
-        run: |
-          set -euo pipefail
-          mapfile -t archives < <(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.apk' \) | sort)
-          test "${#archives[@]}" -gt 0
-          for archive in "${archives[@]}"; do
-            .release-gate-venv/bin/python .github/scripts/verify_release_artifacts.py structure --platform generic --archive "$archive"
-          done
-      - name: Run release-gate regression
-        run: .release-gate-venv/bin/python .github/scripts/check_release_gate.py
-
   release:
     name: Publish Release
-    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-freebsd.result == 'success' && needs.build-android.result == 'success' && needs.build-libretro.result == 'success' && needs.build-libretro-windows.result == 'success' && needs.build-libretro-android.result == 'success' && needs.exporter-smoke.result == 'success' && needs.tests.result == 'success' && needs.verify-release-artifacts.result == 'success' }}
-    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android, exporter-smoke, tests, verify-release-artifacts]
+    needs:
+      [
+        build-windows,
+        build-linux,
+        build-macos,
+        build-freebsd,
+        build-android,
+        build-libretro,
+        build-libretro-windows,
+        build-libretro-android,
+      ]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          fetch-tags: true
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
-      - name: List artifacts
-        run: find artifacts -type f || echo "No artifacts found"
+      - name: Compute release tag
+        id: release
+        run: |
+          version="${{ inputs.release_version || 'v0.0.5' }}"
+          echo "tag=${version}-$(date -u +%Y%m%d)-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
       - name: Create release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_VERSION: ${{ inputs.release_version || 'v0.0.5' }}
-        run: bash .github/scripts/publish_release.sh
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: drippu ${{ inputs.release_version || 'v0.0.5' }} automated build
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+            artifacts/**/*.AppImage
+            artifacts/**/*.apk

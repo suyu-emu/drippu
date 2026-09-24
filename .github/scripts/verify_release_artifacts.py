@@ -26,7 +26,7 @@ def fail(message: str) -> None:
     raise RuntimeError(message)
 
 
-def unpack(archive: Path, destination: Path) -> None:
+def unpack(archive: Path, destination: Path) -> Path:
     destination_root = destination.resolve()
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as package:
@@ -43,7 +43,7 @@ def unpack(archive: Path, destination: Path) -> None:
                     fail(f"symlink zip member is not allowed: {member.filename}")
             for member in members:
                 package.extract(member, destination)
-        return
+        return destination
     if archive.name.endswith((".tar.gz", ".tgz")):
         with tarfile.open(archive, "r:gz") as package:
             members = package.getmembers()
@@ -65,7 +65,7 @@ def unpack(archive: Path, destination: Path) -> None:
                 elif member.islnk() or member.isdev() or member.isfifo():
                     fail(f"special tar member is not allowed: {member.name}")
             package.extractall(destination)
-        return
+        return destination
     if archive.suffix == ".apk":
         with zipfile.ZipFile(archive) as package:
             bad = package.testzip()
@@ -82,7 +82,28 @@ def unpack(archive: Path, destination: Path) -> None:
                 if stat.S_ISLNK(mode):
                     fail(f"symlink APK member is not allowed: {member.filename}")
                 package.extract(member, destination)
-        return
+        return destination
+    if archive.name.endswith(".AppImage"):
+        # AppImages are SquashFS images with an ELF runtime prefix. Extract with
+        # the embedded runtime (no FUSE needed) and verify the extracted tree.
+        executable = archive.resolve()
+        executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+        environment = os.environ.copy()
+        environment["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+        result = subprocess.run(
+            [str(executable), "--appimage-extract"],
+            cwd=destination,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=environment,
+        )
+        if result.returncode != 0:
+            fail(f"failed to extract AppImage {archive.name}: {result.stderr[-2000:]}")
+        extracted = destination / "squashfs-root"
+        if not extracted.is_dir():
+            fail(f"AppImage extraction produced no squashfs-root: {archive.name}")
+        return extracted
     fail(f"unsupported archive: {archive}")
 
 
@@ -337,8 +358,7 @@ def verify(archive: Path, mode: str, target: str) -> None:
     else:
         temporary_dir = tempfile.TemporaryDirectory(prefix="drippu-release-verify-")
     with temporary_dir as temporary:
-        root = Path(temporary)
-        unpack(archive, root)
+        root = unpack(archive, Path(temporary))
         if mode == "structure":
             verify_structure(root, archive)
         elif mode == "desktop":

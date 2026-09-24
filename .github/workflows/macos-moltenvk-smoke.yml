@@ -24,12 +24,6 @@ jobs:
       - name: Init submodules
         run: |
           git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
-      - name: Fix submodule headers
-        run: |
-          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
-          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
-            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
-          fi
       - name: Install deps
         run: >-
           brew install ninja qt@6 openssl ffmpeg glslang boost

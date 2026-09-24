@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import io
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -103,6 +104,23 @@ class VerifyReleaseArtifactsTest(unittest.TestCase):
             link = extracted / "drippu.app/Contents/Frameworks/QtCore.framework/QtCore"
             self.assertTrue(link.is_symlink())
             self.assertEqual(link.read_bytes(), b"mach")
+
+    def test_appimage_extract_returns_squashfs_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "drippu-linux-x86_64.AppImage"
+            archive.write_bytes(b"\x7fELF")
+            destination = root / "extracted"
+            destination.mkdir()
+
+            def fake_run(command, **kwargs):
+                self.assertIn("--appimage-extract", command)
+                (kwargs["cwd"] / "squashfs-root").mkdir()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(verify.subprocess, "run", side_effect=fake_run):
+                extracted = verify.unpack(archive, destination)
+            self.assertEqual(extracted, destination / "squashfs-root")
 
     def test_rejects_tar_symlink_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
