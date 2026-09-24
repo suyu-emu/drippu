@@ -29,7 +29,10 @@ jobs:
         run: |
           set -euo pipefail
           short="${GITHUB_SHA:0:12}"
-          if gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" --paginate --jq '.[].ref' | grep -q "$short"; then
+          # Capture first: piping into `grep -q` can SIGPIPE gh mid-pagination,
+          # which pipefail would turn into a false "not released yet".
+          tags="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/" --paginate --jq '.[].ref')"
+          if grep -qF -- "-${short}" <<<"$tags"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -68,7 +71,7 @@ jobs:
         shell: bash
         run: |
           cmake --version
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DUSE_CCACHE=ON -DCCACHE_PATH=sccache -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -GNinja 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
@@ -106,9 +109,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
       - name: Install deps
         run: bash .github/scripts/install-linux-deps.sh
       - name: ccache
@@ -120,7 +123,7 @@ jobs:
         run: |
           cmake --version
           set -o pipefail
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DUSE_CCACHE=ON -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -164,7 +167,7 @@ jobs:
       - name: Configure
         run: |
           cmake --version
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DUSE_CCACHE=ON -GNinja \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl);$(brew --prefix ffmpeg);$(brew --prefix libusb);$(brew --prefix enet);$(brew --prefix sdl3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
@@ -405,7 +408,7 @@ jobs:
         run: |
           cmake --version
           set -o pipefail
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DUSE_CCACHE=ON -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -457,7 +460,7 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DUSE_CCACHE=ON -DCCACHE_PATH=sccache -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -GNinja 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
@@ -518,7 +521,7 @@ jobs:
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DUSE_CCACHE=ON -GNinja 2>&1 | tee cmake_configure.log
+            -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -564,14 +567,27 @@ jobs:
           path: artifacts
       - name: Compute release tag
         id: release
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version || 'v0.0.5' }}
         run: |
-          version="${{ inputs.release_version || 'v0.0.5' }}"
-          echo "tag=${version}-$(date -u +%Y%m%d)-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release_version: $RELEASE_VERSION (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${RELEASE_VERSION}-$(date -u +%Y%m%d)-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.AppImage' -o -name '*.apk' \) \
+            -exec sha256sum {} + | sed 's|  .*/|  |' | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release.outputs.tag }}
-          name: drippu ${{ inputs.release_version || 'v0.0.5' }} automated build
+          name: drippu ${{ steps.release.outputs.version }} automated build
           target_commitish: ${{ github.sha }}
           prerelease: true
           generate_release_notes: true
@@ -581,3 +597,4 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*.AppImage
             artifacts/**/*.apk
+            SHA256SUMS
