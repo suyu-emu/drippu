@@ -293,7 +293,9 @@ void TestEmitProjectCompile(const fs::path& root) {
     const fs::path out = root / "emit_project";
     fs::create_directories(out);
 
-    u32 text[4] = {kMovzX0_5, kMovzX1_7, kAddX2X0X1, kSvc0};
+    // CBZ splits both taken and fallthrough into chainable generated blocks.
+    // Compiling the emitted project catches invalid C in either chain arm.
+    u32 text[4] = {kMovzX0_5, 0xB4000040u, kMovzX1_7, kSvc0};
     suyu::recomp::EmitProject("smoke", reinterpret_cast<const suyu::recomp::u8*>(text),
                               sizeof(text), 0x1000, out.string(), true);
 
@@ -358,12 +360,25 @@ void TestTranslatedShape() {
     } else {
         pass("BLR X30 translated C reads the target before writing LR");
     }
+
+    // A full-width signed bitfield needs no sign extension. Emitting
+    // 1ULL << 64 here was undefined C and produced different game code across
+    // compilers (observed in Sonic Mania's subsdk1).
+    for (const u32 insn : {0x9340FC20u, 0x935F7828u}) {
+        const std::string body = TranslateInsn(insn, 0x1000);
+        if (BodyUnhandled(body) || body.find("1ULL << 64") != std::string::npos) {
+            fail("full-width SBFM emitted undefined shift: " + body);
+        } else {
+            pass("full-width SBFM avoids undefined shift");
+        }
+    }
 }
 
 fs::path FindBuiltExe(const fs::path& build, const char* name) {
     const fs::path candidates[] = {
         build / name,
 #ifdef _WIN32
+        build / (std::string(name) + ".exe"),
         build / "Release" / (std::string(name) + ".exe"),
         build / "Debug" / (std::string(name) + ".exe"),
 #else
@@ -547,6 +562,17 @@ int main(void) {
   callbacks = 0;
   fail |= expect_eq("same-page load64", recomp_load64(&ctx, 0x100), 0x8877665544332211ULL);
   if (callbacks != 0) fail = 1;
+  {
+    uint64_t lo = 0, hi = 0;
+    callbacks = 0;
+    recomp_load_pair32(&ctx, 0x100, &lo, &hi);
+    if (lo != 0x44332211ULL || hi != 0x88776655ULL || callbacks != 0) fail = 1;
+    recomp_store_pair64(&ctx, 0x110, 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
+    if (callbacks != 0) fail = 1;
+    recomp_load_pair64(&ctx, 0x110, &lo, &hi);
+    if (lo != 0x0123456789ABCDEFULL || hi != 0xFEDCBA9876543210ULL || callbacks != 0)
+      fail = 1;
+  }
 
   memset(backing, 0xCC, sizeof backing);
   page0_host[PAGE_SIZE - 1] = 0x11;
@@ -574,6 +600,17 @@ int main(void) {
   fail |= expect_eq("cross-page load32 discontig", recomp_load32(&ctx, PAGE_SIZE - 1),
                     0x04030201ULL);
   if (callbacks == 0) fail = 1;
+
+  /* A pair spanning discontiguous pages must resolve each half separately. */
+  callbacks = 0;
+  recomp_store_pair64(&ctx, PAGE_SIZE - 8, 0x1122334455667788ULL,
+                      0x99AABBCCDDEEFF00ULL);
+  {
+    uint64_t lo = 0, hi = 0;
+    callbacks = 0;
+    recomp_load_pair64(&ctx, PAGE_SIZE - 8, &lo, &hi);
+    if (lo != 0x1122334455667788ULL || hi != 0x99AABBCCDDEEFF00ULL) fail = 1;
+  }
 
   memset(page0_host, 0, PAGE_SIZE);
   memset(page1_host, 0, PAGE_SIZE);
@@ -789,6 +826,9 @@ void TestSdivProbes(const fs::path& root) {
     fs::path exe = probe_build / "sdiv_probe";
 #ifdef _WIN32
     if (!fs::exists(exe)) {
+        exe = probe_build / "sdiv_probe.exe";
+    }
+    if (!fs::exists(exe)) {
         exe = probe_build / "Release" / "sdiv_probe.exe";
     }
     if (!fs::exists(exe)) {
@@ -869,6 +909,9 @@ void TestBranchProbes(const fs::path& root) {
 
     fs::path exe = probe_build / "branch_probe";
 #ifdef _WIN32
+    if (!fs::exists(exe)) {
+        exe = probe_build / "branch_probe.exe";
+    }
     if (!fs::exists(exe)) {
         exe = probe_build / "Release" / "branch_probe.exe";
     }
@@ -1005,6 +1048,9 @@ void TestFpControl(const fs::path& root) {
 
     fs::path exe = probe_build / "fp_probe";
 #ifdef _WIN32
+    if (!fs::exists(exe)) {
+        exe = probe_build / "fp_probe.exe";
+    }
     if (!fs::exists(exe)) {
         exe = probe_build / "Release" / "fp_probe.exe";
     }

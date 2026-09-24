@@ -89,8 +89,12 @@ if (NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(recomp_stack_harness PRIVATE core common frontend_common dynarmic::dynarmic
                           ${PLATFORM_LIBRARIES} ${CMAKE_DL_LIBS})
     target_include_directories(recomp_stack_harness PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-    add_test(NAME recomp_stack_harness COMMAND recomp_stack_harness)
-    set_tests_properties(recomp_stack_harness PROPERTIES
-        TIMEOUT 360
-    )
+    # The harness builds on Windows to catch compile regressions, but its AOT
+    # fixture uses POSIX dlopen and exits before the integration scenarios.
+    if (NOT WIN32)
+        add_test(NAME recomp_stack_harness COMMAND recomp_stack_harness)
+        set_tests_properties(recomp_stack_harness PROPERTIES
+            TIMEOUT 360
+        )
+    endif()
 endif()

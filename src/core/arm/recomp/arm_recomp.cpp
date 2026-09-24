@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -190,8 +189,6 @@ struct RecompProcessState {
     std::atomic<u64> invalidation_epoch{0};
     std::atomic<u32> active_aot_executions{0};
     std::mutex invalidation_lock;
-    std::mutex active_aot_wait_lock;
-    std::condition_variable active_aot_wait;
 
     void MarkExecutionStarted() {
         // Order the lifecycle transition with loader notifications. A range
@@ -207,6 +204,10 @@ struct RecompProcessState {
     }
 
     bool TryEnterAotExecution() {
+        // The reader's count increment and the writer's odd-epoch publication
+        // form a store-buffering handshake. Both sides must use one total order:
+        // acquire/release alone can let the writer see zero readers while this
+        // reader sees the old even epoch twice and enters stale AOT code.
         const u64 epoch = invalidation_epoch.load(std::memory_order_seq_cst);
         if (epoch & 1) {
             return false;
@@ -221,16 +222,23 @@ struct RecompProcessState {
 
     void LeaveAotExecution() {
         if (active_aot_executions.fetch_sub(1, std::memory_order_seq_cst) == 1) {
-            active_aot_wait.notify_all();
+            active_aot_executions.notify_all();
+        }
+    }
+
+    void WaitForAotReaders() {
+        // atomic::wait couples the observed count to the wait, so a last
+        // reader cannot notify between a predicate check and a condvar sleep.
+        for (u32 count = active_aot_executions.load(std::memory_order_seq_cst); count != 0;
+             count = active_aot_executions.load(std::memory_order_seq_cst)) {
+            active_aot_executions.wait(count, std::memory_order_seq_cst);
         }
     }
 
     std::unique_lock<std::mutex> BeginInvalidation() {
         std::unique_lock lock{invalidation_lock};
         invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
-        std::unique_lock wait_lock{active_aot_wait_lock};
-        active_aot_wait.wait(wait_lock,
-                             [this] { return active_aot_executions.load(std::memory_order_seq_cst) == 0; });
+        WaitForAotReaders();
         return lock;
     }
 
@@ -242,9 +250,7 @@ struct RecompProcessState {
         // Keep the lifecycle decision and odd-epoch publication under one
         // lock. A reader cannot start between the runtime check and the gate.
         invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
-        std::unique_lock wait_lock{active_aot_wait_lock};
-        active_aot_wait.wait(wait_lock,
-                             [this] { return active_aot_executions.load(std::memory_order_seq_cst) == 0; });
+        WaitForAotReaders();
         return lock;
     }
 
@@ -381,6 +387,11 @@ struct RecompCounters {
 RecompCounters g_counters;
 RecompCounters g_lifetime;
 std::atomic<bool> g_coverage_reported{false};
+// A hot title can execute tens of millions of blocks per second. Formatting
+// both coverage reports at every 256K boundary spent substantial time doing
+// file I/O on the emulation threads. Keep periodic crash-resilient snapshots,
+// but rate-limit them across all cores.
+std::atomic<std::chrono::steady_clock::rep> g_last_coverage_snapshot_tick{0};
 
 void FoldCurrentIntoLifetime() {
     g_lifetime.AddAtomicsFrom(g_counters);
@@ -419,6 +430,38 @@ struct ScopedNs {
                              .count();
         if (raw > 0) {
             dest.fetch_add(static_cast<u64>(raw), std::memory_order_relaxed);
+        }
+    }
+};
+
+// Sampled version of ScopedNs for the per-block AOT path. steady_clock::now()
+// twice per block (tens of millions/sec) dominated the dispatcher; sampling
+// 1/128 keeps the aot/dynarmic ratio for the coverage report at 1/128th the
+// cost. The elapsed sample is scaled so totals stay comparable across runs.
+// Dynarmic slices stay exact (they are rare); only the hot AOT dispatch uses
+// this.
+struct SampledAotNs {
+    static constexpr uint32_t kMask = 127;
+    static constexpr uint32_t kScale = 128;
+    std::atomic<u64>& dest;
+    std::chrono::steady_clock::time_point start{};
+    bool active = false;
+    explicit SampledAotNs(std::atomic<u64>& dest_) : dest{dest_} {
+        thread_local uint32_t counter{0};
+        if ((counter++ & kMask) == 0) {
+            active = true;
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~SampledAotNs() {
+        if (!active) {
+            return;
+        }
+        const auto raw = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+        if (raw > 0) {
+            dest.fetch_add(static_cast<u64>(raw) * kScale, std::memory_order_relaxed);
         }
     }
 };
@@ -1347,6 +1390,43 @@ struct ArmRecomp::Impl {
         return true;
     }
 
+    // Fused hot-path: enter the AOT reader gate once, then resolve the block
+    // and validate the icache range. The old RunThread did LookupAot (lookup +
+    // AllowsAotAt) followed by TryEnterAot (gate + AllowsAotAt again): two
+    // icache walks per block plus a race where the lookup happened outside the
+    // gate. On success the caller owns one AOT execution ref and must call
+    // LeaveAot(); on failure no ref is held.
+    AotLookup TryLookupAndEnterAot(u64 pc, RecompBlockFn* out) {
+        if (!process_state->TryEnterAotExecution()) {
+            if (out) {
+                *out = nullptr;
+            }
+            return AotLookup::IcacheReject;
+        }
+        const RecompBlockFn block = lookup ? lookup(pc) : nullptr;
+        if (!block) {
+            process_state->LeaveAotExecution();
+            if (out) {
+                *out = nullptr;
+            }
+            return AotLookup::Miss;
+        }
+        if (!icache.AllowsAotAt(pc)) {
+            process_state->LeaveAotExecution();
+            if (out) {
+                *out = nullptr;
+            }
+            if (icache.AllowsAot()) {
+                g_counters.aot_range_rejects.fetch_add(1, std::memory_order_relaxed);
+            }
+            return AotLookup::IcacheReject;
+        }
+        if (out) {
+            *out = block;
+        }
+        return AotLookup::Hit;
+    }
+
     void LeaveAot() {
         process_state->LeaveAotExecution();
     }
@@ -1363,6 +1443,7 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
     if (HostRecompSession().AttachProcess(process)) {
         ResetCurrentCounters();
         g_coverage_reported.store(false, std::memory_order_relaxed);
+        g_last_coverage_snapshot_tick.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -1528,8 +1609,38 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     impl->interrupted.store(false, std::memory_order_relaxed);
     impl->ctx.halted = 0;
 
+    // Batched block counting: one relaxed fetch_add per block bounced the
+    // counter cache line between cores at tens of millions of dispatches/sec.
+    // Accumulate locally and flush every 128 dispatches; the periodic coverage
+    // dump is checked when a flush crosses a 256K boundary, but written at
+    // most once per five seconds across all emulation threads.
+    u64 pending_blocks = 0;
+    auto flush_block_counts = [&]() {
+        if (pending_blocks == 0) {
+            return;
+        }
+        const u64 prev = g_counters.static_blocks.fetch_add(pending_blocks,
+                                                             std::memory_order_relaxed);
+        const u64 cur = prev + pending_blocks;
+        pending_blocks = 0;
+        if ((prev & ~0x3FFFFULL) != (cur & ~0x3FFFFULL)) {
+            using Clock = std::chrono::steady_clock;
+            constexpr auto interval = std::chrono::duration_cast<Clock::duration>(
+                std::chrono::seconds{5}).count();
+            const auto now = Clock::now().time_since_epoch().count();
+            auto last = g_last_coverage_snapshot_tick.load(std::memory_order_relaxed);
+            if ((last == 0 || now - last >= interval) &&
+                g_last_coverage_snapshot_tick.compare_exchange_strong(
+                    last, now, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                WriteRecompCoverageFile(FormatRecompCoverage());
+                WriteRecompExecutionJson({});
+            }
+        }
+    };
+
     while (!impl->ctx.halted) {
         if (impl->interrupted.load(std::memory_order_relaxed)) {
+            flush_block_counts();
             return HaltReason::BreakLoop;
         }
 
@@ -1558,11 +1669,16 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         impl->trail[impl->trail_pos++ & (Impl::kTrail - 1)] = impl->ctx.pc;
 
         if (impl->ConsumeUnresolvedImportTrap()) {
+            flush_block_counts();
             return HaltReason::PrefetchAbort;
         }
 
+        // Fused hot path: gate + lookup + icache check in one call (previously
+        // LookupAot then TryEnterAot = two icache walks + a race window).
+        // On Hit the AOT reader ref is held; all failure paths below that
+        // return to the JIT must not hold it (fused call already released).
         RecompBlockFn block = nullptr;
-        const AotLookup look = impl->LookupAot(impl->ctx.pc, &block);
+        AotLookup look = impl->TryLookupAndEnterAot(impl->ctx.pc, &block);
         // Test hook: forces every lookup past the Nth to miss, so the JIT
         // fallback below can be exercised on a title that would otherwise never
         // hit a gap. Unset in normal runs.
@@ -1578,8 +1694,12 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 if (n >= limit - 4 && n <= limit + 4) {
                     LOG_ERROR(Core_ARM, "recomp: block #{} pc={:#x}", n, impl->ctx.pc);
                 }
-                if (n >= limit) {
+                if (n >= limit && block) {
+                    // Fused lookup already entered AOT; release before forcing
+                    // the miss path below.
+                    impl->LeaveAot();
                     block = nullptr;
+                    look = AotLookup::Miss;
                 }
             }
         }
@@ -1648,9 +1768,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             }
         }
         if (!block) {
-            // No recompiled block covers this address, or AOT was permanently
-            // refused after ClearInstructionCache. Guest bytes are still mapped,
-            // so hand the thread to Dynarmic instead of PrefetchAbort.
+            // No recompiled block covers this address, or AOT was rejected by
+            // the icache gate inside TryLookupAndEnterAot (which already
+            // released the reader ref). Guest bytes are still mapped, so hand
+            // the thread to Dynarmic instead of PrefetchAbort.
             if (is_icache_reject) {
                 g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -1670,43 +1791,38 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                              "recomp: no JIT fallback available at PC {:#x}; thread cannot "
                              "continue",
                              impl->ctx.pc);
+                flush_block_counts();
                 return HaltReason::PrefetchAbort;
             }
+            flush_block_counts();
             return RunFallback(thread);
         }
 
-        // Dump periodically: teardown is not guaranteed to run (the emulated
-        // process can outlive shutdown), and a run with no report is a run with
-        // no measurement. One compare per block against a power-of-two mask.
-        if ((g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed) &
-             0x3FFFFULL) == 0x3FFFFULL) {
-            WriteRecompCoverageFile(FormatRecompCoverage());
-            WriteRecompExecutionJson({});
-        }
         // Generated code calls a direct branch's target itself rather than
         // coming back here, so one call below can run a whole chain of blocks.
         // The budget bounds that chain, and what is left of it afterwards says
-        // how many blocks actually ran - without which every count here would
-        // report chains rather than blocks.
-        if (!impl->TryEnterAot(impl->ctx.pc)) {
-            g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
-            if (!EnterFallback()) {
-                g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
-                return HaltReason::PrefetchAbort;
-            }
-            return RunFallback(thread);
-        }
-        impl->ctx.chain_budget = impl->icache.AllowsAotChaining() ? kChainBudget : 0;
+        // how many blocks actually ran. Fused lookup above already holds the
+        // AOT reader ref, so no second TryEnterAot is needed here.
+        const int chain_budget = impl->icache.AllowsAotChaining() ? kChainBudget : 0;
+        impl->ctx.chain_budget = chain_budget;
         {
-            ScopedNs timer{g_counters.aot_time_ns};
+            SampledAotNs timer{g_counters.aot_time_ns};
             block(&impl->ctx);
         }
         impl->LeaveAot();
         {
-            const int spent = kChainBudget - impl->ctx.chain_budget;
-            if (spent > 1) {
-                g_counters.static_blocks.fetch_add(static_cast<u64>(spent - 1),
-                                                   std::memory_order_relaxed);
+            const int spent = chain_budget - impl->ctx.chain_budget;
+            // Each successful chain edge decrements the budget before calling
+            // the target. A natural return executed that final target; an
+            // exhausted budget returned before calling it. With chaining
+            // disabled, the first edge can take the budget from zero to -1
+            // without executing its target.
+            const int executed = chain_budget > 0 && impl->ctx.chain_budget > 0
+                                     ? spent + 1
+                                     : std::max(spent, 1);
+            pending_blocks += static_cast<u64>(executed);
+            if (pending_blocks >= 128) {
+                flush_block_counts();
             }
         }
 
@@ -1735,8 +1851,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
                 LOG_CRITICAL(Core_ARM, "recomp: unimplemented opcode at {:#x} and no JIT fallback",
                              impl->ctx.pc);
+                flush_block_counts();
                 return HaltReason::PrefetchAbort;
             }
+            flush_block_counts();
             return RunFallback(thread);
         }
 
@@ -1747,10 +1865,12 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                       impl->ctx.x[2], impl->ctx.x[3]);
             g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
             g_counters.RecordSvc(static_cast<u32>(impl->ctx.pending_svc));
+            flush_block_counts();
             return HaltReason::SupervisorCall;
         }
     }
 
+    flush_block_counts();
     return HaltReason::BreakLoop;
 }
 
@@ -1799,7 +1919,8 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     }
 
     // Do not honour a leftover chain budget from RunThread: a debugger step
-    // must not race through a direct-call chain.
+    // must not race through a direct-call chain. Fused enter keeps the single
+    // icache check (StepThread is cold, so no batching needed here).
     impl->ctx.chain_budget = 0;
     if (!impl->TryEnterAot(impl->ctx.pc)) {
         g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
@@ -1811,7 +1932,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     }
     g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
     {
-        ScopedNs timer{g_counters.aot_time_ns};
+        SampledAotNs timer{g_counters.aot_time_ns};
         block(&impl->ctx);
     }
     impl->LeaveAot();
