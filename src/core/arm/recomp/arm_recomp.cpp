@@ -435,21 +435,27 @@ struct ScopedNs {
 };
 
 // Sampled version of ScopedNs for the per-block AOT path. steady_clock::now()
-// twice per block (tens of millions/sec) dominated the dispatcher; sampling
-// 1/128 keeps the aot/dynarmic ratio for the coverage report at 1/128th the
-// cost. The elapsed sample is scaled so totals stay comparable across runs.
-// Dynarmic slices stay exact (they are rare); only the hot AOT dispatch uses
-// this.
+// twice per block (tens of millions/sec) dominated the dispatcher. Time the
+// first AOT block in each RunThread exactly so short runs still report a
+// duration, then sample 1/128 of later blocks and scale those samples.
+// Dynarmic slices stay exact (they are rare).
 struct SampledAotNs {
     static constexpr uint32_t kMask = 127;
     static constexpr uint32_t kScale = 128;
     std::atomic<u64>& dest;
     std::chrono::steady_clock::time_point start{};
     bool active = false;
-    explicit SampledAotNs(std::atomic<u64>& dest_) : dest{dest_} {
+    u32 scale = kScale;
+    explicit SampledAotNs(std::atomic<u64>& dest_, bool first_in_run = false) : dest{dest_} {
         thread_local uint32_t counter{0};
-        if ((counter++ & kMask) == 0) {
+        const u32 sample_index = counter++;
+        // Short runs must still report AOT time. Charge their first block
+        // exactly; only periodic samples represent another 128 blocks.
+        if (first_in_run || (sample_index & kMask) == 0) {
             active = true;
+            if (first_in_run) {
+                scale = 1;
+            }
             start = std::chrono::steady_clock::now();
         }
     }
@@ -461,7 +467,7 @@ struct SampledAotNs {
                              std::chrono::steady_clock::now() - start)
                              .count();
         if (raw > 0) {
-            dest.fetch_add(static_cast<u64>(raw) * kScale, std::memory_order_relaxed);
+            dest.fetch_add(static_cast<u64>(raw) * scale, std::memory_order_relaxed);
         }
     }
 };
@@ -1615,6 +1621,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     // dump is checked when a flush crosses a 256K boundary, but written at
     // most once per five seconds across all emulation threads.
     u64 pending_blocks = 0;
+    bool first_aot_block = true;
     auto flush_block_counts = [&]() {
         if (pending_blocks == 0) {
             return;
@@ -1806,7 +1813,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         const int chain_budget = impl->icache.AllowsAotChaining() ? kChainBudget : 0;
         impl->ctx.chain_budget = chain_budget;
         {
-            SampledAotNs timer{g_counters.aot_time_ns};
+            SampledAotNs timer{g_counters.aot_time_ns, first_aot_block};
+            first_aot_block = false;
             block(&impl->ctx);
         }
         impl->LeaveAot();
@@ -1932,7 +1940,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     }
     g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
     {
-        SampledAotNs timer{g_counters.aot_time_ns};
+        ScopedNs timer{g_counters.aot_time_ns};
         block(&impl->ctx);
     }
     impl->LeaveAot();
