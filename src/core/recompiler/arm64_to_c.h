@@ -1204,16 +1204,15 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     }
     if ((i & 0xFFFFFC1F) == 0xD65F0000) {
         const u32 rn = (i >> 5) & 31;
-        put("c->pc=c->x[" + std::to_string(rn) + "]; return; /* RET */");
+        put("c->pc=" + Xz(rn) + "; return; /* RET */");
         return false;
     }
-    if ((i & 0xFFFFFC1F) == 0xD61F0000) { u32 rn = (i >> 5) & 31; put("c->pc=c->x[" + std::to_string(rn) + "]; return; /* BR */"); return false; }
+    if ((i & 0xFFFFFC1F) == 0xD61F0000) { u32 rn = (i >> 5) & 31; put("c->pc=" + Xz(rn) + "; return; /* BR */"); return false; }
     if ((i & 0xFFFFFC1F) == 0xD63F0000) {
         u32 rn = (i >> 5) & 31;
-        snprintf(buf, sizeof buf,
-                 "{ uint64_t _target=c->x[%u]; c->x[30]=g_module_base+0x%llxULL; "
-                 "c->pc=_target; return; } /* BLR */",
-                 rn, (unsigned long long)next);
+        snprintf(buf, sizeof buf, "{ uint64_t _target=%s; c->x[30]=g_module_base+0x%llxULL; "
+                                  "c->pc=_target; return; } /* BLR */",
+                 Xz(rn).c_str(), (unsigned long long)next);
         put(buf);
         return false;
     }

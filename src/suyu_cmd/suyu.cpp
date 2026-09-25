@@ -39,6 +39,7 @@
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_gap_session.h"
 #include "core/arm/recomp/recomp_image_features.h"
+#include "core/arm/recomp/recomp_module_binding.h"
 #include "core/core.h"
 #include "core/perf_stats.h"
 #include "core/core_timing.h"
@@ -1673,13 +1674,18 @@ int main(int argc, char** argv) {
         Core::SetRecompFpxReady(recomp_fpx != 0);
         LOG_INFO(Frontend, "Recompiled FPX1 native FP: {} (handshake {:#x})",
                  recomp_fpx ? "negotiated" : "not used", recomp_fpx);
-        // Route base to the module at the same index in load order.
-        // rtld=index0, main=index1, subsdk0=index2, ..., sdk=last.
-        Core::SetRecompBaseSetter([](size_t index, const char*, u64 base) {
-            if (index < s_recomp_modules.size() && s_recomp_modules[index].set_base) {
-                s_recomp_modules[index].set_base(base);
+        Core::SetRecompBaseSetter([](size_t index, const char* live_name, u64 base) {
+            const int image = suyu::recomp::FindRecompModuleForLive(
+                s_recomp_modules.size(),
+                [](size_t i) -> std::string_view { return s_recomp_modules[i].name; }, index,
+                live_name ? std::string_view(live_name) : std::string_view{});
+            if (image >= 0 && s_recomp_modules[image].set_base) {
+                s_recomp_modules[image].set_base(base);
                 // Misses in this module are gaps a re-export can close.
-                Core::RecompGaps::NoteImage(base, s_recomp_modules[index].name);
+                Core::RecompGaps::NoteImage(base, s_recomp_modules[image].name);
+            } else {
+                LOG_WARNING(Frontend, "No recompiled image for live module '{}' (#{})",
+                            live_name ? live_name : "", index);
             }
         });
         // A window running native recompiled code is a standalone game export,

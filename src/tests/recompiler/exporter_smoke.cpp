@@ -11,6 +11,7 @@
 #include "core/arm/recomp/recomp_aot_cache.h"
 #include "core/arm/recomp/recomp_icache.h"
 #include "core/arm/recomp/recomp_image_abi.h"
+#include "core/arm/recomp/recomp_module_binding.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "core/file_sys/common_funcs.h"
@@ -170,11 +171,13 @@ std::string ReadFile(const fs::path& path) {
 constexpr u32 kMovzX0_5 = 0xD28000A0u;
 constexpr u32 kMovzX1_7 = 0xD28000E1u;
 constexpr u32 kMovX0Zero = 0xD2800000u;
-constexpr u32 kAddX2X0X1 = 0x8B010002u;
 constexpr u32 kSvc0 = 0xD4000001u;
 constexpr u32 kRetX5 = 0xD65F00A0u;
 constexpr u32 kRetX30 = 0xD65F03C0u;
+constexpr u32 kRetXzr = 0xD65F03E0u;
+constexpr u32 kBrXzr = 0xD61F03E0u;
 constexpr u32 kBlrX30 = 0xD63F03C0u;
+constexpr u32 kBlrXzr = 0xD63F03E0u;
 constexpr u32 kBPlus8 = 0x14000002u;
 constexpr u32 kMsrFpcrX0 = 0xD51B4400u;
 constexpr u32 kMrsX0Fpcr = 0xD53B4400u;
@@ -940,7 +943,10 @@ void TestSdivProbes(const fs::path& root) {
 void TestBranchProbes(const fs::path& root) {
     const std::string ret5 = TranslateInsn(kRetX5, 0x1000);
     const std::string ret30 = TranslateInsn(kRetX30, 0x1000);
+    const std::string ret_zr = TranslateInsn(kRetXzr, 0x1000);
+    const std::string br_zr = TranslateInsn(kBrXzr, 0x1000);
     const std::string blr = TranslateInsn(kBlrX30, 0x1000);
+    const std::string blr_zr = TranslateInsn(kBlrXzr, 0x1000);
 
     std::ostringstream src;
     src << "#include <stdint.h>\n#include <stdio.h>\n"
@@ -950,8 +956,14 @@ void TestBranchProbes(const fs::path& root) {
         << ret5
         << "}\nstatic void ret_x30(GuestContext* c) {\n"
         << ret30
+        << "}\nstatic void ret_xzr(GuestContext* c) {\n"
+        << ret_zr
+        << "}\nstatic void br_xzr(GuestContext* c) {\n"
+        << br_zr
         << "}\nstatic void blr_x30(GuestContext* c) {\n"
         << blr
+        << "}\nstatic void blr_xzr(GuestContext* c) {\n"
+        << blr_zr
         << "}\nint main(void) {\n"
            "  int fail = 0;\n"
            "  GuestContext c;\n"
@@ -972,6 +984,11 @@ void TestBranchProbes(const fs::path& root) {
            "  printf(\"BLR X30: pc=%llx expected=8000 lr=%llx expected=1004\\n\",\n"
            "         (unsigned long long)c.pc, (unsigned long long)c.x[30]);\n"
            "  if (c.pc != 0x8000 || c.x[30] != 0x1004) fail = 1;\n"
+           "  c.x[31] = 0x9000; c.pc = 0x1000;\n"
+           "  ret_xzr(&c); if (c.pc != 0) fail = 1;\n"
+           "  c.pc = 0x1000; br_xzr(&c); if (c.pc != 0) fail = 1;\n"
+           "  c.pc = 0x1000; blr_xzr(&c);\n"
+           "  if (c.pc != 0 || c.x[30] != 0x1004) fail = 1;\n"
            "  return fail;\n"
            "}\n";
 
@@ -1458,6 +1475,20 @@ void TestCacheInvalidation() {
     }
 }
 
+void TestSparseModuleBinding() {
+    const std::vector<std::string_view> images{"main", "sdk"};
+    const auto bind = [&](size_t index, std::string_view live_name) {
+        return suyu::recomp::FindRecompModuleForLive(
+            images.size(), [&](size_t i) { return images[i]; }, index, live_name);
+    };
+    if (bind(1, "Kart8_Release.nss") != 0 || bind(2, "nnSdk") != 1 ||
+        bind(0, "nnRtld") != -1 || bind(3, "nnUnexpected") != -1) {
+        fail("sparse static images did not bind to their live modules");
+    } else {
+        pass("sparse static images bind by identity and canonical load slot");
+    }
+}
+
 void TestExportAddonClassification() {
     constexpr u64 base = 0x0100AABBCCDDE000ULL;
     constexpr u64 update = base | 0x800;
@@ -1932,6 +1963,7 @@ int main() {
     TestFpControl(root);
     TestUnresolvedImportPolicy();
     TestModuleRegistrationSession();
+    TestSparseModuleBinding();
     TestCacheInvalidation();
     TestExportAddonClassification();
     TestSharedImageAbi(root);
