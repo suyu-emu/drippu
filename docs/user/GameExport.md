@@ -67,6 +67,7 @@ Hybrid remains the choice when static won't run a game.
   package's `README_NATIVE_EXPORT.txt` say which compiler it used. To choose a
   particular `clang-cl.exe`, set `SUYU_CLANG_CL` to its path; to use Microsoft's
   compiler anyway, set `SUYU_RECOMP_COMPILER=msvc`.
+
 - **Source** writes the generated C project, its `CMakeLists.txt` and a build script,
   and stops there. It does not include a compiled program. This is the only format for
   Linux and macOS.
@@ -84,13 +85,13 @@ export continue on the JIT for that module. Clear it to stop the export instead.
 
 The **Update** row shows which update the export will use:
 
-| Message | Meaning |
-|---|---|
-| Update X is available and turned on | The export uses that update. |
-| Update included in this game file | The game file carries its own update, and the export uses it. |
-| Updates are turned off for this game | Turn them on in the game's **Properties > Add-Ons**. |
-| The installed update cannot be read | Reinstall it, or check your keys. Otherwise the export uses the base game. |
-| No update installed | The export uses the base game version. |
+|               Message                |                                  Meaning                                   |
+|--------------------------------------|----------------------------------------------------------------------------|
+| Update X is available and turned on  | The export uses that update.                                               |
+| Update included in this game file    | The game file carries its own update, and the export uses it.              |
+| Updates are turned off for this game | Turn them on in the game's **Properties > Add-Ons**.                       |
+| The installed update cannot be read  | Reinstall it, or check your keys. Otherwise the export uses the base game. |
+| No update installed                  | The export uses the base game version.                                     |
 
 When an update is used, a **From:** line shows where it comes from.
 
@@ -219,3 +220,4 @@ to the game's `.exe`.
 - Exports check that the game code and game data come from the same version, but this
   can't catch every mismatch. Test a package before relying on it.
 - Standalone `.nca` exports stop when an installed update changes RomFS.
+
