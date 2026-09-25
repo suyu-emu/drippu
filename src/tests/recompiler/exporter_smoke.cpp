@@ -9,7 +9,6 @@
 
 #include "core/recompiler/arm64_to_c.h"
 #include "core/arm/recomp/recomp_aot_cache.h"
-#include "core/arm/recomp/recomp_icache.h"
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/arm/recomp/recomp_module_binding.h"
 #include "core/arm/recomp/recomp_session.h"
@@ -31,7 +30,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -1420,58 +1418,15 @@ void TestModuleRegistrationSession() {
     }
 }
 
-void TestCacheInvalidation() {
-    using suyu::recomp::RecompICache;
-
+void TestDirectBranchDispatch() {
     const std::string branch = TranslateInsn(kBPlus8, 0x1000);
     // Direct branches return to Doug's dispatcher. It can observe code
-    // invalidation before selecting the next AOT block.
+    // invalidation before selecting the next AOT block. The active ABI 5/6
+    // guard behavior is covered by tests/recompiler_smoke/run.py.
     if (branch.find("c->pc=g_module_base+0x1008ULL; return;") == std::string::npos) {
         fail("direct branch did not return to the dispatcher: " + branch);
     } else {
         pass("direct branch returns to dispatcher before the next block");
-    }
-
-    RecompICache cache;
-    char aot_block = 0;
-    auto select = [&](u64 pc) -> void* {
-        if (!cache.AllowsAot()) {
-            return nullptr;
-        }
-        return pc == 0x1008 ? &aot_block : nullptr;
-    };
-
-    if (select(0x1008) != &aot_block) {
-        fail("AOT lookup missed 0x1008 before invalidate");
-        return;
-    }
-
-    cache.Clear();
-    if (select(0x1008) == &aot_block) {
-        fail("InvalidateCacheRange left AOT block 0x1008 selected");
-    } else {
-        pass("InvalidateCacheRange stopped selecting AOT block 0x1008");
-    }
-    if (cache.AllowsAot()) {
-        fail("direct block chain can still enter invalidated AOT");
-    } else {
-        pass("direct block chain cannot enter invalidated AOT");
-    }
-
-    RecompICache cleared;
-    cleared.Clear();
-    if (cleared.AllowsAot()) {
-        fail("ClearInstructionCache left AOT selectable");
-    } else {
-        pass("ClearInstructionCache rejects AOT");
-    }
-
-    RecompICache from_nested_ic;
-    from_nested_ic.Clear();
-    if (from_nested_ic.AllowsAot()) {
-        fail("nested JIT CacheInvalidation halt left AOT selectable");
-    } else {
-        pass("nested JIT CacheInvalidation halt rejects AOT");
     }
 }
 
@@ -1964,7 +1919,7 @@ int main() {
     TestUnresolvedImportPolicy();
     TestModuleRegistrationSession();
     TestSparseModuleBinding();
-    TestCacheInvalidation();
+    TestDirectBranchDispatch();
     TestExportAddonClassification();
     TestSharedImageAbi(root);
     TestAotCacheReuse();
