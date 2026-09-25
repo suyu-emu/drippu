@@ -292,14 +292,20 @@ inline const char* g_chain_mod = nullptr;
 // dispatcher checks for interrupts and services SVCs between blocks, so an
 // unbounded chain would let a guest loop run uninterruptibly; it also derives
 // the executed-block count from how much of this budget was spent.
-inline constexpr int kChainBudget = 256;
+// NOTE: the host (ArmRecomp) owns the actual value (currently 32, down from
+// 256 which overflowed the 512KB guest fibers). This constant documents the
+// protocol only; generated code just decrements chain_budget.
+inline constexpr int kChainBudget = 32;
 
-// Conditional branches deliberately do not chain. Measured: chaining them too
-// takes 2.00 ms/frame against 1.80, and turns a tight distribution into one
-// spanning 1.70-2.54 across six reps while the dynarmic arm stays at 2.905 in
-// the same runs. It also pushed JIT transitions from 69,008 to 88,983 and more
-// than doubled lookup misses, which is unexplained and worth understanding
-// before trying this again.
+// Conditional branches chain both edges. A prior attempt regressed (2.00 vs
+// 1.80 ms/frame, doubled misses), but that predated the fused dispatcher gate
+// and the O(1) block index - both of which changed what a chain costs. A tight
+// guest loop is B.cond/CBZ back-edge + B body: leaving cond unchained forces
+// two dispatcher round-trips per iteration. The budget check inside ChainTo
+// still bounds uninterruptible runs, and AllowsAotChaining() disables chaining
+// globally after any range invalidate, so stale chains cannot survive JIT
+// islands. If this regresses again, gate on --chain-budget rather than
+// reverting to park-and-return.
 inline std::string ChainTo(u64 t) {
     char b[256];
     if (g_chain_blocks && g_chain_mod && g_chain_blocks->count(t)) {
@@ -325,6 +331,17 @@ inline std::string Xz(u32 r) {
 }
 inline std::string Wz(u32 r) {
     return r == 31 ? std::string("(uint32_t)0") : ("(uint32_t)c->x[" + std::to_string(r) + "]");
+}
+
+// The condition is fixed at export time. Emit its boolean expression directly
+// so common B.cond and CSEL paths need no runtime call or switch. Condition 15
+// matches recomp_cond's historical always-true handling.
+inline const char* CondExpr(u32 cond) {
+    static constexpr const char* exprs[] = {
+        "c->z", "!c->z", "c->c", "!c->c", "c->n", "!c->n", "c->v", "!c->v",
+        "(c->c&&!c->z)", "(!c->c||c->z)", "(c->n==c->v)", "(c->n!=c->v)",
+        "(!c->z&&c->n==c->v)", "(c->z||c->n!=c->v)", "1", "1"};
+    return exprs[cond & 15];
 }
 
 /// Register 31 as the stack pointer rather than the zero register.
@@ -619,9 +636,37 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         put(buf);
         return false;
     }
-    if ((i & 0xFF000010) == 0x54000000) { s64 off = ((s32)((i >> 5) << 13) >> 13); u64 tt = pc + off * 4; u32 cond = i & 15; snprintf(buf, sizeof buf, "if (recomp_cond(c,%u)) { c->pc=g_module_base+0x%llxULL; } else { c->pc=g_module_base+0x%llxULL; } return;", cond, (unsigned long long)tt, (unsigned long long)next); put(buf); return false; }
-    if ((i & 0x7E000000) == 0x34000000) { u32 sf = i >> 31; bool nz = (i >> 24) & 1; u32 rt = i & 31; s64 off = ((s32)(((i >> 5) & 0x7FFFF) << 13) >> 13); u64 tt = pc + off * 4; std::string v = sf ? Xz(rt) : Wz(rt); snprintf(buf, sizeof buf, "if ((%s)%s0) { c->pc=g_module_base+0x%llxULL; } else { c->pc=g_module_base+0x%llxULL; } return;", v.c_str(), nz ? "!=" : "==", (unsigned long long)tt, (unsigned long long)next); put(buf); return false; }
-    if ((i & 0x7E000000) == 0x36000000) { bool nz = (i >> 24) & 1; u32 b = ((i >> 31) << 5) | ((i >> 19) & 31); u32 rt = i & 31; s64 off = ((s32)(((i >> 5) & 0x3FFF) << 18) >> 18); u64 tt = pc + off * 4; snprintf(buf, sizeof buf, "if (((%s>>%u)&1)%s0) { c->pc=g_module_base+0x%llxULL; } else { c->pc=g_module_base+0x%llxULL; } return;", Xz(rt).c_str(), b, nz ? "!=" : "==", (unsigned long long)tt, (unsigned long long)next); put(buf); return false; }
+    if ((i & 0xFF000010) == 0x54000000) {
+        s64 off = ((s32)((i >> 5) << 13) >> 13);
+        u64 tt = pc + off * 4;
+        u32 cond = i & 15;
+        // Both edges chain when known: loop back-edges stay in generated code
+        // for up to chain_budget blocks instead of bouncing via the dispatcher.
+        put("if (" + std::string(CondExpr(cond)) + ") " + ChainTo(tt) + " else " +
+            ChainTo(next));
+        return false;
+    }
+    if ((i & 0x7E000000) == 0x34000000) {
+        u32 sf = i >> 31;
+        bool nz = (i >> 24) & 1;
+        u32 rt = i & 31;
+        s64 off = ((s32)(((i >> 5) & 0x7FFFF) << 13) >> 13);
+        u64 tt = pc + off * 4;
+        std::string v = sf ? Xz(rt) : Wz(rt);
+        snprintf(buf, sizeof buf, "if ((%s)%s0) ", v.c_str(), nz ? "!=" : "==");
+        put(std::string(buf) + ChainTo(tt) + " else " + ChainTo(next));
+        return false;
+    }
+    if ((i & 0x7E000000) == 0x36000000) {
+        bool nz = (i >> 24) & 1;
+        u32 b = ((i >> 31) << 5) | ((i >> 19) & 31);
+        u32 rt = i & 31;
+        s64 off = ((s32)(((i >> 5) & 0x3FFF) << 18) >> 18);
+        u64 tt = pc + off * 4;
+        snprintf(buf, sizeof buf, "if (((%s>>%u)&1)%s0) ", Xz(rt).c_str(), b, nz ? "!=" : "==");
+        put(std::string(buf) + ChainTo(tt) + " else " + ChainTo(next));
+        return false;
+    }
     if ((i & 0xFFE0001F) == 0xD4000001) { u32 imm = (i >> 5) & 0xFFFF; snprintf(buf, sizeof buf, "c->pc=g_module_base+0x%llxULL; c->pending_svc=%uULL; recomp_svc(c,%u); return;", (unsigned long long)next, imm, imm); put(buf); return false; }
 
     // STP/LDP - load/store pair. Every non-leaf AArch64 function opens and
@@ -644,23 +689,31 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // pre-index applies the offset before the access.
             const char* addr = (mode == 1) ? "_b" : "(_b+_o)";
             s += "int64_t _o=" + std::to_string((long long)off) + "; ";
+            const char* pair = (sz == 8) ? "pair64" : "pair32";
             if (is_load) {
                 // Rt/Rt2 == 31 is XZR here, so the loaded value is discarded -
                 // writing it would land on c->x[31], which is where SP lives.
-                if (rt != 31) {
-                    s += "c->x[" + std::to_string(rt) + "]=recomp_load" + std::to_string(sz * 8) +
-                         "(c," + addr + "); ";
-                }
-                if (rt2 != 31) {
-                    s += "c->x[" + std::to_string(rt2) + "]=recomp_load" + std::to_string(sz * 8) +
-                         "(c," + addr + "+" + std::to_string(sz) + "); ";
+                // Fast path: both live -> single pair call (one page walk).
+                if (rt != 31 && rt2 != 31) {
+                    s += "recomp_load_" + std::string(pair) + "(c," + addr + ",&c->x[" +
+                         std::to_string(rt) + "],&c->x[" + std::to_string(rt2) + "]); ";
+                } else {
+                    if (rt != 31) {
+                        s += "c->x[" + std::to_string(rt) + "]=recomp_load" +
+                             std::to_string(sz * 8) + "(c," + addr + "); ";
+                    }
+                    if (rt2 != 31) {
+                        s += "c->x[" + std::to_string(rt2) + "]=recomp_load" +
+                             std::to_string(sz * 8) + "(c," + addr + "+" + std::to_string(sz) +
+                             "); ";
+                    }
                 }
             } else {
-                s += "recomp_store" + std::to_string(sz * 8) + "(c," + addr + "," +
-                     (rt == 31 ? std::string("(uint64_t)0") : ("c->x[" + std::to_string(rt) + "]")) + "); ";
-                s += "recomp_store" + std::to_string(sz * 8) + "(c," + addr + "+" +
-                     std::to_string(sz) + "," +
-                     (rt2 == 31 ? std::string("(uint64_t)0") : ("c->x[" + std::to_string(rt2) + "]")) + "); ";
+                // Single pair store: one page-table walk for both halves.
+                // XZR sources store zero (same as the two-call form).
+                s += "recomp_store_" + std::string(pair) + "(c," + addr + "," +
+                     (rt == 31 ? std::string("0") : ("c->x[" + std::to_string(rt) + "]")) + "," +
+                     (rt2 == 31 ? std::string("0") : ("c->x[" + std::to_string(rt2) + "]")) + "); ";
             }
             if (mode == 1 || mode == 3) {
                 s += "c->x[" + std::to_string(rn) + "]=_b+_o; ";
@@ -750,7 +803,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 s += "_r = (_s >> " + std::to_string(immr) + ")";
                 if (nbits < 64) s += " & ((1ULL << " + std::to_string(nbits) + ") - 1)";
                 s += "; ";
-                if (opc == 0) { // SBFM: sign-extend from nbits
+                if (opc == 0 && nbits < width) { // SBFM: sign-extend from nbits
                     s += "if (_r & (1ULL << " + std::to_string(nbits - 1) + ")) _r |= ~((1ULL << " +
                          std::to_string(nbits) + ") - 1); ";
                 }
@@ -761,7 +814,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 s += "_r = (_s";
                 if (nbits < 64) s += " & ((1ULL << " + std::to_string(nbits) + ") - 1)";
                 s += ") << " + std::to_string(shift) + "; ";
-                if (opc == 0) {
+                if (opc == 0 && shift + nbits < width) {
                     s += "if (_r & (1ULL << " + std::to_string(shift + nbits - 1) +
                          ")) _r |= ~((1ULL << " + std::to_string(shift + nbits) + ") - 1); ";
                 }
@@ -784,7 +837,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const bool is_imm = ((i >> 11) & 1) != 0;
         const u32 rn = (i >> 5) & 31, nzcv = i & 15;
         const std::string b = is_imm ? (std::to_string(imm_or_rm) + "ULL") : Xz(imm_or_rm);
-        std::string s = "{ if (recomp_cond(c," + std::to_string(cond) + ")) { ";
+        std::string s = "{ if (" + std::string(CondExpr(cond)) + ") { ";
         s += "uint64_t _a=" + Xz(rn) + ", _b=" + b + ", _r=" +
              std::string(op ? "_a-_b" : "_a+_b") + "; ";
         if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
@@ -811,7 +864,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             if (!op && o2) els = "(" + b + " + 1)";            // CSINC
             else if (op && !o2) els = "(~" + b + ")";           // CSINV
             else if (op && o2) els = "((uint64_t)(0 - " + b + "))"; // CSNEG
-            std::string s = "{ uint64_t _r = recomp_cond(c," + std::to_string(cond) + ") ? " +
+            std::string s = "{ uint64_t _r = " + std::string(CondExpr(cond)) + " ? " +
                             a + " : " + els + "; ";
             if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
             s += "c->x[" + std::to_string(rd) + "] = _r; }";
@@ -1299,6 +1352,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
+    // Host FP arithmetic stays off by policy: host float/double uses the host
+    // rounding mode and ignores the guest FPCR (rounding, FTZ, NaN handling),
+    // so translating FADD/FMUL/FDIV/... would silently diverge from Dynarmic
+    // on any title that touches FPCR. exporter_smoke pins this
+    // (ExpectFpControlledOrUnhandled): a translation must either route to the
+    // accurate backend or read c->fpcr. Enabling host FP is a real fallback
+    // win (one transition saved per loop iteration), but it needs FPCR-aware
+    // emission first - see follow-up below - not a silent flag flip.
     constexpr bool kTranslateHostFpArithmetic = false;
 
     // FADDP, scalar: add the two lanes of the source together.
@@ -1943,7 +2004,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             const int fsz = (ftype == 1) ? 8 : 4;
             // Selecting whole register halves rather than reinterpreting the
             // value keeps this exact for NaN payloads too.
-            put("{ uint64_t _r = recomp_cond(c," + std::to_string(cond) + ") ? c->vreg[" +
+            put("{ uint64_t _r = " + std::string(CondExpr(cond)) + " ? c->vreg[" +
                 std::to_string(rn) + "][0] : c->vreg[" + std::to_string(rm) + "][0]; " +
                 (fsz == 4 ? "_r &= 0xFFFFFFFFULL; " : "") + "c->vreg[" + std::to_string(rd) +
                 "][0]=_r; c->vreg[" + std::to_string(rd) + "][1]=0; }");
@@ -2295,7 +2356,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // ordinary FCMP has 1000 in bits 13..10, so the two do not overlap.
             if (((i >> 10) & 3) == 1) {
                 const u32 cond = (i >> 12) & 15, nzcv = i & 15;
-                std::string s = "{ if (recomp_cond(c," + std::to_string(cond) + ")) ";
+                std::string s = "{ if (" + std::string(CondExpr(cond)) + ") ";
                 s += ld_n + ld_m;
                 s += "if (_a != _a || _b != _b) { c->n=0; c->z=0; c->c=1; c->v=1; } ";
                 s += "else { c->n = (_a < _b); c->z = (_a == _b); "
@@ -3637,11 +3698,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         cm << "\n    src/recompiled_" << mod << "_" << u << ".c";
     }
     cm << ")\n\n"
-       << "# Generated block bodies are huge flat switch/if chains translated\n"
-       << "# straight from machine code - there's no loop nesting or hot path for\n"
-       << "# -O2 to meaningfully improve, just a lot of blocks for it to chew\n"
-       << "# through. Compiling them at -O1 cuts single-TU compile time sharply\n"
-       << "# on large modules with no measurable runtime cost.\n"
+       << "# MSVC /O2 improves Sonic Mania's AOT frame rate versus /O1. Keep\n"
+       << "# -O1 on other toolchains until they have a comparable game benchmark.\n"
        << "if(MSVC)\n"
        // /MP is what actually decides wall-clock time here. The Visual Studio
        // generator compiles the files of a single project strictly in
@@ -3657,8 +3715,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        // set) turns "unused local" into a hard build failure; the codegen
        // legitimately computes and drops _r on some flag-only paths, so
        // downgrade it back to a warning for generated sources specifically.
-       << "  set(_recomp_msvc_opts \"/O1\" \"/wd4127\" \"/wd4723\" \"/wd4102\" \"/wd4101\" "
-          "\"/wd4189\")\n"
+       << "  set(_recomp_msvc_opts \"/O2\" \"/wd4127\" \"/wd4723\" \"/wd4102\" \"/wd4101\" "
+          "\"/wd4189\" \"/wd4098\" \"/wd4210\")\n"
        << "  if(NOT CMAKE_GENERATOR MATCHES \"Ninja\")\n"
        << "    list(APPEND _recomp_msvc_opts \"/MP\")\n"
        << "  endif()\n"
@@ -4110,6 +4168,16 @@ uint64_t recomp_load8(GuestContext*,uint64_t); uint64_t recomp_load16(GuestConte
 uint64_t recomp_load32(GuestContext*,uint64_t); uint64_t recomp_load64(GuestContext*,uint64_t);
 void recomp_store8(GuestContext*,uint64_t,uint64_t); void recomp_store16(GuestContext*,uint64_t,uint64_t);
 void recomp_store32(GuestContext*,uint64_t,uint64_t); void recomp_store64(GuestContext*,uint64_t,uint64_t);
+
+/* Paired access: one page-table walk for both halves instead of two. Every
+   non-leaf prologue/epilogue is STP/LDP, so this halves dispatcher-adjacent
+   call + page-walk cost on the hottest stack traffic. Falls back to two
+   single accesses when the pair straddles a page or hits unmapped/debug
+   memory (the single path already handles those). */
+void recomp_load_pair32(GuestContext*,uint64_t,uint64_t*,uint64_t*);
+void recomp_load_pair64(GuestContext*,uint64_t,uint64_t*,uint64_t*);
+void recomp_store_pair32(GuestContext*,uint64_t,uint64_t,uint64_t);
+void recomp_store_pair64(GuestContext*,uint64_t,uint64_t,uint64_t);
 void recomp_svc(GuestContext*,unsigned); void recomp_unhandled(GuestContext*,uint32_t,uint64_t);
 void recomp_barrier(void);
 /* AES S-box, forward or inverse. Constant FIPS 197 tables. */
@@ -4292,6 +4360,22 @@ void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){
   unsigned char* p=recomp_host_ptr(c,a,4); if(p){uint32_t t=(uint32_t)v;memcpy(p,&t,4);return;} memstore(c,a,4,v);}
 void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
   unsigned char* p=recomp_host_ptr(c,a,8); if(p){memcpy(p,&v,8);return;} memstore(c,a,8,v);}
+void recomp_load_pair32(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
+  unsigned char* p=recomp_host_ptr(c,a,8);
+  if(p){uint32_t v0,v1;memcpy(&v0,p,4);memcpy(&v1,p+4,4);*lo=v0;*hi=v1;return;}
+  *lo=recomp_load32(c,a);*hi=recomp_load32(c,a+4);}
+void recomp_load_pair64(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
+  unsigned char* p=recomp_host_ptr(c,a,16);
+  if(p){uint64_t v0,v1;memcpy(&v0,p,8);memcpy(&v1,p+8,8);*lo=v0;*hi=v1;return;}
+  *lo=recomp_load64(c,a);*hi=recomp_load64(c,a+8);}
+void recomp_store_pair32(GuestContext* c,uint64_t a,uint64_t lo,uint64_t hi){
+  unsigned char* p=recomp_host_ptr(c,a,8);
+  if(p){uint32_t v0=(uint32_t)lo,v1=(uint32_t)hi;memcpy(p,&v0,4);memcpy(p+4,&v1,4);return;}
+  recomp_store32(c,a,lo);recomp_store32(c,a+4,hi);}
+void recomp_store_pair64(GuestContext* c,uint64_t a,uint64_t lo,uint64_t hi){
+  unsigned char* p=recomp_host_ptr(c,a,16);
+  if(p){memcpy(p,&lo,8);memcpy(p+8,&hi,8);return;}
+  recomp_store64(c,a,lo);recomp_store64(c,a+8,hi);}
 
 #ifndef RECOMP_STATIC_HOST
 /* Owned by the runtime in the single-module shapes (standalone exe, loadable

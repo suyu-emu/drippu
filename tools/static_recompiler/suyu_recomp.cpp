@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// suyu static recompiler — ARM64 (AArch64) -> portable C source -> native binary.
+// DEPRECATED: this standalone CLI is superseded by the shared engine in
+// src/core/recompiler/arm64_to_c.h (used by game export + ArmRecomp). It is
+// kept for tiny synthetic demos (prove.cmd) only. For real titles use the
+// in-app exporter, which has the full ISA, flat-index dispatch, chaining,
+// page-table fast paths and Dynarmic fallback. This tool's ISA subset and
+// runtime are intentionally minimal.
 //
 // This is a *real* static recompiler in the spirit of N64Recomp (which lifts MIPS to C against a
 // context struct). It decodes a meaningful subset of AArch64 user-mode instructions and emits C
@@ -377,12 +382,28 @@ int main(int argc, char** argv) {
         if (open) { rc << "    c->pc=0x" << std::hex << (b.vaddr + b.size) << std::dec << "ULL; return;\n"; }
         rc << "}\n\n";
     }
-    // dispatch table
-    rc << "#include <stdint.h>\nstruct _ent{uint64_t va; BlockFn fn;};\n";
+    // dispatch table: flat index, not a linear scan. The old linear
+    // recomp_lookup cost O(blocks) per dispatch (tens of millions/sec) and
+    // dominated even the tiny demo. Guest insns are 4B-aligned over one
+    // contiguous range, so (pc-lo)>>2 indexes directly; binary search remains
+    // as fallback if the calloc fails.
+    rc << "#include <stdint.h>\n#include <stdlib.h>\nstruct _ent{uint64_t va; BlockFn fn;};\n";
     rc << "static const struct _ent _tbl[] = {\n";
     for (const auto& b : blocks)
         rc << "  {0x" << std::hex << b.vaddr << std::dec << "ULL, " << FuncName(b.vaddr) << "},\n";
-    rc << "};\nBlockFn recomp_lookup(uint64_t pc){ for(unsigned i=0;i<sizeof(_tbl)/sizeof(_tbl[0]);++i) if(_tbl[i].va==pc) return _tbl[i].fn; return 0; }\n";
+    rc << "};\n"
+          "static BlockFn* _idx=0; static uint64_t _lo=0,_hi=0; static int _tried=0;\n"
+          "static void _build(void){ size_t n,i; if(_tried) return; _tried=1;\n"
+          " if(sizeof(_tbl)/sizeof(_tbl[0])==0) return;\n"
+          " _lo=_tbl[0].va; _hi=_tbl[sizeof(_tbl)/sizeof(_tbl[0])-1].va;\n"
+          " if(_hi<_lo) return; n=(size_t)((_hi-_lo)>>2)+1;\n"
+          " _idx=(BlockFn*)calloc(n,sizeof(BlockFn)); if(!_idx) return;\n"
+          " for(i=0;i<sizeof(_tbl)/sizeof(_tbl[0]);i++) _idx[(size_t)((_tbl[i].va-_lo)>>2)]=_tbl[i].fn; }\n"
+          "BlockFn recomp_lookup(uint64_t pc){ _build();\n"
+          " if(_idx&&pc>=_lo&&pc<=_hi&&((pc-_lo)&3)==0) return _idx[(size_t)((pc-_lo)>>2)];\n"
+          " {unsigned lo=0,hi=sizeof(_tbl)/sizeof(_tbl[0]);\n"
+          "  while(lo<hi){unsigned m=lo+(hi-lo)/2; if(_tbl[m].va<pc) lo=m+1; else hi=m;}\n"
+          "  return (lo<sizeof(_tbl)/sizeof(_tbl[0])&&_tbl[lo].va==pc)?_tbl[lo].fn:0;} }\n";
 
     // emit main.c (loads the same .text as guest memory so PC-relative loads work)
     std::ostringstream mc;

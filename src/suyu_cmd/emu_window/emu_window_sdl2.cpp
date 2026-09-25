@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <SDL3/SDL.h>
+#include <cstdlib>
+#include <fstream>
 // SDL3 removed these constants; define compat shims
 static constexpr Uint8 SDL_PRESSED = 1;
 static constexpr Uint8 SDL_RELEASED = 0;
@@ -643,17 +645,17 @@ void EmuWindow_SDL2::WaitEvent() {
     // Called on main thread
     SDL_Event event;
 
-    if (!SDL_WaitEvent(&event)) {
+    // Wake periodically even when the game produces no input events. The FPS
+    // sample and title update below otherwise stop after the first quiet frame.
+    SDL_ClearError();
+    if (!SDL_WaitEventTimeout(&event, 250)) {
         const char* error = SDL_GetError();
         if (!error || strcmp(error, "") == 0) {
-            // https://github.com/libsdl-org/SDL/issues/5780
-            // Sometimes SDL will return without actually having hit an error condition;
-            // just ignore it in this case.
-            return;
+            event.type = 0;
+        } else {
+            LOG_CRITICAL(Frontend, "SDL_WaitEventTimeout failed: {}", error);
+            exit(1);
         }
-
-        LOG_CRITICAL(Frontend, "SDL_WaitEvent failed: {}", error);
-        exit(1);
     }
 
     switch (event.type) {
@@ -719,6 +721,26 @@ void EmuWindow_SDL2::WaitEvent() {
     const u64 current_time = SDL_GetTicks();
     if (current_time > last_time + 2000) {
         const auto results = system.GetAndResetPerfStats();
+        // Opt-in benchmark output, shared by the JIT frontend and standalone
+        // recompiled exports. Keep the normal window title unchanged.
+        static const char* fps_csv_path = std::getenv("SUYU_FPS_CSV");
+        static std::ofstream fps_csv;
+        static bool fps_csv_opened = false;
+        if (fps_csv_path != nullptr && fps_csv_path[0] != '\0') {
+            if (!fps_csv_opened) {
+                fps_csv.open(fps_csv_path, std::ios::trunc);
+                if (fps_csv) {
+                    fps_csv << "elapsed_ms,fps,speed_percent,frametime_ms\n";
+                }
+                fps_csv_opened = true;
+            }
+            if (fps_csv) {
+                fps_csv << current_time << ',' << results.average_game_fps << ','
+                        << results.emulation_speed * 100.0 << ','
+                        << results.frametime * 1000.0 << '\n';
+                fps_csv.flush();
+            }
+        }
         std::string game_name;
         [[maybe_unused]] auto _ = system.GetGameName(game_name);
         if (g_native_export_mode) {

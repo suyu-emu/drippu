@@ -125,6 +125,11 @@ std::string Quote(const std::string& s) {
 }
 #endif
 
+// Nested AOT helpers below are POSIX-only (cmake+cc+dlopen+objdump paths).
+// Guarded out on Windows, where BuildAndLoadAot fails fast with an explicit
+// "requires POSIX dlopen" message: leaving them defined trips C5245
+// (unreferenced internal linkage, elevated via /we5245) on newer MSVC.
+#ifndef _WIN32
 void AppendSanitizerCmakeArgs(std::vector<std::string>& cfg) {
     const char* flags = SUYU_SMOKE_SANITIZER_FLAGS;
     if (!flags || flags[0] == '\0') {
@@ -166,13 +171,16 @@ bool WriteFile(const fs::path& path, std::string_view text) {
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
     return static_cast<bool>(out);
 }
+#endif // _WIN32
 
+#ifndef _WIN32
 std::string TranslateInsn(u32 insn, u64 pc) {
     std::string body;
     bool unhandled = false;
     suyu::recomp::Translate(insn, pc, body, &unhandled);
     return body;
 }
+#endif // _WIN32
 
 // Guest layout (module-relative). Entry is 0x80000000 with aslr_offset=0.
 constexpr u64 kExpectedEntry = 0x80000000ULL;
@@ -512,6 +520,7 @@ BenchDumpVerdict JudgeAotBenchDump(const DisasmCounts& n) {
     return {false, "too few adds and no in-function loop"};
 }
 
+#ifndef _WIN32
 void RecordBenchDump(const DisasmCounts& n, const std::string& fn) {
     g_aot_compile.disasm_add_count = n.add;
     g_aot_compile.disasm_shl9_count = n.shl9;
@@ -534,8 +543,9 @@ void RecordBenchDump(const DisasmCounts& n, const std::string& fn) {
     std::cout << "AOT block_bench objdump: add=" << n.add << " shl9=" << n.shl9
               << " imul512=" << n.imul512 << " in_fn_back_jcc=" << n.backward_jumps
               << " plt_jmp=" << n.plt_jumps << " store64=" << n.store64
-              << " load64=" << n.load64 << " call=" << n.call << " -> " << v.reason << "\n";
+               << " load64=" << n.load64 << " call=" << n.call << " -> " << v.reason << "\n";
 }
+#endif // _WIN32
 
 void ExpectDumpVerdict(const char* name, const std::string& dump, bool want_ok) {
     const DisasmCounts n = CountBlockBenchOps(dump);
@@ -827,6 +837,7 @@ Core::RecompBlockFn Lookup(u64 pc) {
     return nullptr;
 }
 
+#ifndef _WIN32
 std::string BuildAotSource() {
     // Translate at module-relative PCs; g_module_base is set to entry at runtime.
     const std::string t_movz_tp = TranslateInsn(kMovzX0_1234, kOffTlsSvc + 0);
@@ -1063,6 +1074,7 @@ void block_bench(GuestContext* c) {
     }
     return src.str();
 }
+#endif // _WIN32
 
 bool BuildAndLoadAot(const fs::path& root) {
 #ifdef _WIN32
@@ -2393,9 +2405,13 @@ void ScenarioDirectChainInvalidation(StackFixture& f) {
     ctx = {};
     ctx.pc = g_entry + kOffChainEntry;
     f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+    const auto before_chain = Core::GetRecompExecutionMetrics();
     const auto aot_hr = f.arm->RunThread(f.thread);
     ExpectTrue("direct-chain pre-invalidation SVC", True(aot_hr & Core::HaltReason::SupervisorCall));
     ExpectEq("direct-chain pre-invalidation SVC number", f.arm->GetSvcNumber(), 77);
+    const auto after_chain = Core::GetRecompExecutionMetrics();
+    ExpectEq("direct chain counts entry and target",
+             after_chain.aot_block_executions - before_chain.aot_block_executions, 2ULL);
     Kernel::Svc::ThreadContext aot_ctx{};
     f.arm->GetContext(aot_ctx);
     ExpectEq("direct-chain pre-invalidation result", aot_ctx.r[0], 0xCAFE);
@@ -2479,6 +2495,8 @@ void ScenarioRangeInvalidation(StackFixture& f) {
     ExpectTrue("unaffected range remains AOT",
                True(unaffected_hr & Core::HaltReason::SupervisorCall) &&
                    unaffected_after.aot_block_executions > unaffected_before.aot_block_executions);
+    ExpectEq("unchained unaffected block counted once",
+             unaffected_after.aot_block_executions - unaffected_before.aot_block_executions, 1ULL);
     ScenarioPass("range-specific AOT invalidation keeps unaffected blocks usable", before);
 }
 

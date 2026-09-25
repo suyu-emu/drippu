@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -293,7 +294,9 @@ void TestEmitProjectCompile(const fs::path& root) {
     const fs::path out = root / "emit_project";
     fs::create_directories(out);
 
-    u32 text[4] = {kMovzX0_5, kMovzX1_7, kAddX2X0X1, kSvc0};
+    // CBZ splits both taken and fallthrough into chainable generated blocks.
+    // Compiling the emitted project catches invalid C in either chain arm.
+    u32 text[4] = {kMovzX0_5, 0xB4000040u, kMovzX1_7, kSvc0};
     suyu::recomp::EmitProject("smoke", reinterpret_cast<const suyu::recomp::u8*>(text),
                               sizeof(text), 0x1000, out.string(), true);
 
@@ -358,12 +361,96 @@ void TestTranslatedShape() {
     } else {
         pass("BLR X30 translated C reads the target before writing LR");
     }
+
+    // A full-width signed bitfield needs no sign extension. Emitting
+    // 1ULL << 64 here was undefined C and produced different game code across
+    // compilers (observed in Sonic Mania's subsdk1).
+    for (const u32 insn : {0x9340FC20u, 0x935F7828u}) {
+        const std::string body = TranslateInsn(insn, 0x1000);
+        if (BodyUnhandled(body) || body.find("1ULL << 64") != std::string::npos) {
+            fail("full-width SBFM emitted undefined shift: " + body);
+        } else {
+            pass("full-width SBFM avoids undefined shift");
+        }
+    }
+}
+
+fs::path FindBuiltExe(const fs::path& build, const char* name);
+
+void TestSbfmBoundaries(const fs::path& root) {
+    struct Case {
+        const char* name;
+        bool is64;
+        u32 immr;
+        u32 imms;
+        u64 input;
+        u64 expected;
+    };
+    // Check the full-width cases and their adjacent sign-extending forms.
+    // W writes must also clear the upper half of X0.
+    const Case cases[] = {
+        {"X extract full", true, 0, 63, 0x8000000000000001ULL, 0x8000000000000001ULL},
+        {"X extract signed", true, 1, 63, 0x8000000000000001ULL, 0xC000000000000000ULL},
+        {"X insert full", true, 32, 31, 0x80000000ULL, 0x8000000000000000ULL},
+        {"X insert signed", true, 32, 30, 0x40000000ULL, 0xC000000000000000ULL},
+        {"W extract full", false, 0, 31, 0xF000000080000001ULL, 0x80000001ULL},
+        {"W extract signed", false, 1, 31, 0x80000001ULL, 0xC0000000ULL},
+        {"W insert full", false, 16, 15, 0x8000ULL, 0x80000000ULL},
+        {"W insert signed", false, 16, 14, 0x4000ULL, 0xC0000000ULL},
+    };
+    std::ostringstream src;
+    src << "#include <stdint.h>\n#include <stdio.h>\n"
+           "typedef struct { uint64_t x[32]; } GuestContext;\n";
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        const Case& test = cases[i];
+        const u32 insn = (test.is64 ? 0x93400000u : 0x13000000u) |
+                         (test.immr << 16) | (test.imms << 10) | (1u << 5);
+        const std::string body = TranslateInsn(insn, 0x1000);
+        if (BodyUnhandled(body)) {
+            fail(std::string("SBFM boundary unhandled: ") + test.name);
+            return;
+        }
+        src << "static void test_" << i << "(GuestContext* c) {\n" << body << "}\n";
+    }
+    src << "int main(void) {\n";
+    for (size_t i = 0; i < std::size(cases); ++i) {
+        const Case& test = cases[i];
+        src << "  { GuestContext c = {{0}}; c.x[1] = 0x" << std::hex << test.input
+            << "ULL; test_" << std::dec << i << "(&c); if (c.x[0] != 0x" << std::hex
+            << test.expected << "ULL) { printf(\"SBFM " << test.name
+            << " got %llx\\n\", (unsigned long long)c.x[0]); return 1; } }\n"
+            << std::dec;
+    }
+    src << "  return 0;\n}\n";
+
+    const fs::path probe_src = root / "sbfm_probe";
+    fs::create_directories(probe_src);
+    if (!WriteFile(probe_src / "probe.c", src.str()) ||
+        !WriteFile(probe_src / "CMakeLists.txt",
+                   "cmake_minimum_required(VERSION 3.13)\n"
+                   "project(suyu_sbfm_probe C)\n"
+                   "set(CMAKE_C_STANDARD 11)\n"
+                   "set(CMAKE_C_EXTENSIONS OFF)\n"
+                   "add_executable(sbfm_probe probe.c)\n")) {
+        return;
+    }
+    const fs::path probe_build = probe_src / "build";
+    if (CmakeBuild(probe_src, probe_build, "sbfm_probe", true) != 0) {
+        return;
+    }
+    const fs::path exe = FindBuiltExe(probe_build, "sbfm_probe");
+    if (exe.empty() || RunArgs({exe.string()}) != 0) {
+        fail("SBFM boundary execution");
+        return;
+    }
+    pass("SBFM full-width and sign-extension boundaries executed");
 }
 
 fs::path FindBuiltExe(const fs::path& build, const char* name) {
     const fs::path candidates[] = {
         build / name,
 #ifdef _WIN32
+        build / (std::string(name) + ".exe"),
         build / "Release" / (std::string(name) + ".exe"),
         build / "Debug" / (std::string(name) + ".exe"),
 #else
@@ -547,6 +634,17 @@ int main(void) {
   callbacks = 0;
   fail |= expect_eq("same-page load64", recomp_load64(&ctx, 0x100), 0x8877665544332211ULL);
   if (callbacks != 0) fail = 1;
+  {
+    uint64_t lo = 0, hi = 0;
+    callbacks = 0;
+    recomp_load_pair32(&ctx, 0x100, &lo, &hi);
+    if (lo != 0x44332211ULL || hi != 0x88776655ULL || callbacks != 0) fail = 1;
+    recomp_store_pair64(&ctx, 0x110, 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
+    if (callbacks != 0) fail = 1;
+    recomp_load_pair64(&ctx, 0x110, &lo, &hi);
+    if (lo != 0x0123456789ABCDEFULL || hi != 0xFEDCBA9876543210ULL || callbacks != 0)
+      fail = 1;
+  }
 
   memset(backing, 0xCC, sizeof backing);
   page0_host[PAGE_SIZE - 1] = 0x11;
@@ -574,6 +672,17 @@ int main(void) {
   fail |= expect_eq("cross-page load32 discontig", recomp_load32(&ctx, PAGE_SIZE - 1),
                     0x04030201ULL);
   if (callbacks == 0) fail = 1;
+
+  /* A pair spanning discontiguous pages must resolve each half separately. */
+  callbacks = 0;
+  recomp_store_pair64(&ctx, PAGE_SIZE - 8, 0x1122334455667788ULL,
+                      0x99AABBCCDDEEFF00ULL);
+  {
+    uint64_t lo = 0, hi = 0;
+    callbacks = 0;
+    recomp_load_pair64(&ctx, PAGE_SIZE - 8, &lo, &hi);
+    if (lo != 0x1122334455667788ULL || hi != 0x99AABBCCDDEEFF00ULL) fail = 1;
+  }
 
   memset(page0_host, 0, PAGE_SIZE);
   memset(page1_host, 0, PAGE_SIZE);
@@ -789,6 +898,9 @@ void TestSdivProbes(const fs::path& root) {
     fs::path exe = probe_build / "sdiv_probe";
 #ifdef _WIN32
     if (!fs::exists(exe)) {
+        exe = probe_build / "sdiv_probe.exe";
+    }
+    if (!fs::exists(exe)) {
         exe = probe_build / "Release" / "sdiv_probe.exe";
     }
     if (!fs::exists(exe)) {
@@ -869,6 +981,9 @@ void TestBranchProbes(const fs::path& root) {
 
     fs::path exe = probe_build / "branch_probe";
 #ifdef _WIN32
+    if (!fs::exists(exe)) {
+        exe = probe_build / "branch_probe.exe";
+    }
     if (!fs::exists(exe)) {
         exe = probe_build / "Release" / "branch_probe.exe";
     }
@@ -1005,6 +1120,9 @@ void TestFpControl(const fs::path& root) {
 
     fs::path exe = probe_build / "fp_probe";
 #ifdef _WIN32
+    if (!fs::exists(exe)) {
+        exe = probe_build / "fp_probe.exe";
+    }
     if (!fs::exists(exe)) {
         exe = probe_build / "Release" / "fp_probe.exe";
     }
@@ -1798,6 +1916,7 @@ int main() {
 
     std::cout << "exporter smoke workdir: " << root << std::endl;
     TestTranslatedShape();
+    TestSbfmBoundaries(root);
     TestEmitProjectCompile(root);
     TestMultiModuleLink(root);
     TestMemoryBoundaries(root);
