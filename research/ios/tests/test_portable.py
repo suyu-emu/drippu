@@ -50,7 +50,7 @@ class PortableTests(unittest.TestCase):
     def test_02_jit_configuration_rejected(self):
         _, log = self.config('reject-jit', flags=['-DSUYU_NO_JIT=OFF'], success=False)
         self.assertIn('requires SUYU_NO_JIT=ON', log)
-    def test_03_unfixed_index_symbols_do_collide(self):
+    def test_03_unfixed_indices_collide(self):
         build, _ = self.config('reject-collisions', flags=['-DSWITCH_AOT_TEST_OMIT_SYMBOL_FIX=ON'])
         log = self.build(build, success=False)
         self.assertRegex(log, 'multiple definition|duplicate symbol')

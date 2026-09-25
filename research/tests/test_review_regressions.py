@@ -199,7 +199,7 @@ int main(){
 '''
         run([self.build(cpp,'diagnostics')])
 
-    def test_04_probe_on_off_and_pipeline_counts(self):
+    def test_04_probe_toggle_and_counts(self):
         # Minimal logging/types headers, not a Vulkan/GPU substitute.
         (self.d/'common/logging').mkdir(parents=True)
         (self.d/'common/common_types.h').write_text('#include <cstdint>\nusing u64=std::uint64_t;\n')
