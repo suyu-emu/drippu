@@ -397,7 +397,7 @@ struct Memory::Impl {
     }
 
     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
-        return WalkBlock(dest_addr, size,
+        return WalkBlock(src_addr, size,
         [&](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016X} (start address = {:#016X}, size = {})", GetInteger(current_vaddr), GetInteger(src_addr), size);
             ZeroBlock(dest_addr + offset, copy_amount);
