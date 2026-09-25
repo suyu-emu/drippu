@@ -23,6 +23,9 @@ if (SUYU_CMD OR YUZU_CMD)
         emu_window/emu_window_sdl2_vk.cpp
         emu_window/emu_window_sdl2_vk.h
         precompiled_headers.h
+        controller_assign.h
+        native_status.cpp
+        native_status.h
         sdl_config.cpp
         sdl_config.h
         suyu.cpp
@@ -45,12 +48,33 @@ if (SUYU_CMD OR YUZU_CMD)
     # This is an *additional* target - plain suyu-cmd stays game-agnostic.
     # ---------------------------------------------------------------------
     if (SUYU_CMD_RECOMP_DIR AND EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_registration.c")
+        if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_abi_v4.h")
+            message(FATAL_ERROR
+                "This static module registry predates ABI 4. Re-export the title before building.")
+        endif()
         enable_language(C)
         # Tells the generated module projects to emit only the static library,
         # skipping their portable standalone exe (whose target name would
         # collide between modules) and their loadable shared image.
         set(RECOMP_STATIC_ONLY ON)
         set(_recomp_libs "")
+        # Generated block bodies re-declare temporaries per guest block and
+        # leave results unused wherever the original instruction's value is
+        # dead, so suyu's warnings-as-errors fire constantly on machine-written
+        # code that nobody is going to read, let alone edit. -Wshadow alone
+        # fails the build on Mario Kart 8 Deluxe's main module. The MSVC branch
+        # of the generated CMakeLists already silences its equivalents; do the
+        # same for everyone else by dropping -Werror for these subdirectories
+        # only. The host's own flags are restored once they have been added, so
+        # suyu's sources keep the full set.
+        get_directory_property(_recomp_host_opts COMPILE_OPTIONS)
+        set(_recomp_quiet_opts "${_recomp_host_opts}")
+        # Matched anywhere in the element, not anchored: these arrive wrapped
+        # in a generator expression, e.g.
+        # "$<$<COMPILE_LANGUAGE:C,CXX>:-Werror=shadow>", so an anchored pattern
+        # matches none of them and silently leaves the build exactly as it was.
+        list(FILTER _recomp_quiet_opts EXCLUDE REGEX "-Werror|/WX")
+        set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_recomp_quiet_opts}")
         # file(GLOB) treats [ ] * ? in the WHOLE path as glob syntax, not just
         # the trailing "/*" - a title whose exported folder name carries its
         # title ID in brackets (e.g. "Pokemon Sword[0100ABF008968000][US][v0]",
@@ -72,6 +96,19 @@ if (SUYU_CMD OR YUZU_CMD)
         string(REPLACE "@LBRACKET@" "[[]" _recomp_dir_escaped "${_recomp_dir_escaped}")
         file(GLOB _recomp_children RELATIVE "${SUYU_CMD_RECOMP_DIR}"
              "${_recomp_dir_escaped}/*")
+        # SUYU_CMD_RECOMP_PREBUILT_DIR: the modules were already compiled by
+        # recomp_modules/ (the Windows Build export does that with clang-cl,
+        # since one CMake project has one C compiler). Link its libraries
+        # instead of compiling the generated sources in this tree.
+        if (SUYU_CMD_RECOMP_PREBUILT_DIR)
+            set(_recomp_runtime_lib "${SUYU_CMD_RECOMP_PREBUILT_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}recomp_runtime_shared${CMAKE_STATIC_LIBRARY_SUFFIX}")
+            if (NOT EXISTS "${_recomp_runtime_lib}")
+                message(FATAL_ERROR "SUYU_CMD_RECOMP_PREBUILT_DIR has no ${_recomp_runtime_lib}")
+            endif()
+            add_library(recomp_runtime_shared STATIC IMPORTED)
+            set_target_properties(recomp_runtime_shared PROPERTIES
+                IMPORTED_LOCATION "${_recomp_runtime_lib}")
+        endif()
         foreach(_m ${_recomp_children})
             if (EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/CMakeLists.txt" AND
                 EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_export.c")
@@ -84,6 +121,17 @@ if (SUYU_CMD OR YUZU_CMD)
                 # binary that black-screens.
                 if (EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h")
                     file(READ "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h" _rt_h)
+                    if (NOT _rt_h MATCHES "#define RECOMP_IMAGE_ABI ([56])")
+                        message(FATAL_ERROR "Module '${_m}' predates correctness ABI 5; re-export ALL modules")
+                    endif()
+                    # ABI 6 extends the GuestContext that all modules share
+                    # with one runtime, so a bundle must not mix ABIs.
+                    set(_m_abi "${CMAKE_MATCH_1}")
+                    if (DEFINED _recomp_bundle_abi AND NOT _recomp_bundle_abi STREQUAL _m_abi)
+                        message(FATAL_ERROR "Module '${_m}' is ABI ${_m_abi} but others are ABI "
+                                            "${_recomp_bundle_abi}; re-export ALL modules together")
+                    endif()
+                    set(_recomp_bundle_abi "${_m_abi}")
                     if (NOT _rt_h MATCHES "tpidrro_el0")
                         message(FATAL_ERROR
                             "Recompiled module '${_m}' in ${SUYU_CMD_RECOMP_DIR} predates the "
@@ -91,15 +139,73 @@ if (SUYU_CMD OR YUZU_CMD)
                             "Re-export the game to regenerate its AOT cache.")
                     endif()
                 endif()
+                if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/${_m}/recomp_runtime.h")
+                    message(FATAL_ERROR "Generated module '${_m}' has no runtime header")
+                endif()
+                if (SUYU_CMD_RECOMP_PREBUILT_DIR)
+                    set(_recomp_lib "${SUYU_CMD_RECOMP_PREBUILT_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}recomp_static_${_m}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+                    if (NOT EXISTS "${_recomp_lib}")
+                        message(FATAL_ERROR "SUYU_CMD_RECOMP_PREBUILT_DIR has no ${_recomp_lib}")
+                    endif()
+                    add_library(recomp_static_${_m} STATIC IMPORTED)
+                    set_target_properties(recomp_static_${_m} PROPERTIES
+                        IMPORTED_LOCATION "${_recomp_lib}"
+                        INTERFACE_LINK_LIBRARIES recomp_runtime_shared)
+                    list(APPEND _recomp_libs "recomp_static_${_m}")
+                    continue()
+                endif()
                 add_subdirectory("${SUYU_CMD_RECOMP_DIR}/${_m}"
                                  "${CMAKE_CURRENT_BINARY_DIR}/recomp/${_m}")
+                # The generated CMakeLists renames each module's exported
+                # symbols so that several modules can share one binary, but
+                # its list predates these three and every module defines
+                # them, so linking more than one fails on duplicates.
+                # Rename them the same way until the emitter does.
+                # (recomp_modules/CMakeLists.txt repeats this.)
+                target_compile_definitions(recomp_static_${_m} PRIVATE
+                    recomp_image_index=recomp_image_index_${_m}
+                    _recomp_index_view=_recomp_index_view_${_m}
+                    recomp_build_index=recomp_build_index_${_m})
                 list(APPEND _recomp_libs "recomp_static_${_m}")
             endif()
         endforeach()
+        set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_recomp_host_opts}")
         if (_recomp_libs)
             add_executable(suyu-cmd-static ${SUYU_CMD_SOURCES}
                            "${SUYU_CMD_RECOMP_DIR}/recomp_registration.c")
             target_compile_definitions(suyu-cmd-static PRIVATE SUYU_CMD_STATIC_RECOMP=1)
+            if (NOT SUYU_RECOMP_HYBRID)
+                target_compile_definitions(suyu-cmd-static PRIVATE
+                                           SUYU_CMD_STATIC_RECOMP_STRICT=1)
+            else()
+                target_compile_definitions(suyu-cmd-static PRIVATE
+                                           SUYU_CMD_STATIC_RECOMP_HYBRID=1)
+            endif()
+            if (EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_guard_v2.h")
+                target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_GUARD_V2=1)
+            endif()
+            if (_recomp_bundle_abi STREQUAL "6")
+                if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_fastmem_v1.h")
+                    message(FATAL_ERROR "ABI 6 modules need a registry with the fastmem "
+                                        "handshake; re-export the title with this build")
+                endif()
+                target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_FASTMEM_V1=1)
+                # The registry's feature report, which suyu.cpp checks for bits
+                # this host does not implement before any other handshake.
+                if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_features_v1.h")
+                    message(FATAL_ERROR "ABI 6 modules need a registry with the feature "
+                                        "report; re-export the title with this build")
+                endif()
+                target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_FEATURES_V1=1)
+                # Generation code guard (GG1) registrations, when the export has them.
+                if (EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_guard_gen_v1.h")
+                    target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_GUARD_GEN_V1=1)
+                endif()
+                # FPX1 registries also export suyu_recomp_static_fpx_v1.
+                if (EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_fpx_v1.h")
+                    target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_FPX_V1=1)
+                endif()
+            endif()
             target_link_libraries(suyu-cmd-static PRIVATE ${_recomp_libs})
             list(APPEND SUYU_CMD_TARGETS suyu-cmd-static)
         else()
@@ -110,6 +216,10 @@ if (SUYU_CMD OR YUZU_CMD)
     create_resource("../../dist/suyu.bmp" "suyu_cmd/suyu_icon.h" "suyu_icon")
 
     foreach(_t ${SUYU_CMD_TARGETS})
+        if (USE_DISCORD_PRESENCE)
+            target_link_libraries(${_t} PRIVATE DiscordRPC::discord-rpc)
+            target_compile_definitions(${_t} PRIVATE USE_DISCORD_PRESENCE)
+        endif()
         if (APPLE)
             target_sources(${_t} PRIVATE
                 emu_window/emu_window_sdl2_mtl.cpp

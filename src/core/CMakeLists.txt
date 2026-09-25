@@ -9,10 +9,20 @@ add_library(core STATIC
     arm/arm_interface.h
     arm/recomp/arm_recomp.cpp
     arm/recomp/arm_recomp.h
+    arm/recomp/recomp_gap_session.cpp
+    arm/recomp/recomp_gap_session.h
+    arm/recomp/recomp_gaps.cpp
+    arm/recomp/recomp_gaps.h
+    arm/recomp/recomp_guard_gen.cpp
+    arm/recomp/recomp_guard_gen.h
+    arm/recomp/guest_fp_env.h
+    arm/recomp/recomp_image_features.h
     arm/debug.cpp
     arm/debug.h
     arm/exclusive_monitor.cpp
     arm/exclusive_monitor.h
+    arm/standalone_exclusive_monitor.cpp
+    arm/standalone_exclusive_monitor.h
     arm/symbols.cpp
     arm/symbols.h
     constants.cpp
@@ -243,6 +253,8 @@ add_library(core STATIC
     hle/kernel/k_code_memory.h
     hle/kernel/k_condition_variable.cpp
     hle/kernel/k_condition_variable.h
+    hle/kernel/k_lock_trace.cpp
+    hle/kernel/k_lock_trace.h
     hle/kernel/k_debug.h
     hle/kernel/k_device_address_space.cpp
     hle/kernel/k_device_address_space.h
@@ -1213,7 +1225,13 @@ target_include_directories(core PRIVATE ${OPUS_INCLUDE_DIRS})
 target_link_libraries(core PUBLIC common PRIVATE audio_core hid_core network video_core nx_tzdb tz)
 
 if (BOOST_NO_HEADERS)
-    target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
+    target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::crc)
+    if(NOT IOS)
+        target_link_libraries(core PUBLIC Boost::process)
+    else()
+        # The debugger uses the header-only v1 async pipe, not process launching.
+        target_include_directories(core PRIVATE "${Boost_SOURCE_DIR}/libs/process/include")
+    endif()
 else()
     target_link_libraries(core PUBLIC Boost::headers)
 endif()
@@ -1251,7 +1269,8 @@ if (HAS_NCE)
     target_link_libraries(core PRIVATE merry::oaknut)
 endif()
 
-if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64)
+if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64)
+    AND NOT SUYU_NO_JIT)
     target_sources(core PRIVATE
         arm/dynarmic/arm_dynarmic.h
         arm/dynarmic/arm_dynarmic_64.cpp
@@ -1269,6 +1288,10 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         hle/service/jit/jit.cpp
         hle/service/jit/jit.h)
     target_link_libraries(core PRIVATE dynarmic::dynarmic)
+endif()
+
+if (SUYU_NO_JIT)
+    target_compile_definitions(core PUBLIC SUYU_NO_JIT)
 endif()
 
 target_sources(core PRIVATE hle/service/ssl/ssl_backend_openssl.cpp)

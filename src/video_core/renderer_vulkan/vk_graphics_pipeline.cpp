@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_stall_probe.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_notify.h"
@@ -272,32 +273,51 @@ GraphicsPipeline::GraphicsPipeline(
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
     auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics] {
-        DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
-        uses_push_descriptor = builder.CanUsePushDescriptor();
-        descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
+        // Publish the build result on every exit path. Anything that escapes
+        // this lambda used to leave is_built false forever, and ConfigureDraw
+        // waits on it from the scheduler thread with no timeout, so a single
+        // rejected pipeline deadlocked the whole renderer instead of dropping
+        // one draw. MoltenVK rejects pipelines desktop drivers accept, which
+        // is why this surfaces on Apple first.
+        const auto publish{[this, shader_notify] {
+            {
+                std::scoped_lock lock{build_mutex};
+                is_built = true;
+            }
+            build_condvar.notify_all();
+            if (shader_notify) {
+                shader_notify->MarkShaderComplete();
+            }
+        }};
+        try {
+            DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+            uses_push_descriptor = builder.CanUsePushDescriptor();
+            descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
 
-        if (!uses_push_descriptor) {
-            descriptor_allocator = descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, stage_infos);
+            if (!uses_push_descriptor) {
+                descriptor_allocator =
+                    descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, stage_infos);
+            }
+
+            const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
+            pipeline_layout = builder.CreatePipelineLayout(set_layout);
+            descriptor_update_template =
+                builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
+
+            const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state))};
+            Validate();
+            MakePipeline(render_pass);
+            if (pipeline_statistics) {
+                pipeline_statistics->Collect(device, *pipeline);
+            }
+        } catch (const std::exception& exception) {
+            // vk::Exception derives from std::exception, so this also covers a
+            // driver rejecting the pipeline.
+            LOG_ERROR(Render_Vulkan, "Failed to build graphics pipeline {:016x}: {}", key.Hash(),
+                      exception.what());
+            build_failed = true;
         }
-
-        const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
-        pipeline_layout = builder.CreatePipelineLayout(set_layout);
-        descriptor_update_template =
-            builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
-
-        const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state))};
-        Validate();
-        MakePipeline(render_pass);
-        if (pipeline_statistics) {
-            pipeline_statistics->Collect(device, *pipeline);
-        }
-
-        std::scoped_lock lock{build_mutex};
-        is_built = true;
-        build_condvar.notify_one();
-        if (shader_notify) {
-            shader_notify->MarkShaderComplete();
-        }
+        publish();
     }};
     if (worker_thread) {
         worker_thread->QueueWork(std::move(func));
@@ -519,20 +539,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     texture_cache.UpdateRenderTargets(false);
     texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
                                                                                  views.size()});
-    ConfigureDraw(rescaling, render_area);
-
-    return true;
+    return ConfigureDraw(rescaling, render_area);
 }
 
-void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (!is_built.load(std::memory_order::relaxed)) {
-        // Wait for the pipeline to be built
-        scheduler.Record([this](vk::CommandBuffer) {
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
-        });
+        // Wait here rather than from a recorded command. The recorded wait ran
+        // on the scheduler thread after this draw had already been queued, so
+        // it could never decline to draw when the build failed.
+        StallProbe::Accum build_probe{StallProbe::build_wait_ns,
+                                           &StallProbe::build_wait_count};
+        std::unique_lock lock{build_mutex};
+        build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+    }
+    if (build_failed.load(std::memory_order::relaxed)) {
+        // No pipeline to bind. Drop the draw instead of binding a null handle.
+        return false;
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
@@ -582,6 +606,7 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
+    return true;
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
@@ -597,7 +622,28 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (!key.state.dynamic_vertex_input) {
         const size_t num_vertex_arrays = (std::min)(
             Maxwell::NumVertexArrays, static_cast<size_t>(device.GetMaxVertexInputBindings()));
+        // Declare only the bindings an enabled attribute actually reads. A
+        // binding no attribute references does nothing, and declaring all 32
+        // leaves most of them with no buffer bound, which every draw then
+        // reports as VUID-vkCmdDraw*-None-04007. It also costs real resources
+        // on Metal, where each declared binding consumes one of the vertex
+        // stage's limited buffer argument slots and MoltenVK reserves several
+        // of those for itself. Binding numbers are indices, not positions, so
+        // a sparse set stays consistent with vkCmdBindVertexBuffers.
+        u32 used_bindings{};
+        for (size_t index = 0; index < key.state.attributes.size(); ++index) {
+            const auto& attribute = key.state.attributes[index];
+            if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
+                continue;
+            }
+            if (static_cast<size_t>(attribute.buffer) < num_vertex_arrays) {
+                used_bindings |= 1U << attribute.buffer;
+            }
+        }
         for (size_t index = 0; index < num_vertex_arrays; ++index) {
+            if ((used_bindings & (1U << index)) == 0) {
+                continue;
+            }
             const bool instanced = key.state.binding_divisors[index] != 0;
             const auto rate =
                 instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;

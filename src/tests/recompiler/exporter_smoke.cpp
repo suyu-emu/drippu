@@ -637,11 +637,11 @@ int main(void) {
   {
     uint64_t lo = 0, hi = 0;
     callbacks = 0;
-    recomp_load_pair32(&ctx, 0x100, &lo, &hi);
+    recomp_ldp32(&ctx, 0x100, &lo, &hi);
     if (lo != 0x44332211ULL || hi != 0x88776655ULL || callbacks != 0) fail = 1;
-    recomp_store_pair64(&ctx, 0x110, 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
+    recomp_stp64(&ctx, 0x110, 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
     if (callbacks != 0) fail = 1;
-    recomp_load_pair64(&ctx, 0x110, &lo, &hi);
+    recomp_ldp64(&ctx, 0x110, &lo, &hi);
     if (lo != 0x0123456789ABCDEFULL || hi != 0xFEDCBA9876543210ULL || callbacks != 0)
       fail = 1;
   }
@@ -675,12 +675,12 @@ int main(void) {
 
   /* A pair spanning discontiguous pages must resolve each half separately. */
   callbacks = 0;
-  recomp_store_pair64(&ctx, PAGE_SIZE - 8, 0x1122334455667788ULL,
+  recomp_stp64(&ctx, PAGE_SIZE - 8, 0x1122334455667788ULL,
                       0x99AABBCCDDEEFF00ULL);
   {
     uint64_t lo = 0, hi = 0;
     callbacks = 0;
-    recomp_load_pair64(&ctx, PAGE_SIZE - 8, &lo, &hi);
+    recomp_ldp64(&ctx, PAGE_SIZE - 8, &lo, &hi);
     if (lo != 0x1122334455667788ULL || hi != 0x99AABBCCDDEEFF00ULL) fail = 1;
   }
 

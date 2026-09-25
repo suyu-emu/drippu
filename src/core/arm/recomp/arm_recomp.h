@@ -4,11 +4,14 @@
 #pragma once
 
 #include <cstddef>
-#include <filesystem>
+#include <array>
 #include <memory>
+#include <map>
 #include <string>
+#include <vector>
 
 #include "core/arm/arm_interface.h"
+#include "core/arm/recomp/recomp_guard_gen.h"
 
 namespace Kernel {
 class KProcess;
@@ -18,6 +21,7 @@ namespace Core {
 
 class System;
 class DynarmicExclusiveMonitor;
+class ExclusiveMonitor;
 
 /**
  * Signature of a recompiled block produced by suyu::recomp::EmitProject.
@@ -46,6 +50,52 @@ using RecompLookupFn = RecompBlockFn (*)(u64 pc);
  * own.
  */
 void SetRecompLookup(RecompLookupFn lookup);
+/// Selects the maximum nonrecursive module-local slice for the loaded image ABI.
+/// Legacy direct-call images must remain at 32 to fit the guest fiber stack.
+void SetRecompLongSlices(bool enabled);
+/// True only after every loaded compiled module negotiated guard version 2.
+void SetRecompCodeGuardReady(bool ready);
+bool IsRecompCodeGuardReady();
+
+/// ABI 6 (FM1): the arguments the loader passes to each module's
+/// recomp_image_fastmem_v1. They describe this host's page table and its view
+/// of the generated context; a module that was compiled against anything else
+/// answers 0 and the bundle is refused.
+struct RecompFastmemLayout {
+    u32 page_bits;
+    u32 stride_log2;
+    u64 pointer_mask;
+    u32 off_table;
+    u32 off_limit;
+};
+RecompFastmemLayout GetRecompFastmemLayout();
+/// True only after every loaded module is ABI 6 and passed the handshake above.
+/// SUYU_RECOMP_FASTMEM=0 still keeps the fast path off at run time.
+void SetRecompFastmemReady(bool ready);
+bool IsRecompFastmemReady();
+
+/// ABI 6 feature GG1 (generation code guard). The loader calls this after
+/// SetRecompLookup, with what each GG1 module's recomp_image_guard_gen_v1
+/// returned, and before the process is created. The guard only engages with
+/// guard-v2 negotiated and without SUYU_RECOMP_GUARD_GEN=0; otherwise every
+/// module verifies on every entry. Returns whether it engaged.
+bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules);
+
+/// ABI 6 feature FPX1 (exact native FP): the arguments the loader passes to each
+/// FPX1 module's recomp_image_fpx_v1, this host's view of the generated
+/// context's FP fields and of its kill-switch bit.
+struct RecompFpxLayout {
+    u32 off_fpcr;
+    u32 off_fpsr;
+    u64 inhibit_bit;
+};
+RecompFpxLayout GetRecompFpxLayout();
+/// True only after every loaded module reports FPX1 and passed that handshake.
+/// While set, ArmRecomp keeps the host FP mode the fast paths rely on (MXCSR or
+/// FPCR, see core/arm/recomp/guest_fp_env.h) on every guest-core thread;
+/// SUYU_RECOMP_FPX=0 turns the fast paths off through the kill-switch bit.
+void SetRecompFpxReady(bool ready);
+bool IsRecompFpxReady();
 
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by
@@ -61,66 +111,51 @@ void SetRecompLookup(RecompLookupFn lookup);
 using RecompBaseFn = void (*)(size_t index, const char* module, u64 base);
 void SetRecompBaseSetter(RecompBaseFn setter);
 
+// Installed only for a stopped, explicitly prepared static-image session.
+using RecompModules = std::map<u64, std::string>;
+using RecompPrepareFn = bool (*)(const RecompModules& modules);
+void SetRecompPrepareCallback(RecompPrepareFn callback);
+bool HasRecompPrepareCallback();
+// Must complete before the application process is published to the applet manager.
+bool PrepareRecompProcess(Kernel::KProcess& process, const RecompModules& modules);
+
 /// Returns the registered lookup, or nullptr when no recompiled image is
 /// loaded and the JIT should be used.
 RecompLookupFn GetRecompLookup();
 
-/// schema_version 1 AOT vs Dynarmic execution snapshot.
+/// What the CPU is actually doing, for display while a game is running.
 ///
-/// Totals are run-lifetime: they survive ArmRecomp attaching a new application
-/// process (the stack-harness restart path). Times are host steady_clock
-/// nanoseconds around real AOT block entry and Dynarmic RunThread/StepThread,
-/// not simulated stubs.
-///
-/// JSON (FormatRecompExecutionJson): kind=recomp_execution, clock=steady_clock,
-/// backends.{aot,dynarmic}.{block_executions|run_slices,step_slices,time_ns},
-/// transitions.{aot_to_dynarmic,dynarmic_to_aot},
-/// fallback_reasons.{lookup_miss,unhandled_opcode,icache_rejected,no_fallback_available},
-/// icache.{clear_instruction_cache_calls,invalidate_cache_range_calls,
-///         aot_range_rejects,permanent_aot_reject_events,jit_halt_cache_invalidation},
-/// plus svc_calls, unresolved_import_traps, and histograms.
-///
-/// Benchmark comparison (drippu backlog #3) is not this snapshot. The stack
-/// harness races the same guest fixture under JIT vs hybrid AOT and writes
-/// `recomp_benchmark.json` (`kind=recomp_benchmark`), embedding per-mode
-/// GetRecompExecutionMetrics() deltas. The bench ADD chain is STR/LDR-punctuated
-/// so host -O3 cannot fold it to `x1 << 9`. The harness objdumps `block_bench`
-/// and JudgeAotBenchDump fails on `shl $0x9` / `imul $512`; a jmp to a lower
-/// PLT is not a loop. Named `recomp_store64@plt` is not the live pin (clang
-/// PIC may omit it). Runtime host_mem load/store callback counts must be
-/// 512 × iters. Override with $SUYU_RECOMP_BENCHMARK_JSON.
-/// Default path: $SUYU_RECOMP_EXECUTION_JSON, else `{LogDir}/recomp_execution.json`
-/// (Linux: ~/.local/share/suyu/log/recomp_execution.json unless portable `user/`).
-/// WriteRecompExecutionJson keeps `std::filesystem::path` (no narrow `.string()`
-/// ofstream) and publishes via dest+".tmp" then rename so a reader never sees a
-/// torn file; an existing dest is replaced (RenameFile refuses overwrite).
-struct RecompExecutionMetrics {
-    static constexpr int kSchemaVersion = 1;
-
-    u64 aot_block_executions{};
-    u64 aot_time_ns{};
-    u64 dynarmic_run_slices{};
-    u64 dynarmic_step_slices{};
-    u64 dynarmic_time_ns{};
-    u64 aot_to_dynarmic{};
-    u64 dynarmic_to_aot{};
-    u64 fallback_lookup_miss{};
-    u64 fallback_unhandled_opcode{};
-    u64 fallback_icache_rejected{};
-    u64 fallback_no_backend{};
-    u64 unresolved_import_traps{};
-    u64 svc_calls{};
-    u64 clear_instruction_cache_calls{};
-    u64 invalidate_cache_range_calls{};
-    u64 aot_range_rejects{};
-    u64 permanent_aot_reject_events{};
-    u64 jit_halt_cache_invalidation{};
+/// Whether execution is statically recompiled is otherwise only visible in a
+/// coverage file written after the fact, which is no use to someone watching
+/// the game. `jit_transitions` is the number that settles it: an image that
+/// never reaches the JIT reports zero, and one transition is one too many.
+struct RecompLiveStats {
+    u64 static_blocks;      ///< blocks executed from recompiled images
+    u64 jit_transitions;    ///< times execution had to leave them
+    u64 forced_cutoff_pc;   ///< diagnostic static-block cutoff handoff PC
+    u64 forced_cutoff_blocks;
+    bool backend_active;    ///< ArmRecomp is the CPU for this process
+    bool jit_available;     ///< false when built without a dynamic recompiler
+    /// No JIT fallback is permitted: uncovered code stops execution rather than
+    /// handing off. This is what separates a "suyu static AOT" run from a
+    /// "Hybrid AOT + JIT" one - both execute recompiled code, but only the
+    /// hybrid one is allowed to leave it - so the frontend cannot name the
+    /// running backend without it.
+    bool strict_mode;
 };
+RecompLiveStats GetRecompLiveStats();
 
-RecompExecutionMetrics GetRecompExecutionMetrics();
-std::string FormatRecompExecutionJson();
-std::filesystem::path DefaultRecompExecutionJsonPath();
-bool WriteRecompExecutionJson(const std::filesystem::path& path = {});
+// Process-wide monotonically accumulated diagnostic counters. Fields are sampled
+// independently; callers may subtract a stopped-session baseline.
+struct RecompExecutionStats {
+    u64 blocks{};
+    u64 svc_calls{};
+    u64 lookup_misses{};
+    u64 unhandled{};
+    u64 no_fallback{};
+};
+RecompExecutionStats GetRecompExecutionStats();
+std::array<u64, 4> GetRecompCurrentPcs();
 
 /**
  * CPU backend that executes statically recompiled AArch64 rather than JITing
@@ -150,7 +185,7 @@ public:
     /// debugger that is not attached and the game hangs on a black screen with
     /// no forward progress.
     explicit ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
-                       Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
+                       Kernel::KProcess* process, ExclusiveMonitor* exclusive_monitor,
                        std::size_t core_index);
     ~ArmRecomp() override;
 
@@ -163,14 +198,6 @@ public:
     Architecture GetArchitecture() const override {
         return Architecture::AArch64;
     }
-
-    bool IsRecompBackend() const override {
-        return true;
-    }
-
-    /// True until ClearInstructionCache permanently rejects Translate AOT.
-    /// InvalidateCacheRange (loader RX protect) must leave this true.
-    bool AllowsAot() const;
 
     void GetContext(Kernel::Svc::ThreadContext& ctx) const override;
     void SetContext(const Kernel::Svc::ThreadContext& ctx) override;
@@ -185,6 +212,8 @@ public:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
     void RewindBreakpointInstruction() override;
 
+friend bool PrepareRecompProcess(Kernel::KProcess&, const RecompModules&);
+
 private:
     /// Builds the JIT fallback if needed and marks this thread as running on
     /// it. Returns false when no JIT can be built (no process/monitor).
@@ -193,10 +222,6 @@ private:
     /// and back out, and returns to recompiled execution once the PC is covered
     /// again.
     HaltReason RunFallback(Kernel::KThread* thread);
-    /// Same state sync as RunFallback, but steps a single guest instruction on
-    /// the JIT. Used by StepThread so debugger single-step does not bypass the
-    /// miss/unhandled fallback path that RunThread already uses.
-    HaltReason StepFallback(Kernel::KThread* thread);
 
     struct Impl;
     std::unique_ptr<Impl> impl;

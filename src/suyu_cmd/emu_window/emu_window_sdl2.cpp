@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <SDL3/SDL.h>
+#include <algorithm>
 #include <cstdlib>
-#include <fstream>
+#include <cwchar>
+#include <set>
+#include <string>
+#include <vector>
+#include <SDL3/SDL.h>
 // SDL3 removed these constants; define compat shims
 static constexpr Uint8 SDL_PRESSED = 1;
 static constexpr Uint8 SDL_RELEASED = 0;
@@ -17,12 +21,71 @@ static constexpr Uint8 SDL_RELEASED = 0;
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/drivers/mouse.h"
+#include "input_common/drivers/tas_input.h"
 #include "input_common/drivers/touch_screen.h"
 #include "input_common/main.h"
 #include "common/param_package.h"
 #include "common/settings_input.h"
+#include "suyu_cmd/controller_assign.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2.h"
+#include "suyu_cmd/native_status.h"
+#include "suyu_cmd/sdl_config.h"
 #include "suyu_cmd/suyu_icon.h"
+#include "video_core/gpu.h"
+#include "video_core/shader_notify.h"
+
+namespace {
+constexpr u64 kStatusRefreshMs = 750;
+constexpr u64 kControlsSaveMs = 2000;
+constexpr Sint32 kEventWaitSliceMs = 250;
+
+// The controllers among the input devices: gamepads SDL recognises and whatever suyu's own
+// Joy-Con / Pro Controller driver lists. SDL also lists wheels, flight sticks and virtual or
+// RGB devices as joysticks, and none of those should take a player. The input backend names
+// an SDL device by its GUID with the name checksum cleared. @p sdl_gamepads, when given, gets
+// how many gamepads SDL itself sees.
+std::vector<Common::ParamPackage> ControllerPads(const std::vector<Common::ParamPackage>& devices,
+                                                 std::size_t* sdl_gamepads = nullptr) {
+    std::set<std::string> gamepad_guids;
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    for (int i = 0; i < count; ++i) {
+        SDL_GUID guid = SDL_GetJoystickGUIDForID(ids[i]);
+        guid.data[2] = guid.data[3] = 0;
+        char text[33]{};
+        SDL_GUIDToString(guid, text, sizeof(text));
+        gamepad_guids.insert(text);
+    }
+    SDL_free(ids);
+    if (sdl_gamepads) {
+        *sdl_gamepads = gamepad_guids.size();
+    }
+    std::vector<Common::ParamPackage> pads;
+    for (const auto& device : devices) {
+        const std::string engine = device.Get("engine", "");
+        if ((engine == "sdl" && gamepad_guids.contains(device.Get("guid", ""))) ||
+            engine == "joycon") {
+            pads.push_back(device);
+        }
+    }
+    return pads;
+}
+
+// The input backend's own default mapping for a controller, as the settings screen's
+// auto-map writes it; for gamepads it includes Home and, where the pad has one, Capture.
+void MapDefault(InputCommon::InputSubsystem& input, const Common::ParamPackage& pad,
+                Settings::PlayerInput& player) {
+    for (const auto& [button, param] : input.GetButtonMappingForDevice(pad)) {
+        player.buttons[button] = param.Serialize();
+    }
+    for (const auto& [analog, param] : input.GetAnalogMappingForDevice(pad)) {
+        player.analogs[analog] = param.Serialize();
+    }
+    for (const auto& [motion, param] : input.GetMotionMappingForDevice(pad)) {
+        player.motions[motion] = param.Serialize();
+    }
+}
+} // namespace
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -58,7 +121,29 @@ constexpr int kIdRescanPads = 1010;
 constexpr int kIdBindList = 1011;
 constexpr int kIdBindOne = 1012;
 constexpr int kIdClearOne = 1013;
+constexpr int kIdCombineJoycons = 1014;
+constexpr int kIdSplitJoycons = 1015;
+constexpr int kIdResScale = 1016;
 constexpr UINT_PTR kTimer = 1;
+
+// Same choices, in the same order, as the Qt frontend's View -> Resolution Scale submenu
+// (src/suyu/main.cpp, PopulateResolutionScaleMenu). Kept as one array so the F12 panel and
+// Qt never drift apart on what "2X" etc. means.
+constexpr std::array<std::pair<Settings::ResolutionSetup, const wchar_t*>, 13> kResScaleEntries{{
+    {Settings::ResolutionSetup::Res1_4X, L"0.25X (180p/270p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res1_2X, L"0.5X (360p/540p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res3_4X, L"0.75X (540p/810p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res1X, L"1X (720p/1080p)"},
+    {Settings::ResolutionSetup::Res5_4X, L"1.25X (900p/1350p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res3_2X, L"1.5X (1080p/1620p) [EXPERIMENTAL]"},
+    {Settings::ResolutionSetup::Res2X, L"2X (1440p/2160p)"},
+    {Settings::ResolutionSetup::Res3X, L"3X (2160p/3240p)"},
+    {Settings::ResolutionSetup::Res4X, L"4X (2880p/4320p)"},
+    {Settings::ResolutionSetup::Res5X, L"5X (3600p/5400p)"},
+    {Settings::ResolutionSetup::Res6X, L"6X (4320p/6480p)"},
+    {Settings::ResolutionSetup::Res7X, L"7X (5040p/7560p)"},
+    {Settings::ResolutionSetup::Res8X, L"8X (5760p/8640p)"},
+}};
 
 std::filesystem::path DevExeDir() {
     wchar_t exe_path[MAX_PATH]{};
@@ -83,8 +168,95 @@ struct DevPanelState {
     HWND mods{};
     HWND devices{};
     HWND binds{};
+    HWND combine{};
+    HWND split{};
+    HWND res_scale{};
     std::vector<Common::ParamPackage> device_list;
 };
+
+// Shows the current value; see DevApplyResScale for the write side.
+void DevRefreshResScale(DevPanelState& st) {
+    const auto current = Settings::values.resolution_setup.GetValue();
+    int index = 0;
+    for (std::size_t i = 0; i < kResScaleEntries.size(); ++i) {
+        if (kResScaleEntries[i].first == current) {
+            index = static_cast<int>(i);
+            break;
+        }
+    }
+    SendMessageW(st.res_scale, CB_SETCURSEL, index, 0);
+}
+
+// Same effect as the Qt frontend's OnResolutionScaleSelected while a game is running: the
+// setting is changed and saved right away. Existing render targets already on the GPU keep
+// their current size (see GMainWindow::RestartForResolutionScale in src/suyu/main.cpp for
+// why - rescaled images refuse in-place reallocation and the pipeline cache does not key on
+// resolution), so - exactly like Qt - the new scale takes full effect the next time this
+// package is started, not on the frame after picking it.
+void DevApplyResScale(DevPanelState& st) {
+    const int index = static_cast<int>(SendMessageW(st.res_scale, CB_GETCURSEL, 0, 0));
+    if (index < 0 || static_cast<std::size_t>(index) >= kResScaleEntries.size()) {
+        return;
+    }
+    const auto setup = kResScaleEntries[index].first;
+    if (Settings::values.resolution_setup.GetValue() == setup) {
+        return;
+    }
+    Settings::values.resolution_setup.SetValue(setup);
+    Settings::UpdateRescalingInfo();
+    if (st.system != nullptr) {
+        st.system->ApplySettings();
+    }
+    SaveNativeControls();
+}
+
+// Combine shows while a pair's halves are on two players, Split while a pair is on one.
+void DevRefreshJoyconButtons(DevPanelState& st) {
+    if (st.input == nullptr) {
+        return;
+    }
+    const auto pads = ControllerPads(st.input->GetInputDevices());
+    auto& players = Settings::values.players.GetValue();
+    ShowWindow(st.combine,
+               SuyuCmd::CombineJoycons(players, pads, SdlConfig::default_buttons, {}) ? SW_SHOW
+                                                                                    : SW_HIDE);
+    ShowWindow(st.split,
+               SuyuCmd::SplitJoycons(players, pads, SdlConfig::default_buttons, {}) ? SW_SHOW
+                                                                                  : SW_HIDE);
+}
+
+void DevJoyconAction(DevPanelState& st, bool combine) {
+    if (st.input == nullptr) {
+        return;
+    }
+    const auto pads = ControllerPads(st.input->GetInputDevices());
+    auto& players = Settings::values.players.GetValue();
+    const auto map_pad = [&st](const Common::ParamPackage& pad, Settings::PlayerInput& player) {
+        MapDefault(*st.input, pad, player);
+    };
+    const auto slot =
+        combine ? SuyuCmd::CombineJoycons(players, pads, SdlConfig::default_buttons, map_pad)
+                : SuyuCmd::SplitJoycons(players, pads, SdlConfig::default_buttons, map_pad);
+    if (!slot) {
+        MessageBoxW(nullptr, L"No Joy-Cons to change right now.", L"Controls",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    // The player's own choice from here on: auto-assign leaves the controls alone.
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
+    }
+    if (st.system != nullptr) {
+        st.system->HIDCore().ReloadInputDevices();
+    }
+    SaveNativeControls();
+    const std::wstring text =
+        combine ? L"Joy-Cons combined into Player " + std::to_wstring(*slot + 1) + L"."
+                : L"Joy-Cons split: the left one is Player " + std::to_wstring(*slot + 1) +
+                      L", the right one the next player.";
+    MessageBoxW(nullptr, text.c_str(), L"Controls", MB_OK | MB_ICONINFORMATION);
+    DevRefreshJoyconButtons(st);
+}
 
 // Per-button remapping. Auto-map covers the common case; this covers the rest -
 // pick the entry, press the input you want, done. Same "press what you want"
@@ -132,6 +304,14 @@ void DevBindSelected(DevPanelState& st, bool clear) {
             player.buttons[sel].clear();
         }
         DevRefreshBinds(st);
+        // A choice made here is the player's own; auto-assign leaves it alone.
+        if (g_export_package) {
+            SdlConfig::auto_assign_controllers = false;
+        }
+        SaveNativeControls();
+        if (st.system != nullptr) {
+            st.system->HIDCore().ReloadInputDevices();
+        }
         return;
     }
 
@@ -142,6 +322,7 @@ void DevBindSelected(DevPanelState& st, bool clear) {
     Common::ParamPackage captured;
     const DWORD deadline = GetTickCount() + 5000;
     while (GetTickCount() < deadline) {
+        SDL_PumpEvents();
         captured = st.input->GetNextInput();
         if (captured.Has("engine")) {
             break;
@@ -169,6 +350,10 @@ void DevBindSelected(DevPanelState& st, bool clear) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
+    }
+    SaveNativeControls();
     DevRefreshBinds(st);
 }
 
@@ -177,25 +362,66 @@ void DevBindSelected(DevPanelState& st, bool clear) {
 // UI - what a shipped game build needs is for a plugged-in pad to just work,
 // and a way back to keyboard when it does not.
 void DevRefreshDevices(DevPanelState& st) {
+    SDL_PumpEvents();
+    const int previous = static_cast<int>(SendMessageW(st.devices, CB_GETCURSEL, 0, 0));
+    const auto selected = previous >= 0 && static_cast<std::size_t>(previous) < st.device_list.size()
+                              ? st.device_list[previous].Serialize()
+                              : std::string{};
     SendMessageW(st.devices, CB_RESETCONTENT, 0, 0);
     st.device_list.clear();
     if (st.input == nullptr) {
         return;
     }
     for (const auto& device : st.input->GetInputDevices()) {
-        const std::string name = device.Get("display", device.Get("class", "Unknown"));
-        if (name == "Any" || name == "Keyboard/Mouse") {
+        const std::string engine = device.Get("engine", "");
+        if (engine != "sdl" && engine != "joycon" && engine != "gcpad") {
             continue;
         }
+        const std::string name = device.Get("display", device.Get("class", "Unknown"));
         st.device_list.push_back(device);
         const std::wstring wide(name.begin(), name.end());
         SendMessageW(st.devices, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str()));
     }
     if (st.device_list.empty()) {
+        bool saved_pad = false;
+        for (const auto& binding : Settings::values.players.GetValue()[0].buttons) {
+            Common::ParamPackage existing{binding};
+            if (existing.Get("engine", "") == "sdl") {
+                saved_pad = true;
+                break;
+            }
+        }
         SendMessageW(st.devices, CB_ADDSTRING, 0,
-                     reinterpret_cast<LPARAM>(L"(no controller detected - plug one in and rescan)"));
+                     reinterpret_cast<LPARAM>(saved_pad
+                         ? L"(saved controller disconnected - reconnect and rescan)"
+                         : L"(no controller detected - plug one in and rescan)"));
     }
-    SendMessageW(st.devices, CB_SETCURSEL, 0, 0);
+    int preferred = 0;
+    if (!selected.empty()) {
+        for (std::size_t i = 0; i < st.device_list.size(); ++i) {
+            if (st.device_list[i].Serialize() == selected) {
+                preferred = static_cast<int>(i);
+                break;
+            }
+        }
+    } else {
+        const auto& buttons = Settings::values.players.GetValue()[0].buttons;
+        for (const auto& binding : buttons) {
+            Common::ParamPackage existing{binding};
+            if (!existing.Has("guid") || !existing.Has("port")) {
+                continue;
+            }
+            for (std::size_t i = 0; i < st.device_list.size(); ++i) {
+                if (st.device_list[i].Get("guid", "") == existing.Get("guid", "") &&
+                    st.device_list[i].Get("port", -1) == existing.Get("port", -2)) {
+                    preferred = static_cast<int>(i);
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    SendMessageW(st.devices, CB_SETCURSEL, preferred, 0);
 }
 
 void DevApplyPadMapping(DevPanelState& st) {
@@ -221,6 +447,10 @@ void DevApplyPadMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
+    }
+    SaveNativeControls();
     MessageBoxW(nullptr, L"Controller mapped to Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
@@ -251,29 +481,69 @@ void DevApplyKeyboardMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
+    if (g_export_package) {
+        SdlConfig::auto_assign_controllers = false;
+    }
+    SaveNativeControls();
     MessageBoxW(nullptr, L"Keyboard controls restored for Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
 
 std::wstring DevStatusText(Core::System& system) {
-    std::string game_name;
-    [[maybe_unused]] auto _ = system.GetGameName(game_name);
-    const auto perf = system.GetAndResetPerfStats();
-    wchar_t buf[2048];
+    // Read the shared snapshot rather than sampling. GetAndResetPerfStats
+    // clears the counters as it reads them, so a second caller here would take
+    // half the frames away from whoever owns the sample.
+    SuyuCmd::NativeStatusSnapshot snap{};
+    const bool have_snapshot = SuyuCmd::TryGetNativeStatusSnapshot(snap);
+    if (!have_snapshot) {
+        snap.title_id = system.GetApplicationProcessProgramID();
+    }
+
+    const auto backend = SuyuCmd::ClassifyGameBackend(snap);
+    const std::string backend_line =
+        std::string(SuyuCmd::NativeBackendName(backend)) + SuyuCmd::GameBackendQualifier(snap);
+
+    wchar_t fps_line[160];
+    if (!have_snapshot || !snap.perf_available) {
+        swprintf(fps_line, std::size(fps_line), L"FPS:          (no sample yet)");
+    } else if (snap.speed_meaningful) {
+        swprintf(fps_line, std::size(fps_line), L"FPS:          %.1f   Speed: %.0f%%   CPU work: %.2f ms",
+                 snap.average_game_fps, snap.emulation_speed * 100.0, snap.frametime_ms);
+    } else {
+        // Multicore: guest time follows the host clock, so the speed would always read 100%.
+        swprintf(fps_line, std::size(fps_line), L"FPS:          %.1f   CPU work: %.2f ms",
+                 snap.average_game_fps, snap.frametime_ms);
+    }
+
+    wchar_t applet_line[192];
+    if (snap.applet_running) {
+        const std::wstring applet_name(snap.applet_name.begin(), snap.applet_name.end());
+        swprintf(applet_line, std::size(applet_line), L"\r\nApplet:       %s - %hs", applet_name.c_str(),
+                 SuyuCmd::NativeBackendName(snap.applet_backend));
+    } else {
+        swprintf(applet_line, std::size(applet_line), L"");
+    }
+
+    wchar_t buf[2560];
     const auto exe_dir = DevExeDir();
     swprintf(buf, std::size(buf),
              L"Title:        %hs\r\n"
              L"Title ID:     %016llX\r\n"
-             L"FPS:          %.1f   Speed: %.0f%%   Frame: %.2f ms\r\n"
+             L"Version:      %hs\r\n"
+             L"%s\r\n"
              L"CPU backend:  %hs\r\n"
+             L"JIT trans.:   %llu (requested strict=%hs)\r\n"
+             L"%s\r\n"
+             L"F12:          Controls panel\r\n"
              L"\r\n"
              L"User data:    %s\r\n"
              L"Mods:         %s\r\n"
              L"Keys:         %s\r\n",
-             game_name.empty() ? "(not loaded)" : game_name.c_str(),
-             static_cast<unsigned long long>(system.GetApplicationProcessProgramID()),
-             perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
-             g_native_export_mode ? "ArmRecomp (static recompiled modules)" : "dynarmic JIT",
+             snap.game_name.empty() ? "(not loaded)" : snap.game_name.c_str(),
+             static_cast<unsigned long long>(snap.title_id),
+             snap.display_version.empty() ? "(unknown)" : snap.display_version.c_str(), fps_line,
+             backend_line.c_str(), static_cast<unsigned long long>(snap.jit_transitions),
+             snap.strict_requested ? "yes" : "no", applet_line,
              (exe_dir / L"user").wstring().c_str(), (exe_dir / L"mods").wstring().c_str(),
              DevKeysDir().c_str());
     return buf;
@@ -309,7 +579,11 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER:
         if (st != nullptr && st->system != nullptr) {
+            const bool benchmark_owns_stats = std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
+            SuyuCmd::StoreNativeStatusSnapshot(
+                SuyuCmd::SampleNativeStatus(*st->system, !benchmark_owns_stats));
             SetWindowTextW(st->status, DevStatusText(*st->system).c_str());
+            DevRefreshJoyconButtons(*st);
         }
         return 0;
     case WM_COMMAND:
@@ -353,6 +627,13 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DevBindSelected(*st, true);
             }
             return 0;
+        case kIdCombineJoycons:
+        case kIdSplitJoycons:
+            if (st != nullptr) {
+                DevJoyconAction(*st, LOWORD(wp) == kIdCombineJoycons);
+                DevRefreshBinds(*st);
+            }
+            return 0;
         case kIdBindList:
             if (HIWORD(wp) == LBN_DBLCLK && st != nullptr) {
                 DevBindSelected(*st, false);
@@ -361,6 +642,11 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case kIdMods:
             if (HIWORD(wp) == LBN_DBLCLK && st != nullptr) {
                 DevRefreshMods(st->mods);
+            }
+            return 0;
+        case kIdResScale:
+            if (HIWORD(wp) == CBN_SELCHANGE && st != nullptr) {
+                DevApplyResScale(*st);
             }
             return 0;
         default:
@@ -381,6 +667,7 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
+    const auto previous_dpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     static bool registered = false;
     static const wchar_t* kClass = L"SuyuGameDebugPanel";
     if (!registered) {
@@ -397,17 +684,23 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
         registered = true;
     }
 
-    std::string game_name;
-    [[maybe_unused]] auto _ = system.GetGameName(game_name);
+    SuyuCmd::NativeStatusSnapshot panel_snapshot{};
+    if (!SuyuCmd::TryGetNativeStatusSnapshot(panel_snapshot)) {
+        panel_snapshot = SuyuCmd::SampleNativeStatus(system, false);
+    }
+    const std::string& game_name = panel_snapshot.game_name;
     const std::wstring title =
         (game_name.empty() ? std::wstring(L"Game") : std::wstring(game_name.begin(), game_name.end())) +
         L" - Debug Panel (F12)";
 
     const HWND hwnd = CreateWindowExW(0, kClass, title.c_str(),
                                       WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT,
-                                      CW_USEDEFAULT, 720, 780, nullptr, nullptr,
+                                      CW_USEDEFAULT, 720, 820, nullptr, nullptr,
                                       GetModuleHandleW(nullptr), nullptr);
     if (hwnd == nullptr) {
+        if (previous_dpi != nullptr) {
+            SetThreadDpiAwarenessContext(previous_dpi);
+        }
         return;
     }
 
@@ -447,8 +740,25 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
                     28, hwnd, reinterpret_cast<HMENU>(kIdBindOne), inst, nullptr);
     CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 528, 464, 172,
                     28, hwnd, reinterpret_cast<HMENU>(kIdClearOne), inst, nullptr);
+    // Shown only when they apply; see DevRefreshJoyconButtons.
+    state.combine = CreateWindowExW(0, L"BUTTON", L"Combine Joy-Cons into one player",
+                                    WS_CHILD | BS_PUSHBUTTON | BS_MULTILINE, 528, 508, 172, 40,
+                                    hwnd, reinterpret_cast<HMENU>(kIdCombineJoycons), inst,
+                                    nullptr);
+    state.split = CreateWindowExW(0, L"BUTTON", L"Split Joy-Cons into two players",
+                                  WS_CHILD | BS_PUSHBUTTON | BS_MULTILINE, 528, 556, 172, 40, hwnd,
+                                  reinterpret_cast<HMENU>(kIdSplitJoycons), inst, nullptr);
+    CreateWindowExW(0, L"STATIC", L"Resolution Scale (takes full effect next launch):",
+                    WS_CHILD | WS_VISIBLE, 12, 644, 320, 18, hwnd, nullptr, inst, nullptr);
+    state.res_scale =
+        CreateWindowExW(0, L"COMBOBOX", nullptr,
+                        WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST, 340, 640, 360, 300,
+                        hwnd, reinterpret_cast<HMENU>(kIdResScale), inst, nullptr);
+    for (const auto& [setup, label] : kResScaleEntries) {
+        SendMessageW(state.res_scale, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+    }
     const auto button = [&](const wchar_t* text, int x, int id) {
-        CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, 640, 160, 28,
+        CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, 680, 160, 28,
                         hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), inst, nullptr);
     };
     button(L"Open user data folder", 10, kIdOpenUser);
@@ -470,6 +780,8 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
     DevRefreshMods(state.mods);
     DevRefreshDevices(state);
     DevRefreshBinds(state);
+    DevRefreshJoyconButtons(state);
+    DevRefreshResScale(state);
     SetTimer(hwnd, kTimer, 500, nullptr);
     ShowWindow(hwnd, SW_SHOW);
 
@@ -481,6 +793,9 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }
+    }
+    if (previous_dpi != nullptr) {
+        SetThreadDpiAwarenessContext(previous_dpi);
     }
 }
 
@@ -497,6 +812,10 @@ EmuWindow_SDL2::EmuWindow_SDL2(InputCommon::InputSubsystem* input_subsystem_, Co
 }
 
 EmuWindow_SDL2::~EmuWindow_SDL2() {
+    // An assignment made in the last couple of seconds is still waiting to be written.
+    if (controls_save_pending) {
+        SaveNativeControls();
+    }
     system.HIDCore().UnloadInputDevices();
     input_subsystem->Shutdown();
     SDL_Quit();
@@ -577,6 +896,49 @@ bool EmuWindow_SDL2::IsOpen() const {
     return is_open;
 }
 
+void EmuWindow_SDL2::EnableTasPlayback() {
+    tas_playback = true;
+}
+
+void EmuWindow_SDL2::OnFrameDisplayed() {
+    if (!tas_playback) {
+        return;
+    }
+    // Called on the render thread once per presented frame. The TAS driver
+    // consumes exactly one command per call, which is what keeps a recorded
+    // script deterministic against the frames the guest actually renders.
+    auto* const tas = input_subsystem->GetTas();
+    tas->UpdateThread();
+
+    const auto [state, progress, lengths] = tas->GetStatus();
+    if (!tas_started) {
+        // Start on the first displayed frame rather than at load: before the
+        // guest presents anything there is no frame for command zero to land
+        // on. Reset reloads the script so playback always begins at the top.
+        tas->Reset();
+        tas->StartStop();
+        tas_started = true;
+        LOG_INFO(Frontend, "TAS playback started, {} frames queued", lengths[0]);
+        return;
+    }
+    if (state != InputCommon::TasInput::TasState::Stopped) {
+        tas_progress = progress;
+        return;
+    }
+    // Playback ran off the end of the script and tas_loop is off. Quitting here
+    // is what makes --tas usable unattended; without it the replay finishes and
+    // the process sits idle until something kills it.
+    LOG_INFO(Frontend, "TAS playback finished, {} of {} frames, exiting", tas_progress,
+             lengths[0]);
+    tas_playback = false;
+    // WaitEvent is blocked in SDL_WaitEvent on the main thread. SDL_PushEvent is
+    // thread safe, and the main thread turns SDL_EVENT_QUIT into is_open = false,
+    // so the shutdown stays on the thread that owns the window.
+    SDL_Event quit_event{};
+    quit_event.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&quit_event);
+}
+
 bool EmuWindow_SDL2::IsShown() const {
     return is_shown;
 }
@@ -645,18 +1007,23 @@ void EmuWindow_SDL2::WaitEvent() {
     // Called on main thread
     SDL_Event event;
 
-    // Wake periodically even when the game produces no input events. The FPS
-    // sample and title update below otherwise stop after the first quiet frame.
+    // Wait with a deadline rather than forever: with no input there is no event
+    // to wake on, so a plain SDL_WaitEvent would never refresh the status.
+    // A timeout is the idle tick, not a failure.
     SDL_ClearError();
-    if (!SDL_WaitEventTimeout(&event, 250)) {
-        const char* error = SDL_GetError();
-        if (!error || strcmp(error, "") == 0) {
-            event.type = 0;
-        } else {
-            LOG_CRITICAL(Frontend, "SDL_WaitEventTimeout failed: {}", error);
-            exit(1);
+    if (!SDL_WaitEventTimeout(&event, kEventWaitSliceMs)) {
+        if (const char* error = SDL_GetError(); error != nullptr && error[0] != '\0') {
+            LOG_ERROR(Frontend, "SDL_WaitEventTimeout failed: {}", error);
+            SDL_ClearError();
         }
+        const u64 idle_time = SDL_GetTicks();
+        if (idle_time > last_time + kStatusRefreshMs) {
+            last_time = idle_time;
+            RefreshWindowStatus();
+        }
+        return;
     }
+
 
     switch (event.type) {
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -714,49 +1081,221 @@ void EmuWindow_SDL2::WaitEvent() {
     case SDL_EVENT_QUIT:
         is_open = false;
         break;
+    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        gamepad_check_pending = true;
+        gamepad_retries = kGamepadRetries;
+        break;
     default:
         break;
     }
 
     const u64 current_time = SDL_GetTicks();
-    if (current_time > last_time + 2000) {
-        const auto results = system.GetAndResetPerfStats();
-        // Opt-in benchmark output, shared by the JIT frontend and standalone
-        // recompiled exports. Keep the normal window title unchanged.
-        static const char* fps_csv_path = std::getenv("SUYU_FPS_CSV");
-        static std::ofstream fps_csv;
-        static bool fps_csv_opened = false;
-        if (fps_csv_path != nullptr && fps_csv_path[0] != '\0') {
-            if (!fps_csv_opened) {
-                fps_csv.open(fps_csv_path, std::ios::trunc);
-                if (fps_csv) {
-                    fps_csv << "elapsed_ms,fps,speed_percent,frametime_ms\n";
-                }
-                fps_csv_opened = true;
-            }
-            if (fps_csv) {
-                fps_csv << current_time << ',' << results.average_game_fps << ','
-                        << results.emulation_speed * 100.0 << ','
-                        << results.frametime * 1000.0 << '\n';
-                fps_csv.flush();
-            }
-        }
-        std::string game_name;
-        [[maybe_unused]] auto _ = system.GetGameName(game_name);
-        if (g_native_export_mode) {
-            // Standalone game export: plain game title, no emulator branding.
-            if (!game_name.empty()) {
-                SDL_SetWindowTitle(render_window, game_name.c_str());
-            }
-        } else {
-            const auto title =
-                fmt::format("{} | {} | FPS: {:.0f} ({:.0f}%)", game_name.empty() ? "suyu" : game_name,
-                            Common::g_build_fullname, results.average_game_fps,
-                            results.emulation_speed * 100.0);
-            SDL_SetWindowTitle(render_window, title.c_str());
-        }
+    if (current_time > last_time + kStatusRefreshMs) {
         last_time = current_time;
+        RefreshWindowStatus();
     }
+}
+
+#ifdef _WIN32
+namespace {
+// What the progress window paints. Written and read on the main thread only.
+std::size_t g_build_progress_built = 0;
+std::size_t g_build_progress_total = 0;
+
+LRESULT CALLBACK BuildProgressProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg != WM_PAINT) {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT client;
+    GetClientRect(hwnd, &client);
+    FillRect(dc, &client, GetSysColorBrush(COLOR_WINDOW));
+
+    wchar_t text[96];
+    if (g_build_progress_total == 0) {
+        std::swprintf(text, std::size(text), L"Preparing shaders...");
+    } else {
+        std::swprintf(text, std::size(text), L"Preparing shaders: %zu of %zu",
+                      g_build_progress_built, g_build_progress_total);
+    }
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+    SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    RECT text_rect{16, 12, client.right - 16, 34};
+    DrawTextW(dc, text, -1, &text_rect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT bar{16, 42, client.right - 16, 62};
+    FrameRect(dc, &bar, GetSysColorBrush(COLOR_BTNSHADOW));
+    if (g_build_progress_total != 0) {
+        RECT fill = bar;
+        InflateRect(&fill, -2, -2);
+        const auto done = std::min(g_build_progress_built, g_build_progress_total);
+        fill.right = fill.left + static_cast<LONG>((fill.right - fill.left) * done /
+                                                   g_build_progress_total);
+        FillRect(dc, &fill, GetSysColorBrush(COLOR_HIGHLIGHT));
+    }
+    EndPaint(hwnd, &ps);
+    return 0;
+}
+} // namespace
+#endif
+
+void EmuWindow_SDL2::ShowBuildProgress(std::size_t built, std::size_t total) {
+    // Throttle the title; thousands of pipelines shouldn't mean thousands of title updates.
+    const u64 now = SDL_GetTicks();
+    if (built == 0 || built == total || now >= last_build_title_ticks + 100) {
+        last_build_title_ticks = now;
+        char title[64];
+        if (total == 0) {
+            std::snprintf(title, sizeof(title), "Preparing shaders...");
+        } else {
+            std::snprintf(title, sizeof(title), "Building shaders %zu/%zu", built, total);
+        }
+        SDL_SetWindowTitle(render_window, title);
+    }
+#ifdef _WIN32
+    g_build_progress_built = built;
+    g_build_progress_total = total;
+    if (!build_progress_window) {
+        static const wchar_t* const kClass = L"SuyuBuildProgress";
+        static const bool registered = [] {
+            WNDCLASSW wc{};
+            wc.lpfnWndProc = BuildProgressProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.hCursor = LoadCursorW(nullptr, IDC_WAIT);
+            wc.lpszClassName = kClass;
+            return RegisterClassW(&wc) != 0;
+        }();
+        if (!registered) {
+            return;
+        }
+        const auto owner = static_cast<HWND>(SDL_GetPointerProperty(
+            SDL_GetWindowProperties(render_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+        RECT owner_rect{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+        if (owner) {
+            GetWindowRect(owner, &owner_rect);
+        }
+        constexpr int width = 420;
+        constexpr int height = 78;
+        const int x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
+        const int y = owner_rect.top + (owner_rect.bottom - owner_rect.top - height) / 2;
+        // Owned by the game window, so it stays above it and closes with it.
+        build_progress_window =
+            CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"", WS_POPUP | WS_BORDER | WS_VISIBLE,
+                            x, y, width, height, owner, nullptr, GetModuleHandleW(nullptr),
+                            nullptr);
+    }
+    if (build_progress_window) {
+        InvalidateRect(static_cast<HWND>(build_progress_window), nullptr, FALSE);
+        UpdateWindow(static_cast<HWND>(build_progress_window));
+    }
+#endif
+}
+
+void EmuWindow_SDL2::HideBuildProgress() {
+#ifdef _WIN32
+    if (build_progress_window) {
+        DestroyWindow(static_cast<HWND>(build_progress_window));
+        build_progress_window = nullptr;
+    }
+#endif
+}
+
+bool EmuWindow_SDL2::PumpEventsWhileLoading() {
+    SDL_PumpEvents();
+    // Leave the events queued: the main loop handles a close request as usual.
+    return !SDL_HasEvent(SDL_EVENT_QUIT) && !SDL_HasEvent(SDL_EVENT_WINDOW_CLOSE_REQUESTED);
+}
+
+void EmuWindow_SDL2::RefreshWindowStatus() {
+    // Same tick as the title: cheap, and a controller plugged in mid-game is
+    // picked up within a second.
+    if (gamepad_check_pending) {
+        AutoAssignControllers();
+    }
+    if (controls_save_pending && SDL_GetTicks() >= last_controls_save + kControlsSaveMs) {
+        controls_save_pending = false;
+        last_controls_save = SDL_GetTicks();
+        SaveNativeControls();
+    }
+
+    const bool benchmark_owns_stats = std::getenv("SUYU_CMD_PERF_SAMPLE") != nullptr;
+    const auto snap = SuyuCmd::SampleNativeStatus(system, !benchmark_owns_stats);
+    SuyuCmd::StoreNativeStatusSnapshot(snap);
+
+    SuyuCmd::NativeStatusSnapshot display{};
+    SuyuCmd::TryGetNativeStatusSnapshot(display);
+    if (display.game_running) {
+        display.shaders_building = system.GPU().ShaderNotify().ShadersBuilding();
+    }
+    const std::string title = SuyuCmd::FormatNativeTitle(display);
+    SDL_SetWindowTitle(render_window, title.c_str());
+}
+
+// An export has no input settings screen in front of it, so a player who plugs
+// in controllers expects them to just work: see SuyuCmd::AssignControllers for
+// which pad gets which player. Only a standalone export does this - a plain
+// suyu-cmd run keeps the player's own configuration - and controls picked in
+// the F12 panel switch it off for good (auto_assign_controllers).
+void EmuWindow_SDL2::AutoAssignControllers() {
+    gamepad_check_pending = false;
+    // A TAS replay drives the players itself; their mappings stay as configured.
+    if (!g_export_package || !SdlConfig::auto_assign_controllers ||
+        Settings::values.tas_enable.GetValue()) {
+        return;
+    }
+    const auto devices = input_subsystem->GetInputDevices();
+    std::size_t sdl_gamepads = 0;
+    const auto pads = ControllerPads(devices, &sdl_gamepads);
+    const auto sdl_listed = static_cast<std::size_t>(
+        std::count_if(pads.begin(), pads.end(),
+                      [](const auto& pad) { return pad.Get("engine", "") == "sdl"; }));
+    // SDL can list a gamepad a moment before the input backend registers it,
+    // so look again for a few ticks. Only a few: gamepads the backend leaves to
+    // another driver (Joy-Cons under suyu's own driver) never show up here.
+    if (gamepad_retries > 0 && sdl_listed < sdl_gamepads) {
+        --gamepad_retries;
+        gamepad_check_pending = true;
+    }
+
+    auto bindings = SuyuCmd::ParsePadBindings(SdlConfig::auto_assigned_pads);
+    // GetValue() hands back a reference to the live array, so the mappings are
+    // written straight into the setting.
+    auto& players = Settings::values.players.GetValue();
+    const auto map_pad = [this](const Common::ParamPackage& pad, Settings::PlayerInput& player) {
+        MapDefault(*input_subsystem, pad, player);
+        LOG_INFO(Frontend, "Assigned {}", pad.Get("display", std::string{"a controller"}));
+    };
+    // The layout SdlConfig gives a player with nothing configured.
+    const auto restore_keyboard = [](Settings::PlayerInput& player) {
+        for (std::size_t i = 0; i < player.buttons.size(); ++i) {
+            player.buttons[i] = InputCommon::GenerateKeyboardParam(SdlConfig::default_buttons[i]);
+        }
+        for (std::size_t i = 0; i < player.analogs.size(); ++i) {
+            const auto& keys = SdlConfig::default_analogs[i];
+            player.analogs[i] = InputCommon::GenerateAnalogParamFromKeys(
+                keys[0], keys[1], keys[2], keys[3], SdlConfig::default_stick_mod[i], 0.5f);
+        }
+        for (std::size_t i = 0; i < player.motions.size(); ++i) {
+            player.motions[i] = InputCommon::GenerateKeyboardParam(SdlConfig::default_motions[i]);
+        }
+        LOG_INFO(Frontend, "No controller left: Player 1 uses the keyboard");
+    };
+    if (!SuyuCmd::AssignControllers(players, devices, pads, bindings, pads_seen,
+                                    SdlConfig::default_buttons, map_pad, restore_keyboard)) {
+        return;
+    }
+    SdlConfig::auto_assigned_pads = SuyuCmd::SerializePadBindings(bindings);
+    for (const auto& binding : bindings) {
+        LOG_INFO(Frontend, "Player {}: pad {} port {}, {}", binding.player + 1, binding.guid,
+                 binding.port, players[binding.player].connected ? "connected" : "disconnected");
+    }
+    // The game sees the change now; the file is written at most every couple
+    // of seconds, so a pad that keeps dropping out does not rewrite it each time.
+    system.HIDCore().ReloadInputDevices();
+    controls_save_pending = true;
 }
 
 // Credits to Samantas5855 and others for this function.
