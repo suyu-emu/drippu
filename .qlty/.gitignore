@@ -1,4 +1,4 @@
-/logs/
-/out/
-/plugin_cachedir/
-/results/
+/logs
+/out
+/plugin_cachedir
+/results
