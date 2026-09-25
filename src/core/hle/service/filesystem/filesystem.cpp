@@ -696,6 +696,10 @@ FileSys::VirtualDir FileSystemController::GetBCATDirectory(u64 title_id) const {
     return bis_factory->GetBCATDirectory(title_id);
 }
 
+void FileSystemController::SetSystemContentFallback(std::filesystem::path installed_nand) {
+    system_content_fallback = std::move(installed_nand);
+}
+
 void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite) {
     if (overwrite) {
         bis_factory = nullptr;
@@ -719,8 +723,35 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
         vfs.OpenDirectory(Common::FS::GetSuyuPathString(SuyuPath::DumpDir), rw_mode);
 
     if (bis_factory == nullptr) {
+        // Firmware installed into this NAND always wins. Only a NAND with no system content at
+        // all borrows the installed one, and only for reading: installs still land here.
+        FileSys::VirtualDir system_registered;
+        const auto own_registered =
+            nand_directory ? nand_directory->GetDirectoryRelative("system/Contents/registered")
+                           : nullptr;
+        const bool own_is_empty = own_registered == nullptr ||
+                                  (own_registered->GetFiles().empty() &&
+                                   own_registered->GetSubdirectories().empty());
+        if (own_is_empty && !system_content_fallback.empty()) {
+            auto fallback = vfs.OpenDirectory(
+                Common::FS::PathToUTF8String(system_content_fallback / "system" / "Contents" /
+                                             "registered"),
+                FileSys::OpenMode::Read);
+            if (fallback != nullptr &&
+                !(fallback->GetFiles().empty() && fallback->GetSubdirectories().empty())) {
+                LOG_INFO(Service_FS, "No system content in this NAND; reading firmware from {}",
+                         Common::FS::PathToUTF8String(system_content_fallback));
+                system_registered = std::move(fallback);
+            } else {
+                LOG_WARNING(Service_FS,
+                            "No system content in this NAND or in {}; firmware-backed features "
+                            "such as Mii models will be unavailable",
+                            Common::FS::PathToUTF8String(system_content_fallback));
+            }
+        }
         bis_factory = std::make_unique<FileSys::BISFactory>(
-            nand_directory, std::move(load_directory), std::move(dump_directory));
+            nand_directory, std::move(load_directory), std::move(dump_directory),
+            std::move(system_registered));
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::SysNAND,
                                        bis_factory->GetSystemNANDContents());
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::UserNAND,

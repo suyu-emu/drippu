@@ -5,13 +5,12 @@
 # RET/BLR branch probes against the active arm64_to_c.h header. Does not use
 # tools/static_recompiler.
 #
-# Nested full-tree target recomp_stack_harness also races JIT vs hybrid AOT
-# (drippu backlog #3) and writes recomp_benchmark.json. Fold pin: discriminating
-# PLT dump must FAIL (store+load + 1 add + PLT jmp is not a loop); live store/load
-# is host_mem callback counts, not named recomp_store64@plt.
+# The former full-stack harness targets the retired image ABI and metrics API.
+# The active ABI 5/6 generated-image and host guard contracts are exercised by
+# tests/recompiler_smoke/run.py in CI.
 #
-# Backlog #4: homebrew_harness runs Translate C vs independent ARM arithmetic
-# (edge + random). recomp_stack_harness compares Translate AOT vs Dynarmic.
+# homebrew_harness runs Translate C vs independent ARM arithmetic (edge and
+# random cases). The ABI smoke suite exercises emitted modules and host guards.
 # -DSUYU_ENABLE_SANITIZERS=ON (standalone) or -DYUZU_ENABLE_SANITIZERS=ON (tree)
 # builds ASan+UBSan and forwards the flags into nested probe/AOT compiles. CI
 # runs this natively on both x86-64 and ARM64 so generated code is checked with
@@ -31,10 +30,9 @@ enable_language(C)
 
 # ASan+UBSan for instruction-correctness / generated C. Nested AOT/probe
 # compiles inherit the flags via smoke_config.h (SUYU_SMOKE_SANITIZER_FLAGS).
-# GitHub tests.yml wires this on ubuntu-24.04 (x86-64). There is no ARM64
-# sanitizer runner in this repo's workflows.
+# GitHub tests.yml wires this on x86-64 and ARM64 Linux runners.
 if (NOT DEFINED SUYU_ENABLE_SANITIZERS)
-    option(SUYU_ENABLE_SANITIZERS "ASan+UBSan for recompiler tests (x86-64)" OFF)
+    option(SUYU_ENABLE_SANITIZERS "ASan+UBSan for recompiler tests" OFF)
 endif()
 if (DEFINED YUZU_ENABLE_SANITIZERS AND YUZU_ENABLE_SANITIZERS)
     set(SUYU_ENABLE_SANITIZERS ON)
@@ -78,23 +76,3 @@ add_test(NAME homebrew_harness COMMAND homebrew_harness)
 set_tests_properties(homebrew_harness PROPERTIES
     TIMEOUT 240
 )
-
-# Real ArmRecomp + Dynarmic + kernel stack. Only when nested in the full
-# emulator build (links `core`). Standalone recompiler/ CMake project skips it.
-if (NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    add_executable(recomp_stack_harness recomp_stack_harness.cpp)
-    target_compile_features(recomp_stack_harness PRIVATE cxx_std_20)
-    # frontend_common supplies PlayTimeManager referenced from core's NS services
-    # once System symbols pull that translation unit into the link.
-    target_link_libraries(recomp_stack_harness PRIVATE core common frontend_common dynarmic::dynarmic
-                          ${PLATFORM_LIBRARIES} ${CMAKE_DL_LIBS})
-    target_include_directories(recomp_stack_harness PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-    # The harness builds on Windows to catch compile regressions, but its AOT
-    # fixture uses POSIX dlopen and exits before the integration scenarios.
-    if (NOT WIN32)
-        add_test(NAME recomp_stack_harness COMMAND recomp_stack_harness)
-        set_tests_properties(recomp_stack_harness PROPERTIES
-            TIMEOUT 360
-        )
-    endif()
-endif()

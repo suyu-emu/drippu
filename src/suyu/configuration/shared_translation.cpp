@@ -44,6 +44,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
     INSERT(Settings, login_share_applet_mode, tr("Login share"), QStringLiteral());
     INSERT(Settings, wifi_web_auth_applet_mode, tr("Wifi web auth"), QStringLiteral());
     INSERT(Settings, my_page_applet_mode, tr("My page"), QStringLiteral());
+    INSERT(Settings, enable_overlay, tr("Enable overlay applet"),
+           tr("Enables the console's built-in overlay applet."));
 
     // Audio
     INSERT(Settings, sink_id, tr("Output Engine:"), QStringLiteral());
@@ -73,6 +75,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "faster or not.\n200% for a 30 FPS game is 60 FPS, and for a "
               "60 FPS game it will be 120 FPS.\nDisabling it means unlocking the framerate to the "
               "maximum your PC can reach."));
+    INSERT(Settings, slow_speed_limit, tr("Slow Speed"),
+           tr("Speed limit used while the Slow Speed hotkey is active."));
+    INSERT(Settings, turbo_speed_limit, tr("Turbo Speed"),
+           tr("Speed limit used while the Turbo Speed hotkey is active."));
+    INSERT(Settings, current_speed_mode, QStringLiteral(), QStringLiteral());
     INSERT(Settings, sync_core_speed, tr("Synchronize core speed"),
            tr("Synchronizes CPU core speed to game's maximum rendering speed, which can be useful to "
               "increase FPS without increasing the actual speed of the game (animations, physics, etc.)\n"
@@ -205,6 +212,22 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "accuracy.\nExtreme should only be used for debugging.\nThis option can "
               "be changed while playing.\nSome games may require booting on high to render "
               "properly."));
+    INSERT(Settings, dma_accuracy, tr("DMA Accuracy:"),
+           tr("Controls DMA read accuracy. Default follows the GPU accuracy setting. Unsafe can be "
+              "faster; Safe can fix issues in some games."));
+    INSERT(Settings, gpu_fence_behavior, tr("GPU Fence Behavior:"),
+           tr("Controls GPU fence synchronization. Default follows the GPU accuracy setting. "
+              "Stricter modes can improve compatibility at a performance cost."));
+    INSERT(Settings, frame_pacing_mode, tr("Frame Pacing Mode (Vulkan only):"),
+           tr("Sets the target frame pacing rate for Vulkan presentation."));
+    INSERT(Settings, sync_memory_operations, tr("Sync memory operations"),
+           tr("Synchronizes memory operations for improved compatibility, potentially reducing "
+              "performance."));
+    INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
+           tr("Retains previous buffer states for games that need them."));
+    INSERT(Settings, enable_gpu_buffer_readback, tr("Enable GPU buffer readback"),
+           tr("Reads GPU-modified data back before uploading it again. Some games need this for "
+              "correct rendering."));
     INSERT(Settings, use_asynchronous_shaders, tr("Use asynchronous shader building (Hack)"),
            tr("Enables asynchronous shader compilation, which may reduce shader stutter.\nThis "
               "feature "
@@ -242,6 +265,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "purposes."));
     INSERT(Settings, rng_seed_enabled, QStringLiteral(), QStringLiteral());
     INSERT(Settings, device_name, tr("Device Name"), tr("The name of the emulated Switch."));
+    INSERT(Settings, application_version_override, tr("Application version number override:"),
+           tr("Overrides the reported numeric application version when content has no control "
+              "metadata. Leave at 0 to use the detected version."));
+    INSERT(Settings, application_display_version_override,
+           tr("Application display version override:"),
+           tr("Overrides the version text shown to the game when content has no control metadata. "
+              "Leave empty to use the detected version."));
+    INSERT(Settings, program_args, tr("Homebrew arguments:"),
+           tr("Command-line arguments passed to homebrew when it starts."));
     INSERT(Settings, custom_rtc, tr("Custom RTC Date:"),
            tr("This option allows to change the emulated clock of the Switch.\n"
               "Can be used to manipulate time in games."));
@@ -332,6 +364,28 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QWidget* parent) {
              PAIR(AstcRecompression, Bc1, tr("BC1 (Low quality)")),
              PAIR(AstcRecompression, Bc3, tr("BC3 (Medium quality)")),
          }});
+    translations->insert({Settings::EnumMetadata<Settings::FramePacingMode>::Index(),
+                          {
+                              PAIR(FramePacingMode, Target_Auto, tr("Auto")),
+                              PAIR(FramePacingMode, Target_30, tr("30 FPS")),
+                              PAIR(FramePacingMode, Target_60, tr("60 FPS")),
+                              PAIR(FramePacingMode, Target_90, tr("90 FPS")),
+                              PAIR(FramePacingMode, Target_120, tr("120 FPS")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::DmaAccuracy>::Index(),
+                          {
+                              PAIR(DmaAccuracy, Default, tr("Default")),
+                              PAIR(DmaAccuracy, Unsafe, tr("Unsafe (fast)")),
+                              PAIR(DmaAccuracy, Safe, tr("Safe (stable)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuFenceBehavior>::Index(),
+                          {
+                              PAIR(GpuFenceBehavior, Default, tr("Default")),
+                              PAIR(GpuFenceBehavior, Immediate, tr("Immediate")),
+                              PAIR(GpuFenceBehavior, Balanced, tr("Balanced")),
+                              PAIR(GpuFenceBehavior, Accurate, tr("Accurate")),
+                              PAIR(GpuFenceBehavior, Strict, tr("Strict")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::VramUsageMode>::Index(),
                           {
                               PAIR(VramUsageMode, Conservative, tr("Conservative")),

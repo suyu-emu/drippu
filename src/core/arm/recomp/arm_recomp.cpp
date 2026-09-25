@@ -4,35 +4,37 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
-#include <map>
 #include <mutex>
+#include <map>
+#include <thread>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
 #include "common/logging/log.h"
+#include "common/page_table.h"
 #include "common/string_util.h"
-#include "common/fs/file.h"
-#include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
-#include "core/arm/recomp/recomp_icache.h"
-#include "core/arm/recomp/recomp_image_abi.h"
-#include "core/arm/recomp/recomp_session.h"
-#include "core/arm/recomp/unresolved_import.h"
+#include "core/arm/recomp/guest_fp_env.h"
+#include "core/arm/recomp/recomp_gap_session.h"
+#include "core/arm/recomp/recomp_diagnostic_sampler.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/k_lock_trace.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hardware_properties.h"
 #include "core/arm/debug.h"
+#ifndef SUYU_NO_JIT
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#endif
+#include "core/arm/exclusive_monitor.h"
 #include "core/memory.h"
 
 namespace Core {
@@ -74,9 +76,14 @@ struct GuestContextView {
     // heap bookkeeping this view does not model, so a field appended after that
     // point would be at a different offset on each side.
     int chain_budget;
+    // ABI 6 (FM1): the page table and a page-aligned limit below which the
+    // generated memory helpers may read the table directly. fm_limit 0 keeps
+    // them on the ABI 5 path. ABI 5 modules end their view at chain_budget and
+    // never read these.
+    u32 fm_reserved;
+    const u8* fm_table;
+    u64 fm_limit;
 };
-
-static_assert(sizeof(GuestContextView) == suyu::recomp::kRecompRegsPrefixSize);
 
 // Matches RecompHostMem in the generated runtime. The recompiled code calls
 // through this for every guest access, so that it reads and writes the
@@ -107,6 +114,8 @@ struct RecompHostMem {
     u64 page_bits;
     u64 pointer_mask;
     u64 address_space_max;
+    // Reserved for layout compatibility; ABI 5 never reads this slot.
+    const u64* guard_generation;
 };
 
 // This struct is duplicated by hand in the emitter (arm64_to_c.h, RuntimeH's
@@ -126,7 +135,8 @@ static_assert(offsetof(RecompHostMem, page_entry_stride) == 80);
 static_assert(offsetof(RecompHostMem, page_bits) == 88);
 static_assert(offsetof(RecompHostMem, pointer_mask) == 96);
 static_assert(offsetof(RecompHostMem, address_space_max) == 104);
-static_assert(sizeof(RecompHostMem) == 112);
+static_assert(offsetof(RecompHostMem, guard_generation) == 112);
+static_assert(sizeof(RecompHostMem) == 120);
 
 // Nothing links these two builds together, so the shared layout is pinned on
 // both sides: the generated runtime asserts the same four offsets against its
@@ -138,18 +148,188 @@ static_assert(offsetof(GuestContextView, pending_svc) == 304);
 static_assert(offsetof(GuestContextView, vreg) == 312);
 static_assert(offsetof(GuestContextView, tpidr_el0) == 824);
 static_assert(offsetof(GuestContextView, chain_budget) == 864);
+static_assert(offsetof(GuestContextView, fm_table) == 872);
+static_assert(offsetof(GuestContextView, fm_limit) == 880);
+// The FM1 helpers fold the page table layout in as constants
+// (RECOMP_FM_PAGE_BITS, RECOMP_FM_STRIDE_LOG2, RECOMP_FM_PTR_MASK). A change
+// here must fail the build, not misread the table.
+static_assert(sizeof(Common::PageTable::PageEntryData) == 32);
+static_assert(Common::PageTable::ATTRIBUTE_BITS == 2);
+static_assert(Memory::YUZU_PAGEBITS == 12);
+// GG1: the generated store helpers read the watch word at this offset.
+static_assert(offsetof(Common::PageTable::PageEntryData, recomp_watch) ==
+              RecompGuardGen::kWatchOffset);
+static_assert(sizeof(std::atomic<u64>) == sizeof(u64) && std::atomic<u64>::is_always_lock_free);
 
 // Blocks a chain of direct calls may run before returning here. Only this side
 // sets it - the generated code just decrements - so the emitter does not need
 // to agree on the value.
 //
 // It bounds two things. How long a guest loop can run without the interrupt and
-// SVC checks below getting a look in; and, because the generated calls are not
-// guaranteed to be tail calls, how deep the host stack goes. Guest threads run
-// on 512 KB fibers (common/fiber.cpp) and a block frame carrying SIMD locals is
-// not small, so this has to stay well under what that stack can hold. 256
-// overflowed it and crashed on boot.
-constexpr int kChainBudget = 32;
+// SVC checks below getting a look in; and, if the generated calls are not tail
+// calls, how deep the host stack goes. Guest threads run on 512 KB fibers
+// (common/fiber.cpp) and a block frame carrying SIMD locals is not small.
+//
+// This comment used to say 256 overflowed that stack and crashed on boot, and
+// that raising the budget was only safe when the generated code was built with
+// -foptimize-sibling-calls. That flag is still only on the GNU branch - the
+// MSVC branch emits "/O1" with no tail-call guarantee, and ChainTo calls into
+// another translation unit - so by that reasoning Windows should fall over well
+// below the ABI 4 default of 4096.
+//
+// It does not. Measured on Mario Kart 8 running fully static with zero JIT
+// transitions, replaying the same 8861-command fixture at each budget:
+//
+//     32 -> 0.666x realtime    256 -> 0.696x    1024 -> 0.695x
+//   4096 -> 0.678x             8192 -> 0.692x
+//
+// Every one completed, including 256 and the 8192 ceiling, each executing about
+// 8.5 billion blocks. So either MSVC /O1 does tail-call these, or the chains
+// never get deep enough to matter. The budget is worth about 4% either way,
+// with 32 the slowest, so there is little to gain from tuning it.
+//
+// Keep the bound: one title not overflowing is not proof that a deeper-
+// recursing one cannot. But do not treat a raised budget as known-dangerous on
+// MSVC, because that is not what the measurement says.
+// Refuse the JIT entirely. Without this, "the JIT was never reached" is an
+// observation about one run; with it, reaching the JIT is a loud, fatal failure
+// that names the address, which is the difference between evidence and proof.
+bool StrictNoFallback() {
+    const char* e = std::getenv("SUYU_RECOMP_STRICT");
+    return e && *e && *e != '0';
+}
+
+const int kChainBudgetOverride = [] {
+    const char* e = std::getenv("SUYU_RECOMP_CHAIN_BUDGET");
+    if (!e) {
+        return 0;
+    }
+    const int v = std::atoi(e);
+    return (v >= 1 && v <= 8192) ? v : 0;
+}();
+std::atomic<int> g_recomp_chain_budget{32};
+
+int RecompChainBudget() {
+    return kChainBudgetOverride ? kChainBudgetOverride
+                                : g_recomp_chain_budget.load(std::memory_order_relaxed);
+}
+
+const bool kSamplePc = [] {
+    const char* e = std::getenv("SUYU_RECOMP_SAMPLE_PC");
+    return e && *e && *e != '0';
+}();
+
+// How many blocks a thread retires between PC samples, as a power of two.
+//
+// The default of 18 samples proportionally to *executed blocks*, which is the
+// wrong denominator for a stall: a title that runs 260M blocks of boot work in
+// four seconds and then sits in a 4,000 block/s poll loop for three minutes
+// puts 99.7% of its samples in the four seconds nobody is asking about. Lower
+// this to sample the plateau, and use SUYU_RECOMP_SAMPLE_AFTER_SEC to throw
+// away the burst entirely.
+const unsigned kSamplePcShift = [] {
+    const char* e = std::getenv("SUYU_RECOMP_SAMPLE_SHIFT");
+    if (!e || !*e) {
+        return 18u;
+    }
+    const int v = std::atoi(e);
+    return (v >= 6 && v <= 30) ? static_cast<unsigned>(v) : 18u;
+}();
+
+// Seconds of run time to discard before any sample is kept. 0 keeps everything.
+const double kSampleAfterSec = [] {
+    const char* e = std::getenv("SUYU_RECOMP_SAMPLE_AFTER_SEC");
+    return (e && *e) ? std::atof(e) : 0.0;
+}();
+
+const std::chrono::steady_clock::time_point kRecompStart = std::chrono::steady_clock::now();
+
+// Naming the instruction that writes a guest field is not possible from the
+// store callback, because emitted code resolves mapped memory through the
+// inline page-table walk in recomp_host_ptr and never calls back. That walk
+// has one runtime-controlled escape: it gives up on any address at or above
+// host_mem->address_space_max and takes the callback path instead. Lowering
+// that bound sends every access above a chosen address through HostStore,
+// where the storing block's PC is visible - c->pc holds the entry address of
+// the block currently running, because the emitted code writes it at branches
+// rather than per instruction.
+//
+// The bound applies to loads too, so it is expensive: it is gated on a block
+// count so the fast part of boot runs at full speed and only the window around
+// the fault is instrumented.
+const u64 kSlowPathAbove = [] {
+    const char* e = std::getenv("SUYU_RECOMP_SLOWPATH_ABOVE");
+    return (e && *e) ? std::strtoull(e, nullptr, 0) : 0ULL;
+}();
+const u64 kSlowPathAfterBlocks = [] {
+    const char* e = std::getenv("SUYU_RECOMP_SLOWPATH_AFTER_BLOCKS");
+    return (e && *e) ? std::strtoull(e, nullptr, 0) : 0ULL;
+}();
+const u64 kTrapStoreLo = [] {
+    const char* e = std::getenv("SUYU_RECOMP_TRAP_STORE_LO");
+    return (e && *e) ? std::strtoull(e, nullptr, 0) : 0ULL;
+}();
+const u64 kTrapStoreHi = [] {
+    const char* e = std::getenv("SUYU_RECOMP_TRAP_STORE_HI");
+    return (e && *e) ? std::strtoull(e, nullptr, 0) : 0ULL;
+}();
+
+// How much of the guest's relocation work we do ourselves, and what we do to
+// DT_RELASZ/DT_PLTRELSZ afterwards. See ApplyAllRelocations.
+//
+// Only rtld's own self-relocation actually needs us: it is a hand-written
+// bootstrap loop that the recompiled path exits early out of. Everything
+// after that is rtld's ordinary C++ relocation pass, which runs correctly
+// once rtld itself is relocated.
+//
+//   rtld-only       - default. Pre-apply and zero rtld alone; leave every
+//                     other module untouched for rtld to relocate, exactly as
+//                     under dynarmic. Smash reaches an actual match on this.
+//   zero-all        - the previous default: pre-apply every module and zero
+//                     every module's sizes. Boots, but main's .dynamic then
+//                     reports no relocations, so when nn::ro loads a fighter
+//                     NRO it cannot bind main's deferred imports. Measured:
+//                     0 of main's 909 lua2cpp::create_agent_fighter_* slots
+//                     are ever bound, and the match never starts.
+//   zero-rtld       - pre-apply every module but zero only rtld's sizes.
+//                     Measured not to work: rtld's pass then re-relocates
+//                     modules we already did and svcBreaks immediately
+//                     (12071 breaks, first at 0.1s after the pre-apply).
+//   restore-on-main - zero every module, then put the sizes back on first
+//                     execution in main. Measured not to work: rtld caches
+//                     the sizes into its own module state when it parses
+//                     .dynamic at boot, so a later write is never re-read and
+//                     the slots stay unbound just as under zero-all.
+const std::string kRelaPolicy = [] {
+    const char* e = std::getenv("SUYU_RECOMP_RELA_POLICY");
+    return std::string{(e && *e) ? e : "rtld-only"};
+}();
+// Symbol-name prefix whose unresolved JUMP_SLOT/GLOB_DAT slots are recorded at
+// relocation time and re-read periodically, so a log can say whether anything
+// ever bound them. Smash's fighter agents are `lua2cpp::create_agent_fighter`.
+const std::string kTrackSlotPrefix = [] {
+    const char* e = std::getenv("SUYU_RECOMP_TRACK_SLOT_PREFIX");
+    return std::string{(e && *e) ? e : ""};
+}();
+// The original DT_RELASZ/DT_PLTRELSZ values, as (address, size) pairs, for the
+// restore-on-main policy. Process-global rather than per-Impl: every CPU Impl
+// runs its own relocation pass, but only the first one sees the real sizes -
+// the rest parse .dynamic after it has already zeroed them, so a per-Impl copy
+// records zeros and a later Impl's restore writes those zeros back over the
+// first Impl's correct one. That happened before the first NRO load and put
+// the sizes back at 0 exactly where they were needed.
+std::mutex g_rela_restore_lock;
+std::vector<std::pair<u64, u64>> g_rela_restore;
+std::atomic<bool> g_rela_restored{false};
+
+bool SampleWindowOpen() {
+    if (kSampleAfterSec <= 0.0) {
+        return true;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(now - kRecompStart).count() >= kSampleAfterSec;
+}
+
 static_assert(offsetof(GuestContextView, host_mem) == 832);
 static_assert(offsetof(GuestContextView, tpidrro_el0) == 840);
 static_assert(offsetof(GuestContextView, fpcr) == 848);
@@ -163,121 +343,81 @@ constexpr u64 kNoPendingSvc = ~0ULL;
 // with this parked its PC on an instruction the decoder cannot translate and
 // is asking for that address to be executed by the interpreter fallback.
 constexpr int kHaltUnhandled = 2;
+// Mirrors RECOMP_HALT_BREAKPOINT. PC already names the faulting instruction.
+constexpr int kHaltBreakpoint = 3;
+constexpr int kHaltIcIvau = 4;
+std::atomic<bool> g_code_guard_ready{false};
+// ABI 6 (FM1). Set by the loader once every module passed the handshake, before
+// any guest thread runs. SUYU_RECOMP_FASTMEM=0 keeps the fast path off anyway.
+std::atomic<bool> g_fastmem_ready{false};
+const bool kFastmemDisabled = [] {
+    const char* e = std::getenv("SUYU_RECOMP_FASTMEM");
+    return e && *e == '0';
+}();
+// ABI 6 GG1. SUYU_RECOMP_GUARD_GEN=0 keeps every module on the per-entry check.
+const bool kGuardGenDisabled = [] {
+    const char* e = std::getenv("SUYU_RECOMP_GUARD_GEN");
+    return e && *e == '0';
+}();
+// ABI 6 feature FPX1. Set by the loader once every module passed the FPX1
+// handshake, before any guest thread runs. While set, generated code may keep
+// native FP results, which is exact only in the host FP mode guest_fp_env.h
+// describes; RunThread puts every guest-core thread in that mode and checks it
+// on each dispatch. SUYU_RECOMP_FPX=0 sets the kill-switch bit instead.
+std::atomic<bool> g_fpx_ready{false};
+const bool kFpxDisabled = [] {
+    const char* e = std::getenv("SUYU_RECOMP_FPX");
+    return e && *e == '0';
+}();
+// Bit 32 of the context's fpcr: host-owned, above the 32-bit guest register.
+// FPX1 code masks it out of MRS/MSR FPCR and takes the exact path while it is
+// set. Only an all-FPX1 bundle is loaded, so no module can read it.
+constexpr u64 kFpxInhibit = u64{1} << 32;
+std::atomic<u64> g_fpx_env_repairs{0};
+
+u64 FpxInhibitBits() {
+    return kFpxDisabled && g_fpx_ready.load(std::memory_order_acquire) ? kFpxInhibit : 0;
+}
+bool FpxActive() {
+    return !kFpxDisabled && g_fpx_ready.load(std::memory_order_acquire);
+}
+// Puts this thread's FP mode back where FPX1 code needs it; logged the first
+// time, since something on a guest-core thread (a host callback, an injected
+// library) changed it.
+void RepairFpEnv(const char* where) {
+    if (RecompFpEnv::Ensure() &&
+        g_fpx_env_repairs.fetch_add(1, std::memory_order_relaxed) == 0) {
+        LOG_WARNING(Core_ARM, "recomp: host FP mode was not the one FPX1 code needs ({}); restored",
+                    where);
+    }
+}
+std::atomic<u64> g_forced_cutoff_pc{0};
+std::atomic<u64> g_forced_cutoff_blocks{0};
+
+// An unresolved GOT/JUMP_SLOT relocation used to be left untouched, which
+// means a call through it branches to whatever the raw NSO file already had
+// sitting in that GOT slot - typically a small placeholder/addend value the
+// static linker left for a symbol it expected the *dynamic* linker to fill
+// in later (lazy-binding stub offset, or just zero-adjacent garbage), not a
+// real address. The guest's BLR then lands on that small value directly -
+// e.g. 0xe7ff0 - which is unmapped, and the JIT fallback that "No recompiled
+// block" hands off to can't execute there either, so the whole thread dies.
+// Every unresolved slot is patched to this fixed, recognizable sentinel
+// instead: the dispatch loop below special-cases it as an immediate "return
+// to caller" (PC = LR) rather than a real guest address, so a genuinely
+// call-but-never-actually-invoked unresolved import (the common case - most
+// entries in a large import table exist for code paths a given boot never
+// takes) fails soft instead of crashing the thread outright.
+constexpr u64 kUnresolvedImportTrap = 0xFFFF'FFFF'0000'0000ULL;
 } // namespace
 
 namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
+std::mutex g_process_init_lock;
+std::atomic<RecompPrepareFn> g_recomp_prepare{nullptr};
 
-// The loader creates one ArmRecomp per physical core, but instruction-cache
-// invalidation is process-wide. Weak ownership makes this state shared by all
-// cores of one live KProcess and naturally drops it when the process exits,
-// avoiding stale state if an address is reused by a later process.
-struct RecompProcessState {
-    suyu::recomp::RecompICache icache;
-    std::atomic<bool> execution_started{false};
-
-    // Invalidation is process-wide, while each ArmRecomp is per physical
-    // core.  A lookup can race an invalidation between returning its AOT
-    // function and calling it, so keep a tiny reader gate around generated
-    // execution.  The normal path is two atomics; writers serialize only
-    // while publishing an invalidation and wait for in-flight blocks to leave.
-    // Even epochs are quiescent; an odd epoch is a writer waiting/publishing.
-    // The generation check closes the ABA window where a reader observes
-    // false, gets delayed through a complete invalidation, then increments
-    // the active count and incorrectly executes its stale function pointer.
-    std::atomic<u64> invalidation_epoch{0};
-    std::atomic<u32> active_aot_executions{0};
-    std::mutex invalidation_lock;
-
-    void MarkExecutionStarted() {
-        // Order the lifecycle transition with loader notifications. A range
-        // notification that wins this lock is still pre-execution; any later
-        // notification observes runtime execution and is retained.
-        if (execution_started.load(std::memory_order_acquire)) {
-            return;
-        }
-        std::scoped_lock lock{invalidation_lock};
-        if (!execution_started.load(std::memory_order_relaxed)) {
-            execution_started.store(true, std::memory_order_release);
-        }
-    }
-
-    bool TryEnterAotExecution() {
-        // The reader's count increment and the writer's odd-epoch publication
-        // form a store-buffering handshake. Both sides must use one total order:
-        // acquire/release alone can let the writer see zero readers while this
-        // reader sees the old even epoch twice and enters stale AOT code.
-        const u64 epoch = invalidation_epoch.load(std::memory_order_seq_cst);
-        if (epoch & 1) {
-            return false;
-        }
-        active_aot_executions.fetch_add(1, std::memory_order_seq_cst);
-        if (invalidation_epoch.load(std::memory_order_seq_cst) != epoch) {
-            LeaveAotExecution();
-            return false;
-        }
-        return true;
-    }
-
-    void LeaveAotExecution() {
-        if (active_aot_executions.fetch_sub(1, std::memory_order_seq_cst) == 1) {
-            active_aot_executions.notify_all();
-        }
-    }
-
-    void WaitForAotReaders() {
-        // atomic::wait couples the observed count to the wait, so a last
-        // reader cannot notify between a predicate check and a condvar sleep.
-        for (u32 count = active_aot_executions.load(std::memory_order_seq_cst); count != 0;
-             count = active_aot_executions.load(std::memory_order_seq_cst)) {
-            active_aot_executions.wait(count, std::memory_order_seq_cst);
-        }
-    }
-
-    std::unique_lock<std::mutex> BeginInvalidation() {
-        std::unique_lock lock{invalidation_lock};
-        invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
-        WaitForAotReaders();
-        return lock;
-    }
-
-    std::unique_lock<std::mutex> BeginRangeInvalidation(bool fallback_present) {
-        std::unique_lock lock{invalidation_lock};
-        if (!fallback_present && !execution_started.load(std::memory_order_acquire)) {
-            return {};
-        }
-        // Keep the lifecycle decision and odd-epoch publication under one
-        // lock. A reader cannot start between the runtime check and the gate.
-        invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
-        WaitForAotReaders();
-        return lock;
-    }
-
-    void EndInvalidation() {
-        invalidation_epoch.fetch_add(1, std::memory_order_seq_cst);
-    }
-};
-
-std::mutex g_process_states_lock;
-std::unordered_map<Kernel::KProcess*, std::weak_ptr<RecompProcessState>> g_process_states;
-
-std::shared_ptr<RecompProcessState> AcquireProcessState(Kernel::KProcess* process) {
-    if (!process) {
-        return std::make_shared<RecompProcessState>();
-    }
-    std::scoped_lock lock{g_process_states_lock};
-    auto& weak = g_process_states[process];
-    if (auto state = weak.lock()) {
-        return state;
-    }
-    auto state = std::make_shared<RecompProcessState>();
-    weak = state;
-    return state;
-}
-
-/// Execution coverage for the AOT path (mk8-recomp #13) plus wall-clock time
-/// in each backend (drippu backlog #2).
+/// Execution coverage for the AOT path (mk8-recomp #13).
 ///
 /// The exporter's static coverage says what fraction of the *image* translates.
 /// It cannot say what fraction of *execution* stays on the recompiled path,
@@ -288,24 +428,12 @@ std::shared_ptr<RecompProcessState> AcquireProcessState(Kernel::KProcess* proces
 /// Only this decides whether the AOT path is worth anything, and only this can
 /// rank the missing opcodes by what actually executes.
 struct RecompCounters {
-    std::atomic<u64> static_blocks{0};
-    std::atomic<u64> aot_time_ns{0};
-    std::atomic<u64> dynarmic_time_ns{0};
-    std::atomic<u64> dynarmic_run_slices{0};
-    std::atomic<u64> dynarmic_step_slices{0};
     std::atomic<u64> svc_calls{0};
     std::atomic<u64> fallback_from_miss{0};
     std::atomic<u64> fallback_from_unhandled{0};
-    std::atomic<u64> fallback_from_icache_reject{0};
-    std::atomic<u64> aot_to_dynarmic{0};
     std::atomic<u64> jit_to_static{0};
     std::atomic<u64> unresolved_import_traps{0};
     std::atomic<u64> no_fallback_available{0};
-    std::atomic<u64> clear_instruction_cache{0};
-    std::atomic<u64> invalidate_cache_range{0};
-    std::atomic<u64> aot_range_rejects{0};
-    std::atomic<u64> permanent_aot_reject{0};
-    std::atomic<u64> jit_halt_cache_invalidation{0};
 
     // Guarded rather than atomic: these are touched only on a transition, which
     // is by definition already the slow path.
@@ -313,6 +441,7 @@ struct RecompCounters {
     std::map<u32, u64> unhandled_insn;  ///< guest encoding -> times it forced a fallback
     std::map<u64, u64> miss_pc;         ///< PC with no block -> times it forced a fallback
     std::map<u32, u64> svc_numbers;     ///< SVC imm -> times the guest issued it
+    std::map<u64, u64> sampled_pc;      ///< sparse samples for zero-transition stalls
     /// Load address -> module name, so a PC in this report can be resolved to
     /// module+offset. Without it the addresses mean nothing except beside the
     /// matching boot log, and a report read against another run's log resolves
@@ -337,146 +466,51 @@ struct RecompCounters {
         std::scoped_lock lk{hist_lock};
         ++miss_pc[pc];
     }
-
-    void AddAtomicsFrom(const RecompCounters& src) {
-        const auto add = [](std::atomic<u64>& dst, const std::atomic<u64>& s) {
-            dst.fetch_add(s.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        };
-        add(static_blocks, src.static_blocks);
-        add(aot_time_ns, src.aot_time_ns);
-        add(dynarmic_time_ns, src.dynarmic_time_ns);
-        add(dynarmic_run_slices, src.dynarmic_run_slices);
-        add(dynarmic_step_slices, src.dynarmic_step_slices);
-        add(svc_calls, src.svc_calls);
-        add(fallback_from_miss, src.fallback_from_miss);
-        add(fallback_from_unhandled, src.fallback_from_unhandled);
-        add(fallback_from_icache_reject, src.fallback_from_icache_reject);
-        add(aot_to_dynarmic, src.aot_to_dynarmic);
-        add(jit_to_static, src.jit_to_static);
-        add(unresolved_import_traps, src.unresolved_import_traps);
-        add(no_fallback_available, src.no_fallback_available);
-        add(clear_instruction_cache, src.clear_instruction_cache);
-        add(invalidate_cache_range, src.invalidate_cache_range);
-        add(aot_range_rejects, src.aot_range_rejects);
-        add(permanent_aot_reject, src.permanent_aot_reject);
-        add(jit_halt_cache_invalidation, src.jit_halt_cache_invalidation);
-    }
-
-    void ZeroAtomics() {
-        static_blocks.store(0, std::memory_order_relaxed);
-        aot_time_ns.store(0, std::memory_order_relaxed);
-        dynarmic_time_ns.store(0, std::memory_order_relaxed);
-        dynarmic_run_slices.store(0, std::memory_order_relaxed);
-        dynarmic_step_slices.store(0, std::memory_order_relaxed);
-        svc_calls.store(0, std::memory_order_relaxed);
-        fallback_from_miss.store(0, std::memory_order_relaxed);
-        fallback_from_unhandled.store(0, std::memory_order_relaxed);
-        fallback_from_icache_reject.store(0, std::memory_order_relaxed);
-        aot_to_dynarmic.store(0, std::memory_order_relaxed);
-        jit_to_static.store(0, std::memory_order_relaxed);
-        unresolved_import_traps.store(0, std::memory_order_relaxed);
-        no_fallback_available.store(0, std::memory_order_relaxed);
-        clear_instruction_cache.store(0, std::memory_order_relaxed);
-        invalidate_cache_range.store(0, std::memory_order_relaxed);
-        aot_range_rejects.store(0, std::memory_order_relaxed);
-        permanent_aot_reject.store(0, std::memory_order_relaxed);
-        jit_halt_cache_invalidation.store(0, std::memory_order_relaxed);
+    void RecordSample(u64 pc) {
+        std::scoped_lock lk{hist_lock};
+        ++sampled_pc[pc];
     }
 };
 
 RecompCounters g_counters;
-RecompCounters g_lifetime;
-std::atomic<bool> g_coverage_reported{false};
-// A hot title can execute tens of millions of blocks per second. Formatting
-// both coverage reports at every 256K boundary spent substantial time doing
-// file I/O on the emulation threads. Keep periodic crash-resilient snapshots,
-// but rate-limit them across all cores.
-std::atomic<std::chrono::steady_clock::rep> g_last_coverage_snapshot_tick{0};
+std::array<std::atomic<u64>, 4> g_current_pcs{};
+std::atomic<int> g_live_instances{0};
+std::mutex g_snapshot_lock;
+std::map<std::pair<u64, std::size_t>, std::string> g_diagnostic_snapshots;
 
-void FoldCurrentIntoLifetime() {
-    g_lifetime.AddAtomicsFrom(g_counters);
-    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
-    for (const auto& [insn, count] : g_counters.unhandled_insn) {
-        g_lifetime.unhandled_insn[insn] += count;
-    }
-    for (const auto& [pc, count] : g_counters.miss_pc) {
-        g_lifetime.miss_pc[pc] += count;
-    }
-    for (const auto& [num, count] : g_counters.svc_numbers) {
-        g_lifetime.svc_numbers[num] += count;
-    }
-    for (const auto& [base, name] : g_counters.modules) {
-        g_lifetime.modules[base] = name;
-    }
-    g_counters.unhandled_insn.clear();
-    g_counters.miss_pc.clear();
-    g_counters.svc_numbers.clear();
-    g_counters.modules.clear();
-}
-
-void ResetCurrentCounters() {
-    FoldCurrentIntoLifetime();
-    g_counters.ZeroAtomics();
-}
-
-struct ScopedNs {
-    std::atomic<u64>& dest;
-    std::chrono::steady_clock::time_point start;
-    explicit ScopedNs(std::atomic<u64>& dest_)
-        : dest{dest_}, start{std::chrono::steady_clock::now()} {}
-    ~ScopedNs() {
-        const auto raw = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
-        if (raw > 0) {
-            dest.fetch_add(static_cast<u64>(raw), std::memory_order_relaxed);
-        }
-    }
+/// The block tally is incremented once per executed block by every guest
+/// thread. As one shared atomic that is a contended cache line on the hottest
+/// path there is: it was 23% of the dispatch loop's own cycles. Each thread
+/// counts into its own line instead, and the report sums them.
+struct alignas(64) ThreadBlocks {
+    std::atomic<u64> n{0};
+    char pad[64 - sizeof(std::atomic<u64>)];
 };
+std::mutex g_tally_lock;
+std::vector<ThreadBlocks*> g_tallies;
+std::atomic<u64> g_retired_blocks{0};
+/// TotalStaticBlocks() when the current session began, so a session that never
+/// executed a recompiled block is not counted as a run in recomp_gaps.json.
+std::atomic<u64> g_session_blocks_start{0};
 
-// Sampled version of ScopedNs for the per-block AOT path. steady_clock::now()
-// twice per block (tens of millions/sec) dominated the dispatcher. Time the
-// first AOT block in each RunThread exactly so short runs still report a
-// duration, then sample 1/128 of later blocks and scale those samples.
-// Dynarmic slices stay exact (they are rare).
-struct SampledAotNs {
-    static constexpr uint32_t kMask = 127;
-    static constexpr uint32_t kScale = 128;
-    std::atomic<u64>& dest;
-    std::chrono::steady_clock::time_point start{};
-    bool active = false;
-    u32 scale = kScale;
-    explicit SampledAotNs(std::atomic<u64>& dest_, bool first_in_run = false) : dest{dest_} {
-        thread_local uint32_t counter{0};
-        const u32 sample_index = counter++;
-        // Short runs must still report AOT time. Charge their first block
-        // exactly; only periodic samples represent another 128 blocks.
-        if (first_in_run || (sample_index & kMask) == 0) {
-            active = true;
-            if (first_in_run) {
-                scale = 1;
-            }
-            start = std::chrono::steady_clock::now();
-        }
+struct ThreadBlockSlot {
+    ThreadBlocks* slot = new ThreadBlocks{};
+    ThreadBlockSlot() {
+        std::scoped_lock lk{g_tally_lock};
+        g_tallies.push_back(slot);
     }
-    ~SampledAotNs() {
-        if (!active) {
-            return;
-        }
-        const auto raw = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now() - start)
-                             .count();
-        if (raw > 0) {
-            dest.fetch_add(static_cast<u64>(raw) * scale, std::memory_order_relaxed);
-        }
-    }
+    // The slot outlives the thread: the reporter may be summing while a guest
+    // thread exits, and the count still belongs in the total.
 };
+thread_local ThreadBlockSlot t_blocks;
 
-enum class AotLookup : u8 { Hit, Miss, IcacheReject };
-
-suyu::recomp::RecompSession& HostRecompSession() {
-    static suyu::recomp::RecompSession session;
-    return session;
+u64 TotalStaticBlocks() {
+    std::scoped_lock lk{g_tally_lock};
+    u64 sum = g_retired_blocks.load(std::memory_order_relaxed);
+    for (const ThreadBlocks* s : g_tallies) {
+        sum += s->n.load(std::memory_order_relaxed);
+    }
+    return sum;
 }
 
 template <typename Map>
@@ -501,7 +535,7 @@ auto TopN(const Map& m, size_t n) {
 /// run's measurement is lost with it. Writing periodically means a report
 /// always exists for the last completed interval however the process ends.
 std::string FormatRecompCoverage() {
-    const u64 blocks = g_counters.static_blocks.load();
+    const u64 blocks = TotalStaticBlocks();
     const u64 miss = g_counters.fallback_from_miss.load();
     const u64 unh = g_counters.fallback_from_unhandled.load();
     const u64 transitions = miss + unh;
@@ -511,22 +545,11 @@ std::string FormatRecompCoverage() {
     }
 
     std::string o = "=== RECOMP EXECUTION COVERAGE ===\n";
-    const u64 icache_reject = g_counters.fallback_from_icache_reject.load();
-    const u64 aot_to_jit = g_counters.aot_to_dynarmic.load();
     o += fmt::format("  static blocks executed : {}\n", blocks);
-    o += fmt::format("  AOT time               : {} ns\n", g_counters.aot_time_ns.load());
-    o += fmt::format("  Dynarmic time          : {} ns\n", g_counters.dynarmic_time_ns.load());
     o += fmt::format("  SVCs to HLE            : {}\n", g_counters.svc_calls.load());
-    o += fmt::format(
-        "  static -> JIT          : {} ({} lookup miss, {} unimplemented opcode, {} icache reject)\n",
-        aot_to_jit ? aot_to_jit : (transitions + icache_reject), miss, unh, icache_reject);
+    o += fmt::format("  static -> JIT          : {} ({} lookup miss, {} unimplemented opcode)\n",
+                     transitions, miss, unh);
     o += fmt::format("  JIT -> static          : {}\n", g_counters.jit_to_static.load());
-    o += fmt::format("  ClearInstructionCache  : {} (permanent reject events {})\n",
-                     g_counters.clear_instruction_cache.load(),
-                     g_counters.permanent_aot_reject.load());
-    o += fmt::format("  InvalidateCacheRange   : {} (range AOT rejects {})\n",
-                     g_counters.invalidate_cache_range.load(),
-                     g_counters.aot_range_rejects.load());
     o += fmt::format("  unresolved import traps: {}\n", g_counters.unresolved_import_traps.load());
     if (const u64 nofb = g_counters.no_fallback_available.load(); nofb) {
         o += fmt::format("  threads killed with no JIT fallback: {}\n", nofb);
@@ -558,7 +581,7 @@ std::string FormatRecompCoverage() {
         // system calls while still executing millions of blocks is spinning on
         // something, and this says on what.
         o += "  --- SVCs by call count ---\n";
-        for (const auto& [num, count] : TopN(g_counters.svc_numbers, 16)) {
+        for (const auto& [num, count] : TopN(g_counters.svc_numbers, 40)) {
             o += fmt::format("    svc 0x{:02X}  {:>10}\n", num, count);
         }
         o += fmt::format("    {} distinct SVCs\n", g_counters.svc_numbers.size());
@@ -569,6 +592,25 @@ std::string FormatRecompCoverage() {
         for (const auto& [base, name] : g_counters.modules) {
             o += fmt::format("    {:#018x}  {}\n", base, name);
         }
+    }
+
+    if (!g_counters.sampled_pc.empty()) {
+        const auto resolve = [](u64 pc) -> std::string {
+            u64 best = 0;
+            const std::string* name = nullptr;
+            for (const auto& [base, module_name] : g_counters.modules) {
+                if (pc >= base && base >= best) {
+                    best = base;
+                    name = &module_name;
+                }
+            }
+            return name ? fmt::format("  {}+{:#x}", *name, pc - best) : std::string{};
+        };
+        o += "  --- sampled PCs by count ---\n";
+        for (const auto& [pc, count] : TopN(g_counters.sampled_pc, 48)) {
+            o += fmt::format("    {:#018x}  {:>10}{}\n", pc, count, resolve(pc));
+        }
+        o += fmt::format("    {} distinct sampled PCs\n", g_counters.sampled_pc.size());
     }
 
     if (!g_counters.miss_pc.empty()) {
@@ -592,259 +634,260 @@ std::string FormatRecompCoverage() {
         }
         o += fmt::format("    {} distinct PCs\n", g_counters.miss_pc.size());
     }
+    {
+        std::scoped_lock lock{g_snapshot_lock};
+        if (!g_diagnostic_snapshots.empty()) {
+            o += "  --- last execution-boundary samples (not a live thread enumeration) ---\n";
+            for (const auto& [key, snapshot] : g_diagnostic_snapshots) {
+                (void)key;
+                o += snapshot + "\n";
+            }
+        }
+    }
     o += "=== END RECOMP EXECUTION COVERAGE ===\n";
     return o;
 }
 
 void WriteRecompCoverageFile(const std::string& text) {
-    const auto path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_coverage.txt";
+    const char* explicit_path = std::getenv("SUYU_RECOMP_COVERAGE_PATH");
+    const auto path = explicit_path && *explicit_path
+                          ? std::filesystem::path{explicit_path}
+                          : Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) /
+                                "recomp_coverage.txt";
     std::ofstream out(path, std::ios::trunc);
     if (out) {
         out << text;
     }
 }
 
-u64 SumCounter(const std::atomic<u64>& a, const std::atomic<u64>& b) {
-    return a.load(std::memory_order_relaxed) + b.load(std::memory_order_relaxed);
-}
-
-std::map<u32, u64> MergedU32Hist(std::map<u32, u64> RecompCounters::* member) {
-    std::map<u32, u64> out;
-    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
-    out = g_lifetime.*member;
-    for (const auto& [k, v] : g_counters.*member) {
-        out[k] += v;
-    }
-    return out;
-}
-
-std::map<u64, u64> MergedU64Hist(std::map<u64, u64> RecompCounters::* member) {
-    std::map<u64, u64> out;
-    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
-    out = g_lifetime.*member;
-    for (const auto& [k, v] : g_counters.*member) {
-        out[k] += v;
-    }
-    return out;
-}
-
-std::map<u64, std::string> MergedModules() {
-    std::map<u64, std::string> out;
-    std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
-    out = g_lifetime.modules;
-    for (const auto& [k, v] : g_counters.modules) {
-        out[k] = v;
-    }
-    return out;
-}
-
-nlohmann::json JsonTopU32(const std::map<u32, u64>& m, const char* key, size_t n) {
-    nlohmann::json arr = nlohmann::json::array();
-    for (const auto& [id, count] : TopN(m, n)) {
-        arr.push_back({
-            {key, fmt::format("0x{:08X}", id)},
-            {"count", count},
-        });
-    }
-    return {{"top", arr}, {"distinct", m.size()}};
-}
-
-std::string ResolvePc(u64 pc, const std::map<u64, std::string>& modules) {
-    u64 best = 0;
-    const std::string* name = nullptr;
-    for (const auto& [base, module_name] : modules) {
-        if (pc >= base && base >= best) {
-            best = base;
-            name = &module_name;
-        }
-    }
-    return name ? fmt::format("{}+{:#x}", *name, pc - best) : std::string{};
-}
-
+// Diagnostics are sampled synchronously by the owning CPU interface.
+// No detached worker may retain a KProcess or walk a live thread list.
 void ReportRecompCoverage() {
-    const std::string report = FormatRecompCoverage();
-    if (!report.empty()) {
-        WriteRecompCoverageFile(report);
-        // Split by hand: the report is already newline-delimited and the logger
-        // takes one line at a time.
-        size_t pos = 0;
-        while (pos < report.size()) {
-            const size_t nl = report.find('\n', pos);
-            const std::string_view line{report.data() + pos,
-                                        (nl == std::string::npos ? report.size() : nl) - pos};
-            if (!line.empty()) {
-                LOG_INFO(Core_ARM, "{}", line);
-            }
-            if (nl == std::string::npos) {
-                break;
-            }
-            pos = nl + 1;
-        }
+    if (const auto gg = RecompGuardGen::GetStats(); gg.modules != 0) {
+        using R = RecompGuardGen::Reason;
+        const auto n = [&gg](R r) { return gg.bumps[static_cast<unsigned>(r)]; };
+        LOG_INFO(Core_ARM,
+                 "recomp generation guard: enabled={} active={} generation={} modules={} "
+                 "sticky={} bumps: activate={} map={} unmap={} protect={} device={} "
+                 "invalidate={} invalidate_all={} new_table={} code_write={} pointer={} "
+                 "jit={} map_log={}{}",
+                 gg.enabled, gg.active, gg.generation, gg.modules, gg.sticky, n(R::Activate),
+                 n(R::Map), n(R::Unmap), n(R::Protect), n(R::DeviceMap), n(R::Invalidate),
+                 n(R::InvalidateAll), n(R::PageTableSwap), n(R::CodeWrite),
+                 n(R::PointerExposed), n(R::JitFallback), gg.map_log,
+                 gg.map_log_overflow ? " (overflowed)" : "");
     }
-    WriteRecompExecutionJson({});
+    const std::string report = FormatRecompCoverage();
+    if (report.empty()) {
+        return;
+    }
+    WriteRecompCoverageFile(report);
+    // Split by hand: the report is already newline-delimited and the logger
+    // takes one line at a time.
+    size_t pos = 0;
+    while (pos < report.size()) {
+        const size_t nl = report.find('\n', pos);
+        const std::string_view line{report.data() + pos,
+                                    (nl == std::string::npos ? report.size() : nl) - pos};
+        if (!line.empty()) {
+            LOG_INFO(Core_ARM, "{}", line);
+        }
+        if (nl == std::string::npos) {
+            break;
+        }
+        pos = nl + 1;
+    }
 }
 
 } // namespace
 
+RecompExecutionStats GetRecompExecutionStats() {
+    return {
+        TotalStaticBlocks(),
+        g_counters.svc_calls.load(std::memory_order_relaxed),
+        g_counters.fallback_from_miss.load(std::memory_order_relaxed),
+        g_counters.fallback_from_unhandled.load(std::memory_order_relaxed),
+        g_counters.no_fallback_available.load(std::memory_order_relaxed),
+    };
+}
+
+std::array<u64, 4> GetRecompCurrentPcs() {
+    std::array<u64, 4> result{};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        result[index] = g_current_pcs[index].load(std::memory_order_relaxed);
+    }
+    return result;
+}
+
 void SetRecompLookup(RecompLookupFn lookup) {
+    std::scoped_lock lock{g_process_init_lock};
+    g_code_guard_ready.store(false, std::memory_order_release);
+    g_fastmem_ready.store(false, std::memory_order_release);
+    // The previous bundle's images may be unloaded; drop them untouched.
+    RecompGuardGen::Forget();
+    g_fpx_ready.store(false, std::memory_order_release);
     g_recomp_lookup.store(lookup, std::memory_order_release);
+}
+
+void SetRecompLongSlices(bool enabled) {
+    g_recomp_chain_budget.store(enabled ? 4096 : 32, std::memory_order_relaxed);
+}
+
+void SetRecompCodeGuardReady(bool ready) {
+    g_code_guard_ready.store(ready, std::memory_order_release);
+}
+
+bool IsRecompCodeGuardReady() {
+    return g_code_guard_ready.load(std::memory_order_acquire);
+}
+
+RecompFastmemLayout GetRecompFastmemLayout() {
+    return RecompFastmemLayout{
+        static_cast<u32>(Memory::YUZU_PAGEBITS),
+        5, // log2(sizeof(Common::PageTable::PageEntryData)), pinned above
+        static_cast<u64>(~uintptr_t{0} << Common::PageTable::ATTRIBUTE_BITS),
+        static_cast<u32>(offsetof(GuestContextView, fm_table)),
+        static_cast<u32>(offsetof(GuestContextView, fm_limit)),
+    };
+}
+
+void SetRecompFastmemReady(bool ready) {
+    g_fastmem_ready.store(ready, std::memory_order_release);
+}
+
+RecompFpxLayout GetRecompFpxLayout() {
+    return RecompFpxLayout{
+        static_cast<u32>(offsetof(GuestContextView, fpcr)),
+        static_cast<u32>(offsetof(GuestContextView, fpsr)),
+        kFpxInhibit,
+    };
+}
+
+void SetRecompFpxReady(bool ready) {
+    g_fpx_ready.store(ready, std::memory_order_release);
+}
+
+bool IsRecompFpxReady() {
+    return g_fpx_ready.load(std::memory_order_acquire);
+}
+
+bool IsRecompFastmemReady() {
+    return g_fastmem_ready.load(std::memory_order_acquire);
+}
+
+namespace {
+
+const char* PinCauseName(RecompGuardGen::PinCause cause) {
+    switch (cause) {
+    case RecompGuardGen::PinCause::Untracked:
+        return "untracked table (its pointer was never seen by OnPageTableSwap)";
+    case RecompGuardGen::PinCause::MapLogOverflow:
+        return "untracked: live-mapping log overflowed before activation";
+    case RecompGuardGen::PinCause::ExposuresOverflow:
+        return "untracked: pre-activation raw-pointer log overflowed";
+    case RecompGuardGen::PinCause::NotFirstActivation:
+        return "untracked: a process already activated under this registration";
+    case RecompGuardGen::PinCause::Hole:
+        return "span not wholly mapped read/execute-only at activation";
+    case RecompGuardGen::PinCause::Rebased:
+        return "rebased since activation";
+    case RecompGuardGen::PinCause::AliasAtActivation:
+        return "aliased (another live mapping of its physical pages)";
+    case RecompGuardGen::PinCause::ExposedBeforeActivation:
+        return "raw pointer exposed before activation";
+    case RecompGuardGen::PinCause::Map:
+        return "mapped over (or aliased by) a new mapping";
+    case RecompGuardGen::PinCause::Unmap:
+        return "unmapped";
+    case RecompGuardGen::PinCause::Protect:
+        return "made writable";
+    case RecompGuardGen::PinCause::DeviceMap:
+        return "device-mapped";
+    case RecompGuardGen::PinCause::PointerExposed:
+        return "raw pointer exposed after activation";
+    case RecompGuardGen::PinCause::JitFallback:
+        return "JIT fallback created";
+    }
+    return "unknown";
+}
+
+// Registered once, process-wide: names the rule from DESIGN.md section 2 the
+// first time each module goes sticky, so a log says why instead of just that
+// it did. Info level, one line per module, never per access.
+void EnsureGuardGenPinLogger() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        RecompGuardGen::SetPinLogger([](std::size_t module_index, RecompGuardGen::PinCause cause,
+                                        u64 addr) {
+            if (addr != 0) {
+                LOG_INFO(Core_ARM,
+                         "recomp generation guard: module {} pinned to verify-always: {} "
+                         "(addr={:#x}, page={:#x})",
+                         module_index, PinCauseName(cause), addr, addr >> Memory::YUZU_PAGEBITS);
+            } else {
+                LOG_INFO(Core_ARM, "recomp generation guard: module {} pinned to verify-always: {}",
+                         module_index, PinCauseName(cause));
+            }
+        });
+        RecompGuardGen::SetTableSeenLogger([](const void* table, std::size_t known_tables) {
+            LOG_INFO(Core_ARM,
+                     "recomp generation guard: OnPageTableSwap saw table={} ({} table(s) known)",
+                     table, known_tables);
+        });
+    });
+}
+
+} // namespace
+
+bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules) {
+    EnsureGuardGenPinLogger();
+    const bool enabled = !kGuardGenDisabled && !modules.empty() &&
+                         g_code_guard_ready.load(std::memory_order_acquire);
+    const size_t count = modules.size();
+    RecompGuardGen::SetModules(std::move(modules), enabled);
+    if (count != 0) {
+        LOG_INFO(Core_ARM, "Recompiled generation code guard: {} ({} module(s){})",
+                 enabled ? "negotiated" : "verify on every entry", count,
+                 kGuardGenDisabled ? ", disabled by SUYU_RECOMP_GUARD_GEN=0" : "");
+    }
+    return enabled;
 }
 
 void SetRecompBaseSetter(RecompBaseFn setter) {
     g_recomp_base_setter.store(setter, std::memory_order_release);
 }
 
+RecompLiveStats GetRecompLiveStats() {
+    return RecompLiveStats{
+        TotalStaticBlocks(),
+        g_counters.fallback_from_miss.load(std::memory_order_relaxed) +
+            g_counters.fallback_from_unhandled.load(std::memory_order_relaxed),
+        g_forced_cutoff_pc.load(std::memory_order_relaxed),
+        g_forced_cutoff_blocks.load(std::memory_order_relaxed),
+        g_live_instances.load(std::memory_order_relaxed) > 0,
+#ifdef SUYU_NO_JIT
+        false,
+#else
+        true,
+#endif
+        StrictNoFallback(),
+    };
+}
+
+void SetRecompPrepareCallback(RecompPrepareFn callback) {
+    g_recomp_prepare.store(callback, std::memory_order_release);
+}
+
+bool HasRecompPrepareCallback() {
+    return g_recomp_prepare.load(std::memory_order_acquire) != nullptr;
+}
+
 RecompLookupFn GetRecompLookup() {
     return g_recomp_lookup.load(std::memory_order_acquire);
 }
 
-RecompExecutionMetrics GetRecompExecutionMetrics() {
-    RecompExecutionMetrics m;
-    m.aot_block_executions = SumCounter(g_lifetime.static_blocks, g_counters.static_blocks);
-    m.aot_time_ns = SumCounter(g_lifetime.aot_time_ns, g_counters.aot_time_ns);
-    m.dynarmic_run_slices =
-        SumCounter(g_lifetime.dynarmic_run_slices, g_counters.dynarmic_run_slices);
-    m.dynarmic_step_slices =
-        SumCounter(g_lifetime.dynarmic_step_slices, g_counters.dynarmic_step_slices);
-    m.dynarmic_time_ns = SumCounter(g_lifetime.dynarmic_time_ns, g_counters.dynarmic_time_ns);
-    m.aot_to_dynarmic = SumCounter(g_lifetime.aot_to_dynarmic, g_counters.aot_to_dynarmic);
-    m.dynarmic_to_aot = SumCounter(g_lifetime.jit_to_static, g_counters.jit_to_static);
-    m.fallback_lookup_miss = SumCounter(g_lifetime.fallback_from_miss, g_counters.fallback_from_miss);
-    m.fallback_unhandled_opcode =
-        SumCounter(g_lifetime.fallback_from_unhandled, g_counters.fallback_from_unhandled);
-    m.fallback_icache_rejected =
-        SumCounter(g_lifetime.fallback_from_icache_reject, g_counters.fallback_from_icache_reject);
-    m.fallback_no_backend =
-        SumCounter(g_lifetime.no_fallback_available, g_counters.no_fallback_available);
-    m.unresolved_import_traps =
-        SumCounter(g_lifetime.unresolved_import_traps, g_counters.unresolved_import_traps);
-    m.svc_calls = SumCounter(g_lifetime.svc_calls, g_counters.svc_calls);
-    m.clear_instruction_cache_calls =
-        SumCounter(g_lifetime.clear_instruction_cache, g_counters.clear_instruction_cache);
-    m.invalidate_cache_range_calls =
-        SumCounter(g_lifetime.invalidate_cache_range, g_counters.invalidate_cache_range);
-    m.aot_range_rejects =
-        SumCounter(g_lifetime.aot_range_rejects, g_counters.aot_range_rejects);
-    m.permanent_aot_reject_events =
-        SumCounter(g_lifetime.permanent_aot_reject, g_counters.permanent_aot_reject);
-    m.jit_halt_cache_invalidation =
-        SumCounter(g_lifetime.jit_halt_cache_invalidation, g_counters.jit_halt_cache_invalidation);
-    return m;
-}
-
-std::filesystem::path DefaultRecompExecutionJsonPath() {
-    if (const char* env = std::getenv("SUYU_RECOMP_EXECUTION_JSON"); env && env[0] != '\0') {
-        return std::filesystem::path{env};
-    }
-    return Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_execution.json";
-}
-
-std::string FormatRecompExecutionJson() {
-    const RecompExecutionMetrics m = GetRecompExecutionMetrics();
-    const auto modules = MergedModules();
-    const auto unhandled = MergedU32Hist(&RecompCounters::unhandled_insn);
-    const auto svcs = MergedU32Hist(&RecompCounters::svc_numbers);
-    const auto misses = MergedU64Hist(&RecompCounters::miss_pc);
-
-    nlohmann::json miss_arr = nlohmann::json::array();
-    for (const auto& [pc, count] : TopN(misses, 64)) {
-        nlohmann::json row{
-            {"pc", fmt::format("{:#018x}", pc)},
-            {"count", count},
-        };
-        if (const std::string resolved = ResolvePc(pc, modules); !resolved.empty()) {
-            row["module"] = resolved;
-        }
-        miss_arr.push_back(std::move(row));
-    }
-
-    nlohmann::json module_arr = nlohmann::json::array();
-    for (const auto& [base, name] : modules) {
-        module_arr.push_back({
-            {"base", fmt::format("{:#018x}", base)},
-            {"name", name},
-        });
-    }
-
-    nlohmann::json svc_arr = nlohmann::json::array();
-    for (const auto& [num, count] : TopN(svcs, 16)) {
-        svc_arr.push_back({
-            {"imm", fmt::format("0x{:02X}", num)},
-            {"count", count},
-        });
-    }
-
-    const nlohmann::json doc{
-        {"schema_version", RecompExecutionMetrics::kSchemaVersion},
-        {"kind", "recomp_execution"},
-        {"clock", "steady_clock"},
-        {"backends",
-         {{"aot",
-           {{"block_executions", m.aot_block_executions}, {"time_ns", m.aot_time_ns}}},
-          {"dynarmic",
-           {{"run_slices", m.dynarmic_run_slices},
-            {"step_slices", m.dynarmic_step_slices},
-            {"time_ns", m.dynarmic_time_ns}}}}},
-        {"transitions",
-         {{"aot_to_dynarmic", m.aot_to_dynarmic}, {"dynarmic_to_aot", m.dynarmic_to_aot}}},
-        {"fallback_reasons",
-         {{"lookup_miss", m.fallback_lookup_miss},
-          {"unhandled_opcode", m.fallback_unhandled_opcode},
-          {"icache_rejected", m.fallback_icache_rejected},
-          {"no_fallback_available", m.fallback_no_backend}}},
-        {"icache",
-         {{"clear_instruction_cache_calls", m.clear_instruction_cache_calls},
-          {"invalidate_cache_range_calls", m.invalidate_cache_range_calls},
-          {"aot_range_rejects", m.aot_range_rejects},
-          {"permanent_aot_reject_events", m.permanent_aot_reject_events},
-          {"jit_halt_cache_invalidation", m.jit_halt_cache_invalidation}}},
-        {"svc_calls", m.svc_calls},
-        {"unresolved_import_traps", m.unresolved_import_traps},
-        {"unhandled_opcodes", JsonTopU32(unhandled, "insn", 64)},
-        {"svc_numbers", {{"top", svc_arr}, {"distinct", svcs.size()}}},
-        {"miss_pcs", {{"top", miss_arr}, {"distinct", misses.size()}}},
-        {"modules", module_arr},
-    };
-    return doc.dump(2);
-}
-
-bool WriteRecompExecutionJson(const std::filesystem::path& path) {
-    const std::filesystem::path dest = path.empty() ? DefaultRecompExecutionJsonPath() : path;
-    if (!Common::FS::CreateParentDirs(dest)) {
-        return false;
-    }
-    std::filesystem::path tmp = dest;
-    tmp += ".tmp";
-    {
-        std::ofstream out;
-        Common::FS::OpenFileStream(out, tmp, std::ios_base::out | std::ios_base::trunc);
-        if (!out) {
-            return false;
-        }
-        out << FormatRecompExecutionJson();
-        out.flush();
-        if (!out) {
-            out.close();
-            Common::FS::RemoveFile(tmp);
-            return false;
-        }
-    }
-    // RenameFile refuses an existing dest; drop the previous snapshot first.
-    if (!Common::FS::RemoveFile(dest)) {
-        Common::FS::RemoveFile(tmp);
-        return false;
-    }
-    if (!Common::FS::RenameFile(tmp, dest)) {
-        Common::FS::RemoveFile(tmp);
-        return false;
-    }
-    return true;
-}
-
 struct ArmRecomp::Impl {
-    Impl(System& system_, RecompLookupFn lookup_, Kernel::KProcess* process)
-        : system{system_}, lookup{lookup_}, process_state{AcquireProcessState(process)},
-          icache{process_state->icache} {
+    Impl(System& system_, RecompLookupFn lookup_) : system{system_}, lookup{lookup_} {
         std::memset(&ctx, 0, sizeof(ctx));
         ctx.pending_svc = kNoPendingSvc;
         // Point the recompiled code at the emulator's address space.
@@ -860,6 +903,7 @@ struct ArmRecomp::Impl {
         // Filled in by RefreshPageTable once a process exists; until then the
         // fields stay null and every access takes the callback path.
         bridge.page_entries = nullptr;
+        bridge.guard_generation = nullptr;
         ctx.host_mem = &bridge;
     }
 
@@ -952,11 +996,60 @@ struct ArmRecomp::Impl {
     /// space, so it is refreshed rather than cached forever.
     void RefreshPageTable() {
         const auto view = system.ApplicationMemory().GetPageTableView();
+        // ABI 5 checks the instruction bytes against this mapping on every entry.
         bridge.page_entries = view.entries;
         bridge.page_entry_stride = view.entry_stride;
         bridge.page_bits = view.page_bits;
         bridge.pointer_mask = view.pointer_mask;
         bridge.address_space_max = view.address_space_max;
+        if (kSlowPathAbove != 0 && kSlowPathAbove < bridge.address_space_max &&
+            TotalStaticBlocks() >= kSlowPathAfterBlocks) {
+            bridge.address_space_max = kSlowPathAbove;
+        }
+        // ABI 6 (FM1). The generated helpers read the table with its layout
+        // folded in as constants, so enable them only for a table that has that
+        // layout. The limit is the ABI 5 walk's own limit (after any diagnostic
+        // lowering above) rounded down to a page, so the fast path serves a
+        // subset of what that walk serves and declines everything else to it.
+        ctx.fm_table = nullptr;
+        ctx.fm_limit = 0;
+        if (!kFastmemDisabled && g_fastmem_ready.load(std::memory_order_acquire) &&
+            bridge.page_entries != nullptr && bridge.page_bits == Memory::YUZU_PAGEBITS &&
+            bridge.page_entry_stride == sizeof(Common::PageTable::PageEntryData) &&
+            bridge.pointer_mask == GetRecompFastmemLayout().pointer_mask &&
+            bridge.address_space_max <= (u64{1} << 39)) {
+            ctx.fm_table = static_cast<const u8*>(bridge.page_entries);
+            ctx.fm_limit = bridge.address_space_max & ~u64{0xfff};
+        }
+    }
+
+    /// ABI 6 GG1 activation for `process`. Decided entirely from what the
+    /// Core::Memory hooks recorded since the process's table was created: a
+    /// kernel query here would take the page-table KLightLock, and a contended
+    /// KLightLock reschedules, which inside RunThread could enter this core's
+    /// RunThread again for another guest thread.
+    void ActivateGuardGen(Kernel::KProcess& process, u64 key) {
+        // Watch every page of each stable module's span: GG1 stores there go to
+        // HostStore, and Core::Memory reports writes and raw pointers there.
+        auto& entries = process.GetPageTable().GetImpl().entries;
+        const auto watch = [&entries](u64 va, u64 size) {
+            const u64 first = va >> Memory::YUZU_PAGEBITS;
+            const u64 last = (va + size - 1) >> Memory::YUZU_PAGEBITS;
+            for (u64 page = first; page <= last && page < entries.size(); ++page) {
+                reinterpret_cast<std::atomic<u64>*>(&entries[page].recomp_watch)
+                    ->store(1, std::memory_order_relaxed);
+            }
+        };
+        const void* const activate_table = process.GetMemory().GetPageTableView().entries;
+        LOG_INFO(Core_ARM, "recomp generation guard: process {} activating against table={}",
+                 process.GetProcessId(), activate_table);
+        RecompGuardGen::Activate(key, activate_table, watch);
+        const auto stats = RecompGuardGen::GetStats();
+        LOG_INFO(Core_ARM,
+                 "recomp generation guard: process {} active={} generation={}; {} of {} "
+                 "module(s) verify on every entry",
+                 process.GetProcessId(), stats.active, stats.generation, stats.sticky,
+                 stats.modules);
     }
 
     /// The same source DynarmicCallbacks64::GetCNTPCT uses, so a guest thread
@@ -972,18 +1065,95 @@ struct ArmRecomp::Impl {
         }
     }
 
+    /// Report a static-executed access to an address the guest has not mapped.
+    ///
+    /// The emitted code resolves a mapped access through the page table inline,
+    /// so only an unmapped one reaches these callbacks at all. Such an access
+    /// is not a guest bug: it means some earlier translated instruction put a
+    /// value in a register that the real hardware would never have produced.
+    /// The PC trail is the shortest route from the bad address back to the
+    /// instruction that computed it, and it is already maintained for misses.
+    static void ReportUnmapped(Impl* self, u64 va, u32 size, const char* what) {
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) >= 8) {
+            return;
+        }
+        std::string trail;
+        const size_t count = std::min<size_t>(self->trail_pos, Impl::kTrail);
+        for (size_t i = 0; i < count; ++i) {
+            trail += fmt::format("{:#x} ",
+                                 self->trail[(self->trail_pos - count + i) & (Impl::kTrail - 1)]);
+        }
+        LOG_ERROR(Core_ARM, "recomp unmapped {}{} @ {:#x} from pc={:#x} after {} blocks", what,
+                  size * 8, va, self->ctx.pc, TotalStaticBlocks());
+        LOG_ERROR(Core_ARM, "recomp unmapped PC trail (oldest first): {}", trail);
+        for (size_t r = 0; r < 32; r += 4) {
+            LOG_ERROR(Core_ARM,
+                      "recomp unmapped regs x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} "
+                      "x{:<2}={:#018x}",
+                      r, self->ctx.x[r], r + 1, self->ctx.x[r + 1], r + 2, self->ctx.x[r + 2],
+                      r + 3, self->ctx.x[r + 3]);
+        }
+    }
+
     static u64 HostLoad(void* user, u64 va, u32 size) {
-        auto& memory = static_cast<Impl*>(user)->system.ApplicationMemory();
+        va &= 0xffffffffffffULL;
+        const u32 bytes = size == 0 ? 4 : size;
+        // Size zero is the negotiated guard-v2 instruction read. All other
+        // widths must be architectural scalar sizes, with no 48-bit wrap.
+        if ((size != 0 && size != 1 && size != 2 && size != 4 && size != 8) ||
+            bytes > 0x1000000000000ULL - va) {
+            return 0;
+        }
+        auto* self = static_cast<Impl*>(user);
+        auto& memory = self->system.ApplicationMemory();
+        if (size == 0) {
+            // Validity is per guest page, so the word's first and last bytes
+            // cover it; they are the same page unless the word straddles one.
+            if (!memory.IsValidVirtualAddress(va) ||
+                !memory.IsValidVirtualAddress(va + bytes - 1)) {
+                return 0;
+            }
+            return (u64{1} << 32) | memory.Read32(va);
+        }
+        if (!memory.IsValidVirtualAddress(va)) {
+            ReportUnmapped(self, va, size, "read");
+        }
+        // Memory's scalar accessors split unaligned accesses across guest
+        // pages. Preserve them rather than imposing byte loads on all reads.
         switch (size) {
         case 1: return memory.Read8(va);
         case 2: return memory.Read16(va);
         case 4: return memory.Read32(va);
-        default: return memory.Read64(va);
+        default: return memory.Read64(va); // Validated size == 8.
         }
     }
 
     static void HostStore(void* user, u64 va, u32 size, u64 value) {
-        auto& memory = static_cast<Impl*>(user)->system.ApplicationMemory();
+        va &= 0xffffffffffffULL;
+        if ((size != 1 && size != 2 && size != 4 && size != 8) ||
+            size > 0x1000000000000ULL - va) {
+            return;
+        }
+        if (kTrapStoreLo != 0 && va >= kTrapStoreLo && va < kTrapStoreHi) {
+            auto* self = static_cast<Impl*>(user);
+            std::string trail;
+            const size_t count = std::min<size_t>(self->trail_pos, Impl::kTrail);
+            for (size_t i = 0; i < count; ++i) {
+                trail += fmt::format("{:#x} ",
+                                     self->trail[(self->trail_pos - count + i) & (Impl::kTrail - 1)]);
+            }
+            LOG_ERROR(Core_ARM,
+                      "recomp TRAP store {:#x} size={} value={:#x} from block pc={:#x} blocks={} "
+                      "x19={:#x} x0={:#x} x1={:#x} x8={:#x} lr={:#x} trail={}",
+                      va, size, value, self->ctx.pc, TotalStaticBlocks(), self->ctx.x[19],
+                      self->ctx.x[0], self->ctx.x[1], self->ctx.x[8], self->ctx.x[30], trail);
+        }
+        auto* self = static_cast<Impl*>(user);
+        auto& memory = self->system.ApplicationMemory();
+        if (!memory.IsValidVirtualAddress(va)) {
+            ReportUnmapped(self, va, size, "write");
+        }
         switch (size) {
         case 1: memory.Write8(va, static_cast<u8>(value)); break;
         case 2: memory.Write16(va, static_cast<u16>(value)); break;
@@ -1000,22 +1170,6 @@ struct ArmRecomp::Impl {
             modules_read = true;
             if (auto* process = thread->GetOwnerProcess()) {
                 modules = FindModules(process);
-                // Debug names embedded in rodata are not ExeFS identities:
-                // "main" may call itself "Sonic Mania NX.nss", and two
-                // different modules may both call themselves "nnSdk". Use
-                // the loader's actual filename/base map for the application,
-                // otherwise most images never get a base (or share one).
-                Loader::AppLoader::Modules loaded_modules;
-                // TryGetAppLoader: no title is loaded in the stack harness.
-                if (process == system.ApplicationProcess()) {
-                    if (auto* loader = system.TryGetAppLoader();
-                        loader &&
-                        loader->ReadNSOModules(loaded_modules) ==
-                            Loader::ResultStatus::Success &&
-                        !loaded_modules.empty()) {
-                        modules = std::move(loaded_modules);
-                    }
-                }
                 g_counters.RecordModules(modules);
                 // Now that the loader has placed everything, tell each image
                 // where its own module went.
@@ -1024,8 +1178,6 @@ struct ArmRecomp::Impl {
                     size_t index = 0;
                     for (const auto& [module_base, name] : modules) {
                         setter(index++, name.c_str(), module_base);
-                        LOG_INFO(Core_ARM, "recomp: registered module '{}' at {:#x}", name,
-                                 module_base);
                     }
                 }
             }
@@ -1039,22 +1191,60 @@ struct ArmRecomp::Impl {
         return base;
     }
 
+    // Is `pc` inside the main module? There is no module literally named
+    // "main" - Smash's is `cross2_Release.nss` - so it is identified by load
+    // order instead: the NSO layout is rtld, main, subsdk*, sdk, and `modules`
+    // is keyed by base, so main is the second entry. The next base bounds it.
+    bool PcInMainModule(u64 pc) const {
+        if (modules.size() < 2) {
+            return false;
+        }
+        auto it = std::next(modules.begin());
+        const auto next = std::next(it);
+        const u64 end = (next != modules.end()) ? next->first : it->first + 0x10000000ULL;
+        return pc >= it->first && pc < end;
+    }
+
     struct DynInfo {
         u64 mod_base = 0;
         u64 rela_va = 0, rela_sz = 0, rela_ent = 24, rela_sz_va = 0;
         u64 jmprel_va = 0, jmprel_sz = 0, jmprel_ent = 24, jmprel_sz_va = 0;
         u64 symtab_va = 0, strtab_va = 0;
+        // Address of a harmless "return 0" stub inside this module's own text,
+        // used as the target for every import that could not be resolved.
+        u64 trap_va = 0;
+        std::string name;
     };
 
-    bool ConsumeUnresolvedImportTrap() {
-        if (!suyu::recomp::IsUnresolvedImportTrap(ctx.pc)) {
-            return false;
+    // Find an existing `mov x0, #0; ret` (or failing that, a bare `ret`) in a
+    // module's text and hand back its address.
+    //
+    // Unresolved imports have to point somewhere, and the address has to be one
+    // BOTH execution engines can survive: the recompiled dispatcher can
+    // special-case a magic sentinel, but the dynarmic fallback cannot - it just
+    // tries to translate the address and dies with "cannot execute instruction
+    // at unmapped address". Reusing a real instruction pair the module already
+    // contains sidesteps that entirely: it is mapped, executable, and returns to
+    // the caller under any engine, with no per-engine handling and nothing
+    // written into guest memory. Most entries in a large import table exist for
+    // code paths a given boot never takes, so failing soft here is what keeps a
+    // partially-resolvable module bootable at all.
+    u64 FindReturnStub(u64 mod_base) {
+        auto& mem = system.ApplicationMemory();
+        constexpr u32 kMovX0Zero = 0xD2800000, kRet = 0xD65F03C0;
+        // Text sits at the front of every NSO; a module without a matching pair
+        // in its first megabyte does not have one worth scanning further for.
+        constexpr u64 kScanLimit = 0x100000;
+        u64 bare_ret = 0;
+        for (u64 off = 0; off < kScanLimit; off += 4) {
+            const u32 insn = mem.Read32(mod_base + off);
+            if (insn == kRet) {
+                if (!bare_ret) bare_ret = mod_base + off;
+            } else if (insn == kMovX0Zero && mem.Read32(mod_base + off + 4) == kRet) {
+                return mod_base + off;
+            }
         }
-        const auto hit =
-            suyu::recomp::TakeUnresolvedImportTrap(ctx.x[0], ctx.x[30], unresolved_imports);
-        g_counters.unresolved_import_traps.fetch_add(1, std::memory_order_relaxed);
-        LOG_CRITICAL(Core_ARM, "{}", hit.diagnostic);
-        return true;
+        return bare_ret;
     }
 
     // Locate a module's MOD0 header and parse its .dynamic section. Returns
@@ -1112,8 +1302,8 @@ struct ArmRecomp::Impl {
     struct SymInfo {
         std::string name;
         u64 value = 0;
-        u8 info = 0;
         bool defined = false;
+        bool weak = false;
     };
     SymInfo ReadSymbol(const DynInfo& d, u32 index) {
         auto& mem = system.ApplicationMemory();
@@ -1121,7 +1311,6 @@ struct ArmRecomp::Impl {
         if (!d.symtab_va) return s;
         const u64 sym_va = d.symtab_va + static_cast<u64>(index) * 24;
         const u32 name_off = mem.Read32(sym_va);
-        s.info = mem.Read8(sym_va + 4);
         // st_shndx is a 2-byte field at offset 6 (st_name(4) st_info(1)
         // st_other(1) st_shndx(2) st_value(8) st_size(8)) - reading 4 bytes
         // here previously spilled into st_value's low bytes, corrupting the
@@ -1130,6 +1319,10 @@ struct ArmRecomp::Impl {
         const u16 shndx = mem.Read16(sym_va + 6);
         s.value = mem.Read64(sym_va + 8);
         s.defined = shndx != 0; // SHN_UNDEF == 0
+        // st_info is the byte at +4; the binding is its high nibble.
+        // STB_WEAK == 2. An undefined weak symbol must resolve to 0, which is
+        // how the guest's own rtld leaves it - see the fallthrough below.
+        s.weak = (static_cast<u8>(mem.Read8(sym_va + 4)) >> 4) == 2;
         if (d.strtab_va) {
             std::string name;
             for (u64 i = 0; i < 512; ++i) {
@@ -1187,13 +1380,23 @@ struct ArmRecomp::Impl {
                 mem.Write64(d.mod_base + r_offset, d.mod_base + r_addend);
                 ++applied;
             } else if (r_type == R_AARCH64_IRELATIVE) {
+                // IRELATIVE (ifunc): r_addend is a RESOLVER function's address,
+                // not the final target - the correct behaviour is to call it
+                // (no args, AAPCS64) and store whatever it returns. Actually
+                // invoking guest code from inside relocation application would
+                // need a full nested-call machinery this backend doesn't have,
+                // so - same as a genuinely-unresolved import - patch to the
+                // trap sentinel instead of leaving the GOT slot as raw
+                // pre-relocation file content. Previously this relocation type
+                // matched none of the branches below and was silently skipped
+                // entirely, which is exactly how a BLR through this slot ended
+                // up jumping to a small leftover file value (e.g. 0xe7ff0)
+                // instead of either a real function or a diagnosable trap.
                 LOG_ERROR(Core_ARM,
                           "recomp: IRELATIVE relocation at module base={:#x} offset={:#x} not "
-                          "invoked (resolver call unsupported)",
+                          "invoked (resolver call unsupported); trapped instead",
                           d.mod_base, r_offset);
-                unresolved_imports.push_back(
-                    {"", d.mod_base, r_offset, suyu::recomp::UnresolvedReloc::Irelative});
-                mem.Write64(d.mod_base + r_offset, suyu::recomp::UnresolvedSlotTarget());
+                mem.Write64(d.mod_base + r_offset, d.trap_va ? d.trap_va : kUnresolvedImportTrap);
             } else if (r_type == R_AARCH64_GLOB_DAT || r_type == R_AARCH64_JUMP_SLOT ||
                        r_type == R_AARCH64_ABS64) {
                 const auto sym = ReadSymbol(d, r_sym);
@@ -1245,12 +1448,6 @@ struct ArmRecomp::Impl {
                 } else if (auto it = exports.find(sym.name); it != exports.end()) {
                     mem.Write64(d.mod_base + r_offset, it->second + addend);
                     ++applied;
-                } else if (const auto weak =
-                               suyu::recomp::ResolveUndefinedWeakSymbol(sym.info, addend)) {
-                    // SDK optional hooks test their GOT entry for null before
-                    // calling. A trap address makes that test pass and crashes.
-                    mem.Write64(d.mod_base + r_offset, *weak);
-                    ++applied;
                 } else if (r_type == R_AARCH64_ABS64 && r_sym == 0) {
                     // STN_UNDEF ABS64: S is 0 by definition, so the result is
                     // the addend alone - a plain absolute constant, not a
@@ -1263,12 +1460,28 @@ struct ArmRecomp::Impl {
                         LOG_ERROR(Core_ARM, "recomp: unresolved GOT/PLT symbol '{}' for module base={:#x}",
                                   sym.name.empty() ? "<no name>" : sym.name, d.mod_base);
                     }
-                    const auto kind = (r_type == R_AARCH64_ABS64) ? suyu::recomp::UnresolvedReloc::Abs64
-                                    : (r_type == R_AARCH64_GLOB_DAT)
-                                          ? suyu::recomp::UnresolvedReloc::GlobDat
-                                          : suyu::recomp::UnresolvedReloc::JumpSlot;
-                    unresolved_imports.push_back({sym.name, d.mod_base, r_offset, kind});
-                    mem.Write64(d.mod_base + r_offset, suyu::recomp::UnresolvedSlotTarget());
+                    // An undefined *weak* symbol resolves to 0 by ABI, and that
+                    // is what rtld leaves under dynarmic. Patching it to a
+                    // callable stub instead breaks the `if (&weak) weak(...)`
+                    // idiom: the null check passes and the guest calls a
+                    // function that only returns 0. Smash guards
+                    // nu::VirtualAllocHook/VirtualFreeHook that way at 5489
+                    // sites on its allocator path, so every allocation took the
+                    // hook branch and got nothing back.
+                    // Strong symbols keep the trap sentinel.
+                    const u64 stub =
+                        sym.weak ? 0 : (d.trap_va ? d.trap_va : kUnresolvedImportTrap);
+                    mem.Write64(d.mod_base + r_offset, stub);
+                    // The trap counter cannot report this case - it is only
+                    // written when a thread actually reaches kUnresolvedImportTrap,
+                    // and FindReturnStub always succeeds, so the guest calls a
+                    // real `mov x0,#0; ret` and nothing is ever counted. Record
+                    // the slot address instead, so a later poll can say whether
+                    // anything (nn::ro binding an NRO, say) ever wrote over it.
+                    if (!kTrackSlotPrefix.empty() &&
+                        sym.name.rfind(kTrackSlotPrefix, 0) == 0) {
+                        diagnostics.TrackSlot(d.mod_base + r_offset, stub, sym.name);
+                    }
                 }
             }
         }
@@ -1291,12 +1504,24 @@ struct ArmRecomp::Impl {
         for (const auto& [module_base, name] : all_modules) {
             DynInfo d;
             if (ParseDynamic(module_base, d)) {
+                d.trap_va = FindReturnStub(module_base);
+                d.name = name;
                 IndexExports(d, exports);
                 dyns.push_back(d);
             }
         }
         for (const auto& d : dyns) {
             u32 applied = 0, unresolved = 0;
+            const bool is_rtld = d.name.find("rtld") != std::string::npos;
+            if (kRelaPolicy == "rtld-only" && !is_rtld) {
+                // Left for rtld. Touching neither the entries nor the sizes is
+                // the whole point: rtld has to see this module exactly as it
+                // would under dynarmic, including whatever it records about
+                // which imports are still deferred, or nn::ro cannot bind them
+                // when an NRO turns up later.
+                LOG_INFO(Core_ARM, "recomp: leaving {} base={:#x} to rtld", d.name, d.mod_base);
+                continue;
+            }
             if (d.rela_va && d.rela_sz) {
                 ApplyRelocTable(d, d.rela_va, d.rela_sz, d.rela_ent, exports, applied, unresolved);
             }
@@ -1311,15 +1536,73 @@ struct ArmRecomp::Impl {
             // finding them already resolved by us trips that check and it
             // calls svcBreak, which is what was hanging every recompiled
             // game at boot despite relocations succeeding.
-            if (d.rela_sz_va) mem.Write64(d.rela_sz_va, 0);
-            if (d.jmprel_sz_va) mem.Write64(d.jmprel_sz_va, 0);
+            //
+            // That hang is rtld double-relocating *itself*: its hand-written
+            // bootstrap loop runs before its C++ machinery and is not
+            // idempotent. Every other module is relocated by the C++ pass,
+            // which recomputes each slot from the rela entry rather than
+            // accumulating into it, so re-running it over our results is a
+            // no-op. Zeroing those modules too is what leaves nn::ro unable to
+            // bind main's deferred imports when an NRO shows up later.
+            if (kRelaPolicy == "zero-all" || kRelaPolicy == "restore-on-main" ||
+                ((kRelaPolicy == "zero-rtld" || kRelaPolicy == "rtld-only") && is_rtld)) {
+                if (d.rela_sz_va) mem.Write64(d.rela_sz_va, 0);
+                if (d.jmprel_sz_va) mem.Write64(d.jmprel_sz_va, 0);
+            }
             LOG_INFO(Core_ARM,
                      "recomp: pre-applied {} relocations ({} unresolved external symbols) for "
                      "module base={:#x}",
                      applied, unresolved, d.mod_base);
         }
+        // Only the first Impl through here observes the real sizes; see
+        // g_rela_restore.
+        {
+            std::scoped_lock lk{g_rela_restore_lock};
+            if (g_rela_restore.empty()) {
+                for (const auto& d : dyns) {
+                    if (d.rela_sz_va && d.rela_sz) {
+                        g_rela_restore.emplace_back(d.rela_sz_va, d.rela_sz);
+                    }
+                    if (d.jmprel_sz_va && d.jmprel_sz) {
+                        g_rela_restore.emplace_back(d.jmprel_sz_va, d.jmprel_sz);
+                    }
+                    LOG_INFO(Core_ARM, "recomp: saved rela sizes for {} base={:#x} relasz={} pltrelsz={}",
+                             d.name, d.mod_base, d.rela_sz, d.jmprel_sz);
+                }
+            }
+        }
     }
 
+    // Put DT_RELASZ/DT_PLTRELSZ back for every module. Only meaningful under
+    // the restore-on-main policy; the trigger owns proving rtld is done.
+    void RestoreRelocSizes() {
+        auto& mem = system.ApplicationMemory();
+        std::scoped_lock lk{g_rela_restore_lock};
+        for (const auto& [va, size] : g_rela_restore) {
+            mem.Write64(va, size);
+        }
+        LOG_INFO(Core_ARM, "recomp: restored {} rela size fields", g_rela_restore.size());
+    }
+
+    void SampleDiagnostics(Kernel::KThread* thread) {
+        if (!diagnostics.Enabled()) return;
+        auto* process = thread->GetOwnerProcess();
+        if (!process) return;
+        auto& memory = process->GetMemory();
+        const u64 process_id = process->GetId();
+        diagnostics.Sample(RecompDiagnosticSampler::Clock::now(), thread->GetId(),
+            ctx.pc, ctx.x[30], ctx.x[19], modules,
+            [&](u64 address) { return memory.Read32(address); },
+            [&](u64 address) { return memory.Read64(address); },
+            [&](u64 address) { return memory.IsValidVirtualAddress(address); },
+            [&](const std::string& snapshot) {
+                std::scoped_lock lock{g_snapshot_lock};
+                g_diagnostic_snapshots[{process_id, core_index}] = snapshot;
+            },
+            [](const std::string& line) { LOG_INFO(Core_ARM, "{}", line); });
+    }
+
+    RecompDiagnosticSampler diagnostics;
     System& system;
     RecompLookupFn lookup{};
     GuestContextView ctx{};
@@ -1328,7 +1611,7 @@ struct ArmRecomp::Impl {
     Loader::AppLoader::Modules modules{};
     bool modules_read{false};
     bool rela_applied{false};
-    std::vector<suyu::recomp::UnresolvedImport> unresolved_imports;
+    bool explicitly_prepared{false};
     static constexpr size_t kTrail = 32;
     u64 trail[kTrail]{};
     size_t trail_pos{0};
@@ -1337,152 +1620,140 @@ struct ArmRecomp::Impl {
     // first miss rather than up front: most runs never need it, and a JIT per
     // core costs a code cache each.
     Kernel::KProcess* owner_process{};
-    DynarmicExclusiveMonitor* exclusive_monitor{};
+    // The base interface, not dynarmic's implementation of it: the recompiled
+    // path only ever calls the virtual methods, and holding the concrete type
+    // here is what forced the library into a build that never runs a JIT.
+    ExclusiveMonitor* exclusive_monitor{};
+    // Last guest thread run on this core, so a reservation is voided on a real
+    // context switch and left alone on an ordinary return to the host.
+    Kernel::KThread* last_thread{};
     std::size_t core_index{};
     bool uses_wall_clock{};
+#ifndef SUYU_NO_JIT
     std::unique_ptr<ArmDynarmic64> fallback{};
+#endif
     bool in_fallback{false};
     bool fallback_unavailable{false};
-    std::shared_ptr<RecompProcessState> process_state;
-    suyu::recomp::RecompICache& icache;
-
-    AotLookup LookupAot(u64 pc, RecompBlockFn* out = nullptr) {
-        const RecompBlockFn block = lookup ? lookup(pc) : nullptr;
-        if (out) {
-            *out = block;
-        }
-        if (!block) {
-            return AotLookup::Miss;
-        }
-        if (icache.AllowsAotAt(pc)) {
-            return AotLookup::Hit;
-        }
-        if (out) {
-            *out = nullptr;
-        }
-        if (icache.AllowsAot()) {
-            g_counters.aot_range_rejects.fetch_add(1, std::memory_order_relaxed);
-        }
-        static std::atomic<int> refused{0};
-        if (refused.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_WARNING(Core_ARM,
-                        "recomp: refusing stale AOT at {:#x} after icache invalidate", pc);
-        }
-        return AotLookup::IcacheReject;
-    }
-
-    void NoteIcacheClear(bool from_jit_halt) {
-        const bool was_allowed = icache.AllowsAot();
-        icache.Clear();
-        if (from_jit_halt) {
-            g_counters.jit_halt_cache_invalidation.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (was_allowed) {
-            g_counters.permanent_aot_reject.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    // LookupAot runs before the generated function is called. Re-check under
-    // the process-wide reader gate so an invalidation racing that gap either
-    // waits for an in-flight block or sends this slice to Dynarmic.
-    bool TryEnterAot(u64 pc) {
-        if (!process_state->TryEnterAotExecution()) {
-            return false;
-        }
-        if (!icache.AllowsAotAt(pc)) {
-            process_state->LeaveAotExecution();
-            return false;
-        }
-        return true;
-    }
-
-    // Fused hot-path: enter the AOT reader gate once, then resolve the block
-    // and validate the icache range. The old RunThread did LookupAot (lookup +
-    // AllowsAotAt) followed by TryEnterAot (gate + AllowsAotAt again): two
-    // icache walks per block plus a race where the lookup happened outside the
-    // gate. On success the caller owns one AOT execution ref and must call
-    // LeaveAot(); on failure no ref is held.
-    AotLookup TryLookupAndEnterAot(u64 pc, RecompBlockFn* out) {
-        if (!process_state->TryEnterAotExecution()) {
-            if (out) {
-                *out = nullptr;
-            }
-            return AotLookup::IcacheReject;
-        }
-        const RecompBlockFn block = lookup ? lookup(pc) : nullptr;
-        if (!block) {
-            process_state->LeaveAotExecution();
-            if (out) {
-                *out = nullptr;
-            }
-            return AotLookup::Miss;
-        }
-        if (!icache.AllowsAotAt(pc)) {
-            process_state->LeaveAotExecution();
-            if (out) {
-                *out = nullptr;
-            }
-            if (icache.AllowsAot()) {
-                g_counters.aot_range_rejects.fetch_add(1, std::memory_order_relaxed);
-            }
-            return AotLookup::IcacheReject;
-        }
-        if (out) {
-            *out = block;
-        }
-        return AotLookup::Hit;
-    }
-
-    void LeaveAot() {
-        process_state->LeaveAotExecution();
-    }
 };
 
 ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
-                     Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
+                     Kernel::KProcess* process, ExclusiveMonitor* exclusive_monitor,
                      std::size_t core_index)
-    : ArmInterface{uses_wall_clock}, impl{std::make_unique<Impl>(system, lookup, process)} {
+    : ArmInterface{uses_wall_clock}, impl{std::make_unique<Impl>(system, lookup)} {
     impl->owner_process = process;
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;
     impl->uses_wall_clock = uses_wall_clock;
-    if (HostRecompSession().AttachProcess(process)) {
-        ResetCurrentCounters();
-        g_coverage_reported.store(false, std::memory_order_relaxed);
-        g_last_coverage_snapshot_tick.store(0, std::memory_order_relaxed);
+    RecompDiagnosticSampler::Config diagnostic_config;
+    diagnostic_config.snapshots = kSamplePc;
+    const char* lr_env = std::getenv("SUYU_RECOMP_WATCH_LR_OFFSET");
+    const char* addr_env = std::getenv("SUYU_RECOMP_WATCH_ADDR");
+    diagnostic_config.watch = (lr_env && *lr_env) || (addr_env && *addr_env);
+    diagnostic_config.lr_offset = (lr_env && *lr_env) ? std::strtoull(lr_env, nullptr, 0) : 0;
+    diagnostic_config.fixed_address = (addr_env && *addr_env) ? std::strtoull(addr_env, nullptr, 0) : 0;
+    if (diagnostic_config.watch) {
+        const char* path_env = std::getenv("SUYU_RECOMP_WATCH_PATH");
+        diagnostic_config.watch_path = (path_env && *path_env)
+            ? std::string{path_env}
+            : (Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_watch.txt").string();
+    }
+    impl->diagnostics.Configure(process ? process->GetId() : 0, core_index,
+                                std::move(diagnostic_config));
+    // Snapshot storage contains copied text only. A new session starts fresh.
+    if (g_live_instances.fetch_add(1, std::memory_order_relaxed) == 0) {
+        std::scoped_lock lock{g_snapshot_lock};
+        g_diagnostic_snapshots.clear();
+        // Before the loader places any module: it reports each one as it does.
+        g_session_blocks_start.store(TotalStaticBlocks(), std::memory_order_relaxed);
+        RecompGaps::BeginSession(process ? process->GetProgramId() : 0, StrictNoFallback());
     }
 }
 
 ArmRecomp::~ArmRecomp() {
-    bool expected = false;
-    if (g_coverage_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        ReportRecompCoverage();
+    if (impl->core_index < g_current_pcs.size()) {
+        g_current_pcs[impl->core_index].store(0, std::memory_order_relaxed);
     }
-    HostRecompSession().DetachProcess(impl->owner_process);
+    // Reports only copied samples and counters; never dereferences a process
+    // after its page table has been finalized. Report once per session, not once
+    // per host-process lifetime.
+    if (g_live_instances.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        ReportRecompCoverage();
+        RecompGaps::EndSession(TotalStaticBlocks() >
+                               g_session_blocks_start.load(std::memory_order_relaxed));
+    }
+}
+
+bool PrepareRecompProcess(Kernel::KProcess& process, const RecompModules& modules) {
+    const auto prepare = g_recomp_prepare.load(std::memory_order_acquire);
+    if (!prepare) return true;
+    // KProcess::InitializeInterfaces chooses ArmRecomp for every application
+    // core while this lookup is installed. RTTI is disabled in core builds.
+    if (!GetRecompLookup() || !process.IsApplication() || !process.Is64Bit() ||
+        modules.empty() || modules.begin()->second != "rtld" ||
+        modules.begin()->first != GetInteger(process.GetEntryPoint())) {
+        LOG_ERROR(Core_ARM, "Static preparation requires an AArch64 rtld entry point");
+        return false;
+    }
+    for (size_t i = 0; i < Hardware::NUM_CPU_CORES; ++i) {
+        const auto* cpu = static_cast<ArmRecomp*>(process.GetArmInterface(i));
+        if (!cpu || cpu->impl->explicitly_prepared) return false;
+    }
+    if (!prepare(modules)) return false;
+    for (size_t i = 0; i < Hardware::NUM_CPU_CORES; ++i) {
+        auto& state = *static_cast<ArmRecomp*>(process.GetArmInterface(i))->impl;
+        state.modules = modules;
+        state.modules_read = true;
+        // Run real rtld relocation. The desktop host pre-relocator substitutes
+        // unresolved imports and must never modify this strict session's memory.
+        state.rela_applied = true;
+        state.explicitly_prepared = true;
+    }
+    g_counters.RecordModules(modules);
+    return true;
 }
 
 bool ArmRecomp::EnterFallback() {
     if (impl->fallback_unavailable) {
         return false;
     }
+    if (StrictNoFallback()) {
+        // Latched, so the caller's own critical log naming the PC is what gets
+        // read, and the second thread to arrive does not repeat this one.
+        impl->fallback_unavailable = true;
+        LOG_CRITICAL(Core_ARM, "recomp: strict mode - refusing to fall back to the JIT");
+        return false;
+    }
+#ifdef SUYU_NO_JIT
+    // Built without a dynamic recompiler at all. There is nothing to fall back
+    // to, by construction rather than by configuration.
+    impl->fallback_unavailable = true;
+    LOG_CRITICAL(Core_ARM, "recomp: built without a JIT; uncovered code cannot run");
+    return false;
+#else
     if (!impl->fallback) {
         if (!impl->owner_process || !impl->exclusive_monitor) {
             impl->fallback_unavailable = true;
             return false;
         }
-        impl->fallback = std::make_unique<ArmDynarmic64>(impl->system, impl->uses_wall_clock,
-                                                         impl->owner_process, *impl->exclusive_monitor,
-                                                         impl->core_index);
+        // The JIT stores through the page table without the GG1 watch.
+        RecompGuardGen::OnJitFallback();
+        impl->fallback = std::make_unique<ArmDynarmic64>(
+            impl->system, impl->uses_wall_clock, impl->owner_process,
+            static_cast<DynarmicExclusiveMonitor&>(*impl->exclusive_monitor), impl->core_index);
         LOG_WARNING(Core_ARM, "recomp: created JIT fallback for uncovered code");
-    }
-    if (!impl->in_fallback) {
-        g_counters.aot_to_dynarmic.fetch_add(1, std::memory_order_relaxed);
     }
     impl->in_fallback = true;
     return true;
+#endif
 }
 
 HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
+#ifdef SUYU_NO_JIT
+    // Unreachable: EnterFallback never succeeds in this build. Kept so the one
+    // call site needs no guard of its own.
+    (void)thread;
+    return HaltReason::PrefetchAbort;
+#else
     // The recompiled context is the single source of truth; the JIT is loaded
     // from it on the way in and drained back on the way out, so every accessor
     // on this interface (SVC arguments, thread context save/restore) keeps
@@ -1496,22 +1767,10 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
     impl->fallback->SetContext(tctx);
     impl->fallback->SetTpidrroEl0(impl->ctx.tpidrro_el0);
 
-    HaltReason hr;
-    {
-        ScopedNs timer{g_counters.dynarmic_time_ns};
-        hr = impl->fallback->RunThread(thread);
-    }
-    g_counters.dynarmic_run_slices.fetch_add(1, std::memory_order_relaxed);
+    const HaltReason hr = impl->fallback->RunThread(thread);
 
     impl->fallback->GetContext(tctx);
     this->SetContext(tctx);
-    if (impl->ConsumeUnresolvedImportTrap()) {
-        return HaltReason::PrefetchAbort;
-    }
-    if (True(hr & HaltReason::CacheInvalidation)) {
-        impl->NoteIcacheClear(true);
-        impl->ctx.chain_budget = 0;
-    }
     if (True(hr & HaltReason::SupervisorCall)) {
         impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
     }
@@ -1522,71 +1781,116 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
 
     // Return to recompiled execution as soon as the PC is covered again, so a
     // single uncovered function costs only the time spent inside it.
-    if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
+    if (impl->lookup && impl->lookup(impl->ctx.pc)) {
         impl->in_fallback = false;
         g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
     }
     return hr;
-}
-
-HaltReason ArmRecomp::StepFallback(Kernel::KThread* thread) {
-    impl->ctx.pending_svc = kNoPendingSvc;
-    impl->ctx.halted = 0;
-    impl->interrupted.store(false, std::memory_order_relaxed);
-
-    Kernel::Svc::ThreadContext tctx{};
-    this->GetContext(tctx);
-    impl->fallback->SetContext(tctx);
-    impl->fallback->SetTpidrroEl0(impl->ctx.tpidrro_el0);
-
-    HaltReason hr;
-    {
-        ScopedNs timer{g_counters.dynarmic_time_ns};
-        hr = impl->fallback->StepThread(thread);
-    }
-    g_counters.dynarmic_step_slices.fetch_add(1, std::memory_order_relaxed);
-
-    impl->fallback->GetContext(tctx);
-    this->SetContext(tctx);
-    if (impl->ConsumeUnresolvedImportTrap()) {
-        return HaltReason::PrefetchAbort;
-    }
-    if (True(hr & HaltReason::CacheInvalidation)) {
-        impl->NoteIcacheClear(true);
-        impl->ctx.chain_budget = 0;
-    }
-    if (True(hr & HaltReason::SupervisorCall)) {
-        impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
-        g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
-        impl->in_fallback = false;
-        g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
-    }
-    return hr;
+#endif
 }
 
 HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
+    // A context switch voids any outstanding reservation. A thread preempted
+    // between its LDXR and STXR would otherwise have the STXR succeed against a
+    // word another thread changed on this core meanwhile, silently losing an
+    // update to a mutex or condition variable and deadlocking the guest.
+    //
+    // Only on an actual switch: this backend returns to the host constantly
+    // (chain budget, SVCs), so clearing on every entry would void reservations
+    // the same thread is still in the middle of.
+    if (impl->last_thread != thread) {
+        impl->last_thread = thread;
+        if (impl->exclusive_monitor) {
+            impl->exclusive_monitor->ClearExclusive(impl->core_index);
+        }
+    }
     // Logged once so it is obvious from a log whether the backend was ever
     // entered at all. A run with no errors is otherwise indistinguishable from
     // a run where the guest thread was never scheduled onto it.
-    static bool announced = false;
-    if (!announced) {
-        announced = true;
+    static std::atomic_bool announced{false};
+    bool first_run = !announced.exchange(true, std::memory_order_relaxed);
+    if (first_run) {
         LOG_INFO(Core_ARM, "ArmRecomp::RunThread entered, pc={:#x}", impl->ctx.pc);
     }
     if (!impl->lookup) {
         LOG_ERROR(Core_ARM, "No recompiled code registered; cannot run thread");
         return HaltReason::BreakLoop;
     }
+
     impl->RefreshPageTable();
+    // FPX1: the guest register is 32 bits; bit 32 is this host's kill switch,
+    // re-applied on every entry because every import of the context drops it.
+    const bool fpx_active = FpxActive();
+    impl->ctx.fpcr = (impl->ctx.fpcr & 0xffffffffULL) | FpxInhibitBits();
+    if (fpx_active) {
+        RepairFpEnv("entry");
+    }
+    if (first_run) {
+        LOG_INFO(Core_ARM, "ArmRecomp FPX1 native FP: {}",
+                 !g_fpx_ready.load(std::memory_order_acquire)
+                     ? "not used"
+                     : kFpxDisabled ? "negotiated, disabled by SUYU_RECOMP_FPX=0"
+                                    : "on, host FP mode enforced");
+    }
+    if (first_run) {
+        LOG_INFO(Core_ARM,
+                 "ArmRecomp page table ready: entries={} stride={} page_bits={} max={:#x} "
+                 "fastmem={} (limit {:#x}{})",
+                 impl->bridge.page_entries != nullptr, impl->bridge.page_entry_stride,
+                 impl->bridge.page_bits, impl->bridge.address_space_max,
+                 impl->ctx.fm_limit != 0, impl->ctx.fm_limit,
+                 kFastmemDisabled ? ", disabled by SUYU_RECOMP_FASTMEM=0" : "");
+    }
 
-    HostRecompSession().EnsureModuleBasesRegistered(
-        [&] { impl->ModuleBaseFor(thread, impl->ctx.pc); });
+    // Registering every loaded image's base with the host dispatcher is a
+    // side effect of this call, not something its return value is used for
+    // here - the dispatcher needs it done once before the first lookup, or
+    // every image's base stays 0 and every lookup misses.
+    if (HasRecompPrepareCallback() && !impl->explicitly_prepared) {
+        LOG_ERROR(Core_ARM, "Refusing unprepared static guest execution");
+        return HaltReason::BreakLoop;
+    }
+    // Keep the legacy desktop path isolated. Explicit sessions never enter
+    // this process-global lazy protocol or its heuristic relocation path.
+    if (!impl->explicitly_prepared && !impl->rela_applied) {
+        // Every CPU Impl needs its own complete module map and relocation pass.
+        // Collapsing this to once per KProcess left later Impls incompletely
+        // initialized and changed MK8's execution despite zero lookup misses.
+        // Serialize the shared guest-memory writes to retain the original
+        // per-Impl behavior without the original multicore race.
+        std::scoped_lock lock{g_process_init_lock};
+        if (!impl->rela_applied) {
+            impl->ModuleBaseFor(thread, impl->ctx.pc);
+            impl->ApplyAllRelocations(impl->modules);
+            impl->rela_applied = true;
+        }
+    }
 
-    if (!impl->rela_applied) {
-        impl->rela_applied = true;
-        impl->ApplyAllRelocations(impl->modules);
+    // ABI 6 GG1: the first run of each process decides which modules may skip
+    // their per-entry check. Module bases are set by now (above, or by the
+    // explicit prepare callback), and no block of this process has run yet.
+    if (RecompGuardGen::Watching()) {
+        if (auto* process = thread->GetOwnerProcess()) {
+            const u64 key = process->GetProcessId() | (u64{1} << 63);
+            if (!RecompGuardGen::IsActive(key)) {
+                impl->ActivateGuardGen(*process, key);
+            }
+        }
+    }
+
+    if (kRelaPolicy == "restore-on-main" && !g_rela_restored.load(std::memory_order_acquire) &&
+        impl->PcInMainModule(impl->ctx.pc)) {
+        // Ordering this relies on: rtld is the process entrypoint, and the NSO
+        // boot sequence has it self-relocate and then relocate every other
+        // module before it branches to main's entry. So the first guest PC
+        // inside main is after rtld is finished with both tables, and long
+        // before nn::ro loads any NRO (Smash's first LoadNro is ~33s in).
+        std::scoped_lock lock{g_process_init_lock};
+        if (!g_rela_restored.exchange(true, std::memory_order_acq_rel)) {
+            LOG_INFO(Core_ARM, "recomp: first execution in main at pc={:#x}; restoring rela sizes",
+                     impl->ctx.pc);
+            impl->RestoreRelocSizes();
+        }
     }
 
     // A previous miss handed this thread to the JIT; keep running there until
@@ -1594,60 +1898,30 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
     // caught before that hand-off as well as inside the dispatch loop below -
     // a thread already in the JIT that calls an unresolved import would
     // otherwise be handed the sentinel address to execute, which is unmapped.
-    if (impl->ConsumeUnresolvedImportTrap()) {
-        return HaltReason::PrefetchAbort;
+    if (impl->ctx.pc == kUnresolvedImportTrap) {
+        impl->ctx.x[0] = 0;
+        impl->ctx.pc = impl->ctx.x[30];
+        impl->in_fallback = false;
     }
-    // Publish the runtime lifecycle only after loader/module setup has
-    // completed, but before the first LookupAot in this slice.
-    impl->process_state->MarkExecutionStarted();
     if (impl->in_fallback) {
-        // PC may have moved (new scheduling slice, harness scenario, SVC
-        // resume) onto covered AOT since we last ran the JIT. Check before
-        // spending another Dynarmic slice.
-        if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
-            impl->in_fallback = false;
-            g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            return RunFallback(thread);
-        }
+        return RunFallback(thread);
     }
 
     impl->interrupted.store(false, std::memory_order_relaxed);
     impl->ctx.halted = 0;
 
-    // Batched block counting: one relaxed fetch_add per block bounced the
-    // counter cache line between cores at tens of millions of dispatches/sec.
-    // Accumulate locally and flush every 128 dispatches; the periodic coverage
-    // dump is checked when a flush crosses a 256K boundary, but written at
-    // most once per five seconds across all emulation threads.
-    u64 pending_blocks = 0;
-    bool first_aot_block = true;
-    auto flush_block_counts = [&]() {
-        if (pending_blocks == 0) {
-            return;
-        }
-        const u64 prev = g_counters.static_blocks.fetch_add(pending_blocks,
-                                                             std::memory_order_relaxed);
-        const u64 cur = prev + pending_blocks;
-        pending_blocks = 0;
-        if ((prev & ~0x3FFFFULL) != (cur & ~0x3FFFFULL)) {
-            using Clock = std::chrono::steady_clock;
-            constexpr auto interval = std::chrono::duration_cast<Clock::duration>(
-                std::chrono::seconds{5}).count();
-            const auto now = Clock::now().time_since_epoch().count();
-            auto last = g_last_coverage_snapshot_tick.load(std::memory_order_relaxed);
-            if ((last == 0 || now - last >= interval) &&
-                g_last_coverage_snapshot_tick.compare_exchange_strong(
-                    last, now, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                WriteRecompCoverageFile(FormatRecompCoverage());
-                WriteRecompExecutionJson({});
-            }
-        }
-    };
-
     while (!impl->ctx.halted) {
+        // A host callback or SVC path run since the last block could have
+        // changed this thread's FP mode; one control-register read per
+        // dispatch, not per op.
+        if (fpx_active && !RecompFpEnv::Conforms()) {
+            RepairFpEnv("dispatch");
+        }
+        impl->SampleDiagnostics(thread);
+        if (impl->core_index < g_current_pcs.size()) {
+            g_current_pcs[impl->core_index].store(impl->ctx.pc, std::memory_order_relaxed);
+        }
         if (impl->interrupted.load(std::memory_order_relaxed)) {
-            flush_block_counts();
             return HaltReason::BreakLoop;
         }
 
@@ -1675,22 +1949,43 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // GOT read from a bad emitted branch.
         impl->trail[impl->trail_pos++ & (Impl::kTrail - 1)] = impl->ctx.pc;
 
-        if (impl->ConsumeUnresolvedImportTrap()) {
-            flush_block_counts();
-            return HaltReason::PrefetchAbort;
+        if (impl->ctx.pc == kUnresolvedImportTrap) {
+            // Landed here via a BLR through a GOT/JUMP_SLOT slot patched by
+            // ApplyRelocTable because no definition was found anywhere - most
+            // such imports exist for code paths this particular boot never
+            // takes, so treat the call as a no-op: return to the caller with
+            // a zeroed result register rather than crash the thread. x30 is
+            // the guest's own return address (BLR sets it before the branch),
+            // exactly as if this were a real function that did nothing.
+            static std::atomic<int> trap_count{0};
+            if (trap_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+                g_counters.unresolved_import_traps.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR(Core_ARM, "recomp: called through unresolved import (returning to caller {:#x})",
+                          impl->ctx.x[30]);
+            }
+            impl->ctx.x[0] = 0;
+            impl->ctx.pc = impl->ctx.x[30];
+            continue;
         }
 
-        // Fused hot path: gate + lookup + icache check in one call (previously
-        // LookupAot then TryEnterAot = two icache walks + a race window).
-        // On Hit the AOT reader ref is held; all failure paths below that
-        // return to the JIT must not hold it (fused call already released).
-        RecompBlockFn block = nullptr;
-        AotLookup look = impl->TryLookupAndEnterAot(impl->ctx.pc, &block);
+        static std::atomic<u64> early_dispatches{0};
+        const u64 early_dispatch = early_dispatches.fetch_add(1, std::memory_order_relaxed);
+        if (early_dispatch < 64) {
+            LOG_INFO(Core_ARM, "Early static dispatch #{}: pc={:#x}", early_dispatch,
+                     impl->ctx.pc);
+        }
+        RecompBlockFn block = impl->lookup(impl->ctx.pc);
+        if (first_run) {
+            LOG_INFO(Core_ARM, "First static lookup: pc={:#x}, covered={}", impl->ctx.pc,
+                     block != nullptr);
+        }
         // Test hook: forces every lookup past the Nth to miss, so the JIT
         // fallback below can be exercised on a title that would otherwise never
         // hit a gap. Unset in normal runs.
         {
             static const char* const force_miss = std::getenv("SUYU_RECOMP_FORCE_MISS_AFTER");
+            static const char* const force_miss_static_blocks =
+                std::getenv("SUYU_RECOMP_FORCE_MISS_AFTER_STATIC_BLOCKS");
             static std::atomic<int> blocks_run{0};
             if (force_miss) {
                 const int n = blocks_run.fetch_add(1, std::memory_order_relaxed);
@@ -1701,12 +1996,166 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 if (n >= limit - 4 && n <= limit + 4) {
                     LOG_ERROR(Core_ARM, "recomp: block #{} pc={:#x}", n, impl->ctx.pc);
                 }
-                if (n >= limit && block) {
-                    // Fused lookup already entered AOT; release before forcing
-                    // the miss path below.
-                    impl->LeaveAot();
+                if (n >= limit) {
                     block = nullptr;
-                    look = AotLookup::Miss;
+                }
+            }
+            // Same hook keyed on a module-relative guest PC. Block counts and
+            // wall clocks both bracket a fault loosely; this hands over at one
+            // named instruction, which is what turns a bracket into a bisect.
+            // Module bases are picked by the loader and differ per run, so the
+            // offset is matched against every loaded base rather than an
+            // absolute address the caller could not know in advance.
+            static const char* const force_miss_at_offset =
+                std::getenv("SUYU_RECOMP_FORCE_MISS_AT_MODULE_OFFSET");
+            if (force_miss_at_offset) {
+                static const u64 target = std::strtoull(force_miss_at_offset, nullptr, 0);
+                // Snapshotted rather than read under the counters' lock on every
+                // block, which would cost more than the whole dispatch loop.
+                // Retried while empty because the first guest blocks can run
+                // before the loader has finished registering module bases.
+                static std::vector<u64> bases;
+                if (bases.empty()) {
+                    std::scoped_lock lk{g_counters.hist_lock};
+                    for (const auto& [base, name] : g_counters.modules) {
+                        bases.push_back(base);
+                    }
+                }
+                for (const u64 base : bases) {
+                    if (impl->ctx.pc - base == target) {
+                        u64 unset = 0;
+                        if (g_forced_cutoff_pc.compare_exchange_strong(
+                                unset, impl->ctx.pc, std::memory_order_relaxed)) {
+                            g_forced_cutoff_blocks.store(TotalStaticBlocks(),
+                                                         std::memory_order_relaxed);
+                            LOG_ERROR(Core_ARM,
+                                      "recomp: forced offset cutoff {:#x} reached pc={:#x} "
+                                      "after {} blocks",
+                                      target, impl->ctx.pc,
+                                      g_forced_cutoff_blocks.load(std::memory_order_relaxed));
+                        }
+                        block = nullptr;
+                        break;
+                    }
+                }
+            }
+            // Address-range hole. Every guest PC whose offset in `main` falls
+            // in [lo, hi) misses the lookup and runs under the JIT while the
+            // rest of the module stays static, which narrows a fault inside a
+            // module the way bisect-modules narrows it to a module. Read at
+            // runtime, so an arm needs neither a re-export nor a rebuild.
+            //
+            // Module-relative for the same reason as the cutoff above. Scoped
+            // to `main` because the same offset exists in every other image.
+            //
+            // Only meaningful when fallback is allowed: under
+            // SUYU_RECOMP_STRICT a miss is a PrefetchAbort, not a handover.
+            static const char* const main_hole = std::getenv("SUYU_RECOMP_MAIN_HOLE");
+            if (main_hole) {
+                static u64 hole_lo = 0;
+                static u64 hole_hi = 0;
+                static const bool hole_valid = [] {
+                    char* end = nullptr;
+                    hole_lo = std::strtoull(main_hole, &end, 0);
+                    if (!end || *end != '-') {
+                        LOG_ERROR(Core_ARM, "recomp: SUYU_RECOMP_MAIN_HOLE={} is not <lo>-<hi>",
+                                  main_hole);
+                        return false;
+                    }
+                    hole_hi = std::strtoull(end + 1, nullptr, 0);
+                    if (hole_hi <= hole_lo) {
+                        LOG_ERROR(Core_ARM, "recomp: SUYU_RECOMP_MAIN_HOLE={} is empty", main_hole);
+                        return false;
+                    }
+                    return true;
+                }();
+                // Which module the offsets are relative to, as a substring of
+                // its name. Modules are registered under the NSO's own name,
+                // not the exefs file name - Smash's `main` is
+                // `cross2_Release.nss` and its `sdk` is `nnSdk` - so matching
+                // "main" finds nothing. Unset applies the hole to every module,
+                // which is what the all-to-JIT control wants.
+                static const char* const hole_module = std::getenv("SUYU_RECOMP_HOLE_MODULE");
+                // Snapshotted, and retried while empty, because the first guest
+                // blocks can run before the loader registers module bases.
+                static std::vector<u64> hole_bases;
+                if (hole_valid && hole_bases.empty()) {
+                    std::scoped_lock lk{g_counters.hist_lock};
+                    for (const auto& [base, name] : g_counters.modules) {
+                        if (!hole_module || name.find(hole_module) != std::string::npos) {
+                            hole_bases.push_back(base);
+                        }
+                    }
+                    if (!hole_bases.empty()) {
+                        LOG_ERROR(Core_ARM, "recomp: main hole {:#x}-{:#x} armed on {} module(s)",
+                                  hole_lo, hole_hi, hole_bases.size());
+                    } else if (!g_counters.modules.empty()) {
+                        // Named a module that is not loaded. Silence here would
+                        // look exactly like a range that never executes.
+                        LOG_ERROR(Core_ARM, "recomp: SUYU_RECOMP_HOLE_MODULE={} matched no module",
+                                  hole_module);
+                    }
+                }
+                for (const u64 base : hole_bases) {
+                    if (impl->ctx.pc < base) {
+                        continue;
+                    }
+                    const u64 off = impl->ctx.pc - base;
+                    if (off >= hole_lo && off < hole_hi) {
+                        // Logged once so a run proves the hole was applied. A
+                        // silently ignored hole reports the same counters as no
+                        // hole at all, which makes every arm of a bisection look
+                        // uninformative for the wrong reason.
+                        static std::atomic<bool> hole_announced{false};
+                        if (!hole_announced.exchange(true, std::memory_order_relaxed)) {
+                            LOG_ERROR(Core_ARM,
+                                      "recomp: main hole {:#x}-{:#x} active (base {:#x}), first "
+                                      "handover at pc={:#x}",
+                                      hole_lo, hole_hi, base, impl->ctx.pc);
+                        }
+                        block = nullptr;
+                        break;
+                    }
+                }
+            }
+            // Same hook keyed on wall time instead of block count. A stalled
+            // title stops retiring blocks, so a block-count cutoff placed
+            // inside the stall is never reached; seconds get there regardless.
+            static const char* const force_miss_after_sec =
+                std::getenv("SUYU_RECOMP_FORCE_MISS_AFTER_SEC");
+            if (force_miss_after_sec) {
+                const double limit = std::atof(force_miss_after_sec);
+                const double elapsed = std::chrono::duration<double>(
+                                           std::chrono::steady_clock::now() - kRecompStart)
+                                           .count();
+                if (elapsed >= limit) {
+                    u64 unset = 0;
+                    if (g_forced_cutoff_pc.compare_exchange_strong(
+                            unset, impl->ctx.pc, std::memory_order_relaxed)) {
+                        g_forced_cutoff_blocks.store(TotalStaticBlocks(),
+                                                     std::memory_order_relaxed);
+                        LOG_ERROR(Core_ARM, "recomp: forced time cutoff {}s reached pc={:#x}",
+                                  limit, impl->ctx.pc);
+                    }
+                    block = nullptr;
+                }
+            }
+            if (force_miss_static_blocks) {
+                const u64 limit = std::strtoull(force_miss_static_blocks, nullptr, 10);
+                const u64 executed = TotalStaticBlocks();
+                if (executed >= limit) {
+                    u64 unset = 0;
+                    if (g_forced_cutoff_pc.compare_exchange_strong(
+                            unset, impl->ctx.pc, std::memory_order_relaxed)) {
+                        g_forced_cutoff_blocks.store(executed, std::memory_order_relaxed);
+                    }
+                    static std::atomic<int> static_cutoff_logs{0};
+                    if (static_cutoff_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        LOG_ERROR(Core_ARM,
+                                  "recomp: forced static-block cutoff {} reached at {} pc={:#x}",
+                                  limit, executed, impl->ctx.pc);
+                    }
+                    block = nullptr;
                 }
             }
         }
@@ -1714,10 +2163,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // the full diagnostic dump is kept for the first few only, where it is
         // still useful for finding which indirect call went uncovered.
         static std::atomic<int> miss_count{0};
-        const bool is_icache_reject = !block && look == AotLookup::IcacheReject;
-        const int miss_index =
-            block || is_icache_reject ? 0 : miss_count.fetch_add(1, std::memory_order_relaxed);
-        if (!block && impl->icache.AllowsAot() && miss_index < 8) {
+        const int miss_index = block ? 0 : miss_count.fetch_add(1, std::memory_order_relaxed);
+        if (!block && miss_index < 8) {
             std::string trail;
             const size_t count = std::min<size_t>(impl->trail_pos, Impl::kTrail);
             for (size_t i = 0; i < count; ++i) {
@@ -1775,63 +2222,98 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             }
         }
         if (!block) {
-            // No recompiled block covers this address, or AOT was rejected by
-            // the icache gate inside TryLookupAndEnterAot (which already
-            // released the reader ref). Guest bytes are still mapped, so hand
-            // the thread to Dynarmic instead of PrefetchAbort.
-            if (is_icache_reject) {
-                g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
+            // No recompiled block covers this address: an indirect branch into
+            // code the static pass never reached. The guest's own instructions
+            // are still mapped in guest memory, so hand the thread to a JIT and
+            // keep going instead of returning PrefetchAbort - that halt reason
+            // makes the kernel suspend the thread for a debugger that is not
+            // attached, which is a permanent, silent black-screen hang.
+            if (miss_index < 64) {
+                LOG_ERROR(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
+                          impl->ctx.pc);
             } else {
-                if (miss_index < 64) {
-                    LOG_ERROR(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
-                              impl->ctx.pc);
-                } else {
-                    LOG_DEBUG(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
-                              impl->ctx.pc);
-                }
-                g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
-                g_counters.RecordMiss(impl->ctx.pc);
+                LOG_DEBUG(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
+                          impl->ctx.pc);
             }
+            g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
+            g_counters.RecordMiss(impl->ctx.pc);
+            RecompGaps::RecordMiss(impl->ctx.pc);
             if (!EnterFallback()) {
                 g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
+                // A strict run stops here, and may never reach teardown.
+                RecompGaps::Flush(true, true);
                 LOG_CRITICAL(Core_ARM,
                              "recomp: no JIT fallback available at PC {:#x}; thread cannot "
                              "continue",
                              impl->ctx.pc);
-                flush_block_counts();
                 return HaltReason::PrefetchAbort;
             }
-            flush_block_counts();
             return RunFallback(thread);
         }
 
+        // Dump periodically: teardown is not guaranteed to run (the emulated
+        // process can outlive shutdown), and a run with no report is a run with
+        // no measurement. One compare per block against a power-of-two mask.
+        const u64 seen = t_blocks.slot->n.load(std::memory_order_relaxed) + 1;
+        t_blocks.slot->n.store(seen, std::memory_order_relaxed);
+        if ((seen & 0x3FFFFULL) == 0x3FFFFULL) {
+            WriteRecompCoverageFile(FormatRecompCoverage());
+            // Time-limited inside; teardown is not guaranteed, as above.
+            RecompGaps::Flush(true, false);
+        }
         // Generated code calls a direct branch's target itself rather than
         // coming back here, so one call below can run a whole chain of blocks.
         // The budget bounds that chain, and what is left of it afterwards says
-        // how many blocks actually ran. Fused lookup above already holds the
-        // AOT reader ref, so no second TryEnterAot is needed here.
-        const int chain_budget = impl->icache.AllowsAotChaining() ? kChainBudget : 0;
+        // how many blocks actually ran - without which every count here would
+        // report chains rather than blocks.
+        const int chain_budget = RecompChainBudget();
         impl->ctx.chain_budget = chain_budget;
-        {
-            SampledAotNs timer{g_counters.aot_time_ns, first_aot_block};
-            first_aot_block = false;
-            block(&impl->ctx);
+        if (first_run) {
+            LOG_INFO(Core_ARM, "Calling first signed static block at pc={:#x}", impl->ctx.pc);
         }
-        impl->LeaveAot();
+        block(&impl->ctx);
+        if (early_dispatch < 64) {
+            LOG_INFO(Core_ARM, "Early static return #{}: pc={:#x}, svc={}, halted={}",
+                     early_dispatch, impl->ctx.pc, impl->ctx.pending_svc, impl->ctx.halted);
+        }
+        if (first_run) {
+            LOG_INFO(Core_ARM, "First signed static block returned: pc={:#x}, svc={}, halted={}",
+                     impl->ctx.pc, impl->ctx.pending_svc, impl->ctx.halted);
+            first_run = false;
+        }
         {
             const int spent = chain_budget - impl->ctx.chain_budget;
-            // Each successful chain edge decrements the budget before calling
-            // the target. A natural return executed that final target; an
-            // exhausted budget returned before calling it. With chaining
-            // disabled, the first edge can take the budget from zero to -1
-            // without executing its target.
-            const int executed = chain_budget > 0 && impl->ctx.chain_budget > 0
-                                     ? spent + 1
-                                     : std::max(spent, 1);
-            pending_blocks += static_cast<u64>(executed);
-            if (pending_blocks >= 128) {
-                flush_block_counts();
+            u64 after = seen;
+            if (spent > 0) {
+                // The first block is already in `seen`. A decrement to zero
+                // parks the next PC without entering it, so that final attempt
+                // contributes no executed block.
+                after += static_cast<u64>(spent - (impl->ctx.chain_budget == 0 ? 1 : 0));
+                t_blocks.slot->n.store(after, std::memory_order_relaxed);
             }
+            if (kSamplePc && (seen >> kSamplePcShift) != (after >> kSamplePcShift) &&
+                SampleWindowOpen()) {
+                g_counters.RecordSample(impl->ctx.pc);
+            }
+        }
+
+        if (impl->ctx.halted == kHaltIcIvau) {
+            if (!g_code_guard_ready.load(std::memory_order_acquire)) {
+                LOG_CRITICAL(Core_ARM, "recomp: IC IVAU requires guard-v2 host and all guarded modules");
+                std::abort();
+            }
+            const u64 address = impl->ctx.pending_svc;
+            impl->ctx.pending_svc = kNoPendingSvc;
+            // Forward the guest instruction-cache operation to each CPU interface.
+            for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
+                if (auto* cpu = thread->GetOwnerProcess()->GetArmInterface(core)) cpu->InvalidateCacheRange(address, 64);
+            }
+            impl->ctx.pc += 4;
+            impl->ctx.halted = 0;
+            continue;
+        }
+        if (impl->ctx.halted == kHaltBreakpoint) {
+            return HaltReason::InstructionBreakpoint;
         }
 
         // The block stopped on an instruction the decoder has no translation
@@ -1841,6 +2323,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // plausible-looking null that only surfaced as a crash much later, in
         // whatever code eventually dereferenced it.
         if (impl->ctx.halted == kHaltUnhandled) {
+            if ((static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)) & 0xffffffe0U) == 0xd50b7520U) {
+                LOG_CRITICAL(Core_ARM, "recomp: legacy unguarded IC IVAU refused at {:#x}", impl->ctx.pc);
+                std::abort();
+            }
             impl->ctx.halted = 0;
             // The generated code knows the encoding but cannot pass it back
             // through the halt contract, so read it out of guest memory - the
@@ -1848,21 +2334,22 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             // ranks the missing opcodes by execution rather than by how often
             // they appear in the image.
             g_counters.fallback_from_unhandled.fetch_add(1, std::memory_order_relaxed);
-            g_counters.RecordUnhandled(
-                static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)));
+            const u32 unsupported_opcode =
+                static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4));
+            g_counters.RecordUnhandled(unsupported_opcode);
+            RecompGaps::RecordUnimplemented(unsupported_opcode);
             static std::atomic<int> unhandled_count{0};
             if (unhandled_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-                LOG_WARNING(Core_ARM, "recomp: unimplemented opcode at {:#x}; running on JIT",
-                            impl->ctx.pc);
+                LOG_WARNING(Core_ARM, "recomp: unimplemented opcode {:#010x} at {:#x}; checking fallback policy",
+                            unsupported_opcode, impl->ctx.pc);
             }
             if (!EnterFallback()) {
                 g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
-                LOG_CRITICAL(Core_ARM, "recomp: unimplemented opcode at {:#x} and no JIT fallback",
-                             impl->ctx.pc);
-                flush_block_counts();
+                RecompGaps::Flush(true, true);
+                LOG_CRITICAL(Core_ARM, "recomp: unimplemented opcode {:#010x} at {:#x} and no JIT fallback",
+                             unsupported_opcode, impl->ctx.pc);
                 return HaltReason::PrefetchAbort;
             }
-            flush_block_counts();
             return RunFallback(thread);
         }
 
@@ -1873,137 +2360,84 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                       impl->ctx.x[2], impl->ctx.x[3]);
             g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
             g_counters.RecordSvc(static_cast<u32>(impl->ctx.pending_svc));
-            flush_block_counts();
             return HaltReason::SupervisorCall;
         }
     }
 
-    flush_block_counts();
     return HaltReason::BreakLoop;
 }
 
 HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
-    // AOT blocks are straight-line C with no per-instruction re-entry, so a
-    // covered PC still steps at block granularity. Misses and unhandled
-    // encodings must take the same JIT fallback entry as RunThread: returning
-    // PrefetchAbort here used to suspend the thread for a debugger that then
-    // could not advance, while RunThread would have continued on Dynarmic.
+    impl->SampleDiagnostics(thread);
+    // A context switch voids any outstanding reservation. A thread preempted
+    // between its LDXR and STXR would otherwise have the STXR succeed against a
+    // word another thread changed on this core meanwhile, silently losing an
+    // update to a mutex or condition variable and deadlocking the guest.
+    //
+    // Only on an actual switch: this backend returns to the host constantly
+    // (chain budget, SVCs), so clearing on every entry would void reservations
+    // the same thread is still in the middle of.
+    if (impl->last_thread != thread) {
+        impl->last_thread = thread;
+        if (impl->exclusive_monitor) {
+            impl->exclusive_monitor->ClearExclusive(impl->core_index);
+        }
+    }
+    // Block granularity is the finest this backend can step: recompiled blocks
+    // are straight-line C with no per-instruction re-entry point.
     if (!impl->lookup) {
         return HaltReason::BreakLoop;
     }
-    if (impl->ConsumeUnresolvedImportTrap()) {
+    const RecompBlockFn block = impl->lookup(impl->ctx.pc);
+    if (!block) {
         return HaltReason::PrefetchAbort;
     }
-    impl->process_state->MarkExecutionStarted();
-    // Same resume contract as RunThread: leftover pending_svc is from a prior
-    // halt the kernel already serviced. A debugger step of a non-SVC AOT block
-    // must not report SupervisorCall because that field was still set.
-    if (impl->ctx.pending_svc != kNoPendingSvc) {
+    impl->ctx.halted = 0;
+    impl->ctx.pending_svc = kNoPendingSvc;
+    impl->ctx.chain_budget = 1;
+    block(&impl->ctx);
+    if (impl->ctx.halted == kHaltIcIvau) {
+        if (!g_code_guard_ready.load(std::memory_order_acquire)) {
+            LOG_CRITICAL(Core_ARM, "recomp: IC IVAU requires guard-v2 host and all guarded modules");
+            std::abort();
+        }
+        const u64 address = impl->ctx.pending_svc;
         impl->ctx.pending_svc = kNoPendingSvc;
-    }
-    if (impl->in_fallback) {
-        if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
-            impl->in_fallback = false;
-            g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            return StepFallback(thread);
+        for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
+            if (auto* cpu = thread->GetOwnerProcess()->GetArmInterface(core)) cpu->InvalidateCacheRange(address, 64);
         }
-    }
-
-    RecompBlockFn block = nullptr;
-    const AotLookup look = impl->LookupAot(impl->ctx.pc, &block);
-    if (!block) {
-        if (look == AotLookup::IcacheReject) {
-            g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
-            g_counters.RecordMiss(impl->ctx.pc);
-        }
-        if (!EnterFallback()) {
-            g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
-            return HaltReason::PrefetchAbort;
-        }
-        return StepFallback(thread);
-    }
-
-    // Do not honour a leftover chain budget from RunThread: a debugger step
-    // must not race through a direct-call chain. Fused enter keeps the single
-    // icache check (StepThread is cold, so no batching needed here).
-    impl->ctx.chain_budget = 0;
-    if (!impl->TryEnterAot(impl->ctx.pc)) {
-        g_counters.fallback_from_icache_reject.fetch_add(1, std::memory_order_relaxed);
-        if (!EnterFallback()) {
-            g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
-            return HaltReason::PrefetchAbort;
-        }
-        return StepFallback(thread);
-    }
-    g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
-    {
-        ScopedNs timer{g_counters.aot_time_ns};
-        block(&impl->ctx);
-    }
-    impl->LeaveAot();
-
-    if (impl->ctx.halted == kHaltUnhandled) {
+        impl->ctx.pc += 4;
         impl->ctx.halted = 0;
-        g_counters.fallback_from_unhandled.fetch_add(1, std::memory_order_relaxed);
-        g_counters.RecordUnhandled(
-            static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)));
-        if (!EnterFallback()) {
-            g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
-            return HaltReason::PrefetchAbort;
-        }
-        return StepFallback(thread);
+        return HaltReason::StepThread;
+    }
+    if (impl->ctx.halted == kHaltBreakpoint) {
+        return HaltReason::InstructionBreakpoint;
+    }
+    if (impl->ctx.halted == kHaltUnhandled &&
+        (static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)) & 0xffffffe0U) == 0xd50b7520U) {
+        LOG_CRITICAL(Core_ARM, "recomp: legacy unguarded IC IVAU refused while stepping at {:#x}", impl->ctx.pc);
+        std::abort();
     }
     if (impl->ctx.pending_svc != kNoPendingSvc) {
-        g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
-        g_counters.RecordSvc(static_cast<u32>(impl->ctx.pending_svc));
         return HaltReason::SupervisorCall;
     }
     return HaltReason::StepThread;
 }
 
-bool ArmRecomp::AllowsAot() const {
-    return impl->icache.AllowsAot();
-}
-
 void ArmRecomp::ClearInstructionCache() {
-    // Permanent AOT reject: guest code may have changed under the image the
-    // static pass translated. Further RunThread/StepThread must use the JIT.
-    g_counters.clear_instruction_cache.fetch_add(1, std::memory_order_relaxed);
-    {
-        auto invalidation = impl->process_state->BeginInvalidation();
-        impl->NoteIcacheClear(false);
-        impl->process_state->EndInvalidation();
-    }
-    impl->ctx.chain_budget = 0;
-    if (impl->fallback) {
-        impl->fallback->ClearInstructionCache();
-    }
+#ifndef SUYU_NO_JIT
+    if (impl->fallback) impl->fallback->ClearInstructionCache();
+#endif
+    // ABI 5 blocks verify bytes on every entry; GG1 blocks do once the
+    // generation moves.
+    RecompGuardGen::OnInvalidateAll();
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
-    // Range invalidate (loader RX protect, page-table copies) must flush the
-    // Dynarmic fallback without permanently rejecting AOT. AOT was compiled
-    // for the image bytes being mapped; treating every loader invalidate as
-    // ClearInstructionCache would kill ArmRecomp before the first guest insn.
-    // Guest IC ops that mean bytes changed under us arrive as CacheInvalidation
-    // halt reasons and call icache.Clear() from RunFallback/StepFallback.
-    g_counters.invalidate_cache_range.fetch_add(1, std::memory_order_relaxed);
-    impl->ctx.chain_budget = 0;
-    // During initial module mapping the fallback does not exist yet, and the
-    // loader's protection notification is not evidence that guest bytes
-    // changed. Once Dynarmic is live, retain only this affected range as a
-    // JIT island; unrelated AOT entry PCs remain eligible.
-    auto invalidation = impl->process_state->BeginRangeInvalidation(impl->fallback != nullptr);
-    if (invalidation.owns_lock()) {
-        impl->icache.InvalidateRange(addr, size);
-        impl->process_state->EndInvalidation();
-    }
-    if (impl->fallback) {
-        impl->fallback->InvalidateCacheRange(addr, size);
-    }
+#ifndef SUYU_NO_JIT
+    if (impl->fallback) impl->fallback->InvalidateCacheRange(addr, size);
+#endif
+    RecompGuardGen::OnInvalidate(addr, size);
 }
 
 void ArmRecomp::GetContext(Kernel::Svc::ThreadContext& ctx) const {
@@ -2046,7 +2480,8 @@ void ArmRecomp::SetContext(const Kernel::Svc::ThreadContext& ctx) {
         impl->ctx.vreg[i][0] = ctx.v[i][0];
         impl->ctx.vreg[i][1] = ctx.v[i][1];
     }
-    impl->ctx.fpcr = ctx.fpcr;
+    // ThreadContext carries the 32-bit guest FPCR; keep the FPX1 kill switch.
+    impl->ctx.fpcr = static_cast<u32>(ctx.fpcr) | FpxInhibitBits();
     impl->ctx.fpsr = ctx.fpsr;
     // Only the guest-owned thread pointer travels in ThreadContext. The
     // read-only one is republished separately by PhysicalCore::LoadContext
@@ -2084,9 +2519,13 @@ void ArmRecomp::SignalInterrupt(Kernel::KThread* thread) {
     impl->interrupted.store(true, std::memory_order_relaxed);
     // While the JIT is running this thread it is the one that has to be woken;
     // the flag above is only read by the recompiled dispatch loop.
+#ifndef SUYU_NO_JIT
     if (impl->fallback) {
         impl->fallback->SignalInterrupt(thread);
     }
+#else
+    (void)thread;
+#endif
 }
 
 const Kernel::DebugWatchpoint* ArmRecomp::HaltedWatchpoint() const {

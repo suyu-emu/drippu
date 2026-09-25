@@ -9,8 +9,8 @@
 
 #include "core/recompiler/arm64_to_c.h"
 #include "core/arm/recomp/recomp_aot_cache.h"
-#include "core/arm/recomp/recomp_icache.h"
 #include "core/arm/recomp/recomp_image_abi.h"
+#include "core/arm/recomp/recomp_module_binding.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
 #include "core/file_sys/common_funcs.h"
@@ -30,7 +30,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -170,11 +169,13 @@ std::string ReadFile(const fs::path& path) {
 constexpr u32 kMovzX0_5 = 0xD28000A0u;
 constexpr u32 kMovzX1_7 = 0xD28000E1u;
 constexpr u32 kMovX0Zero = 0xD2800000u;
-constexpr u32 kAddX2X0X1 = 0x8B010002u;
 constexpr u32 kSvc0 = 0xD4000001u;
 constexpr u32 kRetX5 = 0xD65F00A0u;
 constexpr u32 kRetX30 = 0xD65F03C0u;
+constexpr u32 kRetXzr = 0xD65F03E0u;
+constexpr u32 kBrXzr = 0xD61F03E0u;
 constexpr u32 kBlrX30 = 0xD63F03C0u;
+constexpr u32 kBlrXzr = 0xD63F03E0u;
 constexpr u32 kBPlus8 = 0x14000002u;
 constexpr u32 kMsrFpcrX0 = 0xD51B4400u;
 constexpr u32 kMrsX0Fpcr = 0xD53B4400u;
@@ -485,6 +486,8 @@ add_custom_target(all_module_forms DEPENDS multimodule_probe recompiled_exe_main
                   recompiled_exe_rtld recompiled_image recompiled_rtld)
 )CMAKE") || !WriteFile(out / "probe.c", R"C(
 #include "main/recomp_runtime.h"
+#include <stdlib.h>
+#include <string.h>
 extern BlockFn recomp_image_lookup_main(uint64_t);
 extern BlockFn recomp_image_lookup_rtld(uint64_t);
 extern void recomp_image_set_base_main(uint64_t);
@@ -495,6 +498,16 @@ int main(void) {
     uint64_t lo1, hi1, lo2, hi2;
     BlockFn *idx1, *idx2;
     GuestContext c = {0};
+    /* ABI 5 verifies the guest instruction bytes before running each block.
+       Give both generated modules the code they were built from. */
+    c.mem_base_vaddr = 0x100000;
+    c.mem_size = 0x101008;
+    c.mem = (uint8_t*)calloc(1, (size_t)c.mem_size);
+    if (!c.mem) return 7;
+    const uint32_t main_code[] = {0xD28000A0u, 0xD4000001u};
+    const uint32_t rtld_code[] = {0xD28000E0u, 0xD4000001u};
+    memcpy(c.mem + 0x1000, main_code, sizeof(main_code));
+    memcpy(c.mem + 0x101000, rtld_code, sizeof(rtld_code));
     recomp_image_set_base_main(0x100000);
     recomp_image_set_base_rtld(0x200000);
     if (!recomp_image_index_main(&lo1, &hi1, &idx1) ||
@@ -503,13 +516,16 @@ int main(void) {
     BlockFn a = recomp_image_lookup_main(lo1);
     BlockFn b = recomp_image_lookup_rtld(lo2);
     if (!a || !b || a == b || idx1[0] != a || idx2[0] != b) return 3;
+    c.pc = lo1;
     a(&c);
     if (c.x[0] != 5) return 4;
+    c.pc = lo2;
     b(&c);
     if (c.x[0] != 7) return 5;
     recomp_image_set_base_main(0x300000);
     if (recomp_image_lookup_main(0x301000) != a ||
         recomp_image_lookup_rtld(lo2) != b) return 6;
+    free(c.mem);
     return 0;
 }
 )C")) {
@@ -637,11 +653,11 @@ int main(void) {
   {
     uint64_t lo = 0, hi = 0;
     callbacks = 0;
-    recomp_load_pair32(&ctx, 0x100, &lo, &hi);
+    recomp_ldp32(&ctx, 0x100, &lo, &hi);
     if (lo != 0x44332211ULL || hi != 0x88776655ULL || callbacks != 0) fail = 1;
-    recomp_store_pair64(&ctx, 0x110, 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
+    recomp_stp64(&ctx, 0x110, 0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL);
     if (callbacks != 0) fail = 1;
-    recomp_load_pair64(&ctx, 0x110, &lo, &hi);
+    recomp_ldp64(&ctx, 0x110, &lo, &hi);
     if (lo != 0x0123456789ABCDEFULL || hi != 0xFEDCBA9876543210ULL || callbacks != 0)
       fail = 1;
   }
@@ -675,12 +691,12 @@ int main(void) {
 
   /* A pair spanning discontiguous pages must resolve each half separately. */
   callbacks = 0;
-  recomp_store_pair64(&ctx, PAGE_SIZE - 8, 0x1122334455667788ULL,
+  recomp_stp64(&ctx, PAGE_SIZE - 8, 0x1122334455667788ULL,
                       0x99AABBCCDDEEFF00ULL);
   {
     uint64_t lo = 0, hi = 0;
     callbacks = 0;
-    recomp_load_pair64(&ctx, PAGE_SIZE - 8, &lo, &hi);
+    recomp_ldp64(&ctx, PAGE_SIZE - 8, &lo, &hi);
     if (lo != 0x1122334455667788ULL || hi != 0x99AABBCCDDEEFF00ULL) fail = 1;
   }
 
@@ -766,29 +782,6 @@ int main(void) {
         return;
     }
     pass("page-edge load/store (discontig/tracked/unmapped) via RuntimeC");
-}
-
-void TestDiscoverBlocksPageBoundaries() {
-    // A generated AOT block must never cross a guest page: range invalidation
-    // tracks entry pages, so splitting here makes that metadata sufficient for
-    // every compiled block rather than relying on a conservative neighbour.
-    std::vector<u32> text(0x2008 / sizeof(u32), 0xD503201F); // AArch64 NOP
-    const auto blocks = suyu::recomp::DiscoverBlocks(
-        reinterpret_cast<const u8*>(text.data()), text.size() * sizeof(u32), 0x1000);
-    if (blocks.size() != 3 || blocks[0].vaddr != 0x1000 || blocks[0].size != 0x1000 ||
-        blocks[1].vaddr != 0x2000 || blocks[1].size != 0x1000 || blocks[2].vaddr != 0x3000 ||
-        blocks[2].size != 8) {
-        std::ostringstream detail;
-        detail << "DiscoverBlocks did not split AOT blocks at guest page boundaries (count="
-               << blocks.size();
-        for (const auto& block : blocks) {
-            detail << " [" << std::hex << block.vaddr << "," << block.size << "]";
-        }
-        detail << ")";
-        fail(detail.str());
-        return;
-    }
-    pass("DiscoverBlocks splits AOT blocks at guest page boundaries");
 }
 
 void TestSdivProbes(const fs::path& root) {
@@ -925,7 +918,10 @@ void TestSdivProbes(const fs::path& root) {
 void TestBranchProbes(const fs::path& root) {
     const std::string ret5 = TranslateInsn(kRetX5, 0x1000);
     const std::string ret30 = TranslateInsn(kRetX30, 0x1000);
+    const std::string ret_zr = TranslateInsn(kRetXzr, 0x1000);
+    const std::string br_zr = TranslateInsn(kBrXzr, 0x1000);
     const std::string blr = TranslateInsn(kBlrX30, 0x1000);
+    const std::string blr_zr = TranslateInsn(kBlrXzr, 0x1000);
 
     std::ostringstream src;
     src << "#include <stdint.h>\n#include <stdio.h>\n"
@@ -935,8 +931,14 @@ void TestBranchProbes(const fs::path& root) {
         << ret5
         << "}\nstatic void ret_x30(GuestContext* c) {\n"
         << ret30
+        << "}\nstatic void ret_xzr(GuestContext* c) {\n"
+        << ret_zr
+        << "}\nstatic void br_xzr(GuestContext* c) {\n"
+        << br_zr
         << "}\nstatic void blr_x30(GuestContext* c) {\n"
         << blr
+        << "}\nstatic void blr_xzr(GuestContext* c) {\n"
+        << blr_zr
         << "}\nint main(void) {\n"
            "  int fail = 0;\n"
            "  GuestContext c;\n"
@@ -957,6 +959,11 @@ void TestBranchProbes(const fs::path& root) {
            "  printf(\"BLR X30: pc=%llx expected=8000 lr=%llx expected=1004\\n\",\n"
            "         (unsigned long long)c.pc, (unsigned long long)c.x[30]);\n"
            "  if (c.pc != 0x8000 || c.x[30] != 0x1004) fail = 1;\n"
+           "  c.x[31] = 0x9000; c.pc = 0x1000;\n"
+           "  ret_xzr(&c); if (c.pc != 0) fail = 1;\n"
+           "  c.pc = 0x1000; br_xzr(&c); if (c.pc != 0) fail = 1;\n"
+           "  c.pc = 0x1000; blr_xzr(&c);\n"
+           "  if (c.pc != 0 || c.x[30] != 0x1004) fail = 1;\n"
            "  return fail;\n"
            "}\n";
 
@@ -1388,61 +1395,29 @@ void TestModuleRegistrationSession() {
     }
 }
 
-void TestCacheInvalidation() {
-    using suyu::recomp::RecompICache;
-
-    std::unordered_set<u64> blocks{0x1000, 0x1008};
-    suyu::recomp::g_chain_blocks = &blocks;
-    suyu::recomp::g_chain_mod = "icache";
-    const std::string chain = TranslateInsn(kBPlus8, 0x1000);
-    suyu::recomp::g_chain_blocks = nullptr;
-    suyu::recomp::g_chain_mod = nullptr;
-    if (chain.find("--c->chain_budget <= 0") == std::string::npos) {
-        fail("ChainTo no longer parks when the chain budget is spent: " + chain);
+void TestDirectBranchDispatch() {
+    const std::string branch = TranslateInsn(kBPlus8, 0x1000);
+    // Direct branches return to Doug's dispatcher. It can observe code
+    // invalidation before selecting the next AOT block. The active ABI 5/6
+    // guard behavior is covered by tests/recompiler_smoke/run.py.
+    if (branch.find("c->pc=g_module_base+0x1008ULL; return;") == std::string::npos) {
+        fail("direct branch did not return to the dispatcher: " + branch);
     } else {
-        pass("ChainTo parks when chain_budget hits 0");
+        pass("direct branch returns to dispatcher before the next block");
     }
+}
 
-    RecompICache cache;
-    char aot_block = 0;
-    auto select = [&](u64 pc) -> void* {
-        if (!cache.AllowsAot()) {
-            return nullptr;
-        }
-        return pc == 0x1008 ? &aot_block : nullptr;
+void TestSparseModuleBinding() {
+    const std::vector<std::string_view> images{"main", "sdk"};
+    const auto bind = [&](size_t index, std::string_view live_name) {
+        return suyu::recomp::FindRecompModuleForLive(
+            images.size(), [&](size_t i) { return images[i]; }, index, live_name);
     };
-
-    if (select(0x1008) != &aot_block) {
-        fail("AOT lookup missed 0x1008 before invalidate");
-        return;
-    }
-
-    cache.Clear();
-    if (select(0x1008) == &aot_block) {
-        fail("InvalidateCacheRange left AOT block 0x1008 selected");
+    if (bind(1, "Kart8_Release.nss") != 0 || bind(2, "nnSdk") != 1 ||
+        bind(0, "nnRtld") != -1 || bind(3, "nnUnexpected") != -1) {
+        fail("sparse static images did not bind to their live modules");
     } else {
-        pass("InvalidateCacheRange stopped selecting AOT block 0x1008");
-    }
-    if (cache.AllowsAot()) {
-        fail("direct block chain can still enter invalidated AOT");
-    } else {
-        pass("direct block chain cannot enter invalidated AOT");
-    }
-
-    RecompICache cleared;
-    cleared.Clear();
-    if (cleared.AllowsAot()) {
-        fail("ClearInstructionCache left AOT selectable");
-    } else {
-        pass("ClearInstructionCache rejects AOT");
-    }
-
-    RecompICache from_nested_ic;
-    from_nested_ic.Clear();
-    if (from_nested_ic.AllowsAot()) {
-        fail("nested JIT CacheInvalidation halt left AOT selectable");
-    } else {
-        pass("nested JIT CacheInvalidation halt rejects AOT");
+        pass("sparse static images bind by identity and canonical load slot");
     }
 }
 
@@ -1785,18 +1760,12 @@ void TestSharedImageAbi(const fs::path& root) {
     } else {
         pass("EmitProject exports recomp_image_abi");
     }
-    if (generated.find("build_id") == std::string::npos &&
-        generated.find("0x11") == std::string::npos) {
-        fail("EmitProject export has no content hash");
+    if (generated.find("recomp_image_guard_v2") == std::string::npos ||
+        generated.find("recomp_image_abi(void){ return RECOMP_IMAGE_ABI;") ==
+            std::string::npos) {
+        fail("EmitProject export lacks the active ABI/guard contract");
     } else {
-        pass("EmitProject export carries a content hash");
-    }
-    const std::string unknown_index =
-        std::to_string(kRecompRegsPrefixSize) + "u,\n  " + std::to_string(kRecompMaxModules) + "u,";
-    if (generated.find(unknown_index) == std::string::npos) {
-        fail("EmitProject unknown name stored module_index 0");
-    } else {
-        pass("EmitProject unknown name emits out-of-range module_index");
+        pass("EmitProject exports the active ABI/guard contract");
     }
 }
 
@@ -1920,13 +1889,13 @@ int main() {
     TestEmitProjectCompile(root);
     TestMultiModuleLink(root);
     TestMemoryBoundaries(root);
-    TestDiscoverBlocksPageBoundaries();
     TestSdivProbes(root);
     TestBranchProbes(root);
     TestFpControl(root);
     TestUnresolvedImportPolicy();
     TestModuleRegistrationSession();
-    TestCacheInvalidation();
+    TestSparseModuleBinding();
+    TestDirectBranchDispatch();
     TestExportAddonClassification();
     TestSharedImageAbi(root);
     TestAotCacheReuse();

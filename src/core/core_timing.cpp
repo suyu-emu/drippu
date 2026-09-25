@@ -291,12 +291,11 @@ std::optional<s64> CoreTiming::Advance() {
 void CoreTiming::Reset() {
     paused = true;
     if (timer_thread.joinable()) {
-        // request_stop before Set: otherwise the thread can consume the
-        // wakeup, loop back into Event::Wait, and join() hangs forever
-        // (Catch2 named this as CoreTiming[BasicOrderNoPausing] SIGTERM).
         timer_thread.request_stop();
-        pause_event.Set();
-        event.Set();
+    }
+    pause_event.Set();
+    event.Set();
+    if (timer_thread.joinable()) {
         timer_thread.join();
     }
     has_started = false;

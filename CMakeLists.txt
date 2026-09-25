@@ -13,7 +13,10 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/find")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules")
 
-set(CPM_SOURCE_CACHE ${CMAKE_SOURCE_DIR}/.cache/cpm)
+# Keep an explicit -DCPM_SOURCE_CACHE authoritative, including for read-only
+# source checkouts. A normal variable here would hide the caller's cache entry.
+set(CPM_SOURCE_CACHE "${CMAKE_SOURCE_DIR}/.cache/cpm" CACHE PATH
+    "Directory to download CPM dependencies")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES 0)
 
@@ -26,6 +29,10 @@ include(UseCcache)
 include(CMakeDependentOption)
 include(CTest)
 include(CPMUtil)
+option(SUYU_USE_LOCAL_EXTERNALS "Use locally populated dependency trees (custom revisions)" OFF)
+if(SUYU_USE_LOCAL_EXTERNALS)
+    include(LocalDependencies)
+endif()
 
 if (NOT DEFINED ARCHITECTURE)
     message(FATAL_ERROR "Architecture didn't make it out of scope, did you delete DetectArchitecture.cmake?")
@@ -203,7 +210,8 @@ if(MSVC)
 endif()
 
 # TODO(crueter): Cleanup, each dep that has a bundled option should allow to choose between bundled, external, system
-cmake_dependent_option(YUZU_USE_BUNDLED_SDL3 "Download bundled SDL3 build" "${MSVC}" "NOT ANDROID" OFF)
+cmake_dependent_option(ENABLE_SDL3 "Enable SDL3 audio and input backends" ON "NOT ANDROID AND NOT IOS" OFF)
+cmake_dependent_option(YUZU_USE_BUNDLED_SDL3 "Download bundled SDL3 build" "${MSVC}" "ENABLE_SDL3" OFF)
 
 option(ENABLE_CUBEB "Enables the cubeb audio backend" ON)
 
@@ -231,6 +239,15 @@ cmake_dependent_option(ENABLE_OPENGL "Enable OpenGL" ON "NOT (WIN32 AND ARCHITEC
 mark_as_advanced(FORCE ENABLE_OPENGL)
 
 option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
+# A build with no dynamic recompiler in it at all. The CPU then comes
+# entirely from statically recompiled images, and an address none of them
+# covers is a hard failure rather than a fallback - which is the point.
+# Titles without a complete static image, and AArch32 titles, cannot run in
+# such a build. The guest-facing jit:u service goes with it.
+option(SUYU_NO_JIT "Build without dynarmic: statically recompiled code only" "${IOS}")
+if(IOS AND NOT SUYU_NO_JIT)
+    message(FATAL_ERROR "iOS requires SUYU_NO_JIT=ON")
+endif()
 option(SUYU_BUILD_LIBRETRO_CORE "Build suyu as a libretro core (suyu_libretro.dll)" OFF)
 if (SUYU_BUILD_LIBRETRO_CORE)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -240,9 +257,16 @@ if (SUYU_BUILD_LIBRETRO_CORE)
     # that only exist in src/android/.../native.cpp.
     add_compile_definitions(SUYU_BUILD_LIBRETRO_CORE)
 endif()
+option(SUYU_ANDROID_LIBRETRO "Build Android libretro without standalone app JNI" OFF)
+if (SUYU_ANDROID_LIBRETRO)
+    if (NOT ANDROID OR NOT SUYU_BUILD_LIBRETRO_CORE)
+        message(FATAL_ERROR "SUYU_ANDROID_LIBRETRO requires Android and SUYU_BUILD_LIBRETRO_CORE")
+    endif()
+    add_compile_definitions(SUYU_ANDROID_LIBRETRO)
+endif()
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 
-cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" OFF "ENABLE_QT" OFF)
+cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" ON "NOT ANDROID" OFF)
 
 option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")
 
@@ -272,13 +296,16 @@ cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT A
 cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CMD "Compile the suyu-cli executable" ON "NOT ANDROID" OFF)
+if(NOT ENABLE_SDL3 AND (ENABLE_QT OR YUZU_CMD))
+    message(FATAL_ERROR "SDL3-disabled core builds require ENABLE_QT=OFF and YUZU_CMD=OFF")
+endif()
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR PLATFORM_LINUX" OFF)
 
 option(YUZU_DOWNLOAD_TIME_ZONE_DATA "Always download time zone binaries" ON)
 set(YUZU_TZDB_PATH "" CACHE STRING "Path to a pre-downloaded timezone database")
 
-cmake_dependent_option(YUZU_USE_BUNDLED_MOLTENVK "Download bundled MoltenVK lib" ON "APPLE" OFF)
+cmake_dependent_option(YUZU_USE_BUNDLED_MOLTENVK "Download bundled MoltenVK lib" ON "APPLE AND NOT IOS" OFF)
 
 option(YUZU_DISABLE_LLVM "Disable LLVM (useful for CI)" OFF)
 
@@ -376,6 +403,11 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(IOS)
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+endif()
 
 # Output binaries to bin/
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
@@ -399,7 +431,11 @@ else()
     set(OPENSSL_CONFIGURE_VERBOSE ON)
 
     if (OpenSSL_ADDED)
-        AddJsonPackage(openssl-cmake)
+        if (SUYU_ANDROID_LIBRETRO)
+            AddJsonPackage(NAME openssl-cmake OPTIONS "OPENSSL_CONFIGURE_OPTIONS no-asm")
+        else()
+            AddJsonPackage(openssl-cmake)
+        endif()
     endif()
 endif()
 
@@ -414,7 +450,10 @@ set(BUILD_TESTING OFF)
 set(ENABLE_TESTING OFF)
 
 # boost
-set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers process filesystem crc variant)
+set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers process filesystem context crc variant)
+if(IOS)
+    list(REMOVE_ITEM BOOST_INCLUDE_LIBRARIES process)
+endif()
 
 AddJsonPackage(boost)
 
@@ -452,6 +491,16 @@ endif()
 
 # fmt
 AddJsonPackage(fmt)
+# Third-party headers must not inherit first-party warnings-as-errors.
+if(fmt_ADDED AND TARGET fmt)
+    set_property(TARGET fmt PROPERTY SYSTEM TRUE)
+    # Homebrew can expose a newer fmt header in the global system include
+    # directory while CPM builds the pinned library. Put the pinned headers
+    # first for every target so compiled objects use the library's ABI.
+    if(DEFINED CPM_PACKAGE_fmt_SOURCE_DIR)
+        include_directories(BEFORE "${CPM_PACKAGE_fmt_SOURCE_DIR}/include")
+    endif()
+endif()
 
 # lz4
 AddJsonPackage(lz4)
@@ -529,7 +578,12 @@ endfunction()
 # =============================================
 
 if (APPLE)
-    foreach(fw Carbon Metal Cocoa IOKit CoreVideo CoreMedia Security UniformTypeIdentifiers)
+    if(IOS)
+        set(apple_frameworks Foundation CoreFoundation CFNetwork UIKit Metal QuartzCore IOSurface CoreGraphics CoreVideo CoreMedia Security UniformTypeIdentifiers GameController)
+    else()
+        set(apple_frameworks Carbon Metal Cocoa IOKit CoreVideo CoreMedia Security UniformTypeIdentifiers)
+    endif()
+    foreach(fw IN LISTS apple_frameworks)
         find_library(${fw}_LIBRARY ${fw} REQUIRED)
         list(APPEND PLATFORM_LIBRARIES ${${fw}_LIBRARY})
     endforeach()
@@ -564,13 +618,17 @@ if (ARCHITECTURE_x86 OR ARCHITECTURE_x86_64)
 endif()
 
 if (NOT YUZU_STATIC_ROOM)
-    find_package(libusb)
+    if(ENABLE_LIBUSB)
+        find_package(libusb)
+    endif()
     find_package(VulkanMemoryAllocator)
     find_package(VulkanUtilityLibraries)
     find_package(SimpleIni)
     find_package(sirit)
     find_package(gamemode)
-    find_package(frozen)
+    if(ENABLE_QT)
+        find_package(frozen)
+    endif()
 
     if (ARCHITECTURE_riscv64)
         find_package(biscuit)
@@ -584,7 +642,7 @@ if (NOT YUZU_STATIC_ROOM)
         find_package(oaknut)
     endif()
 
-    if (NOT ANDROID)
+    if (ENABLE_SDL3)
         find_package(SDL3)
     endif()
 
@@ -636,7 +694,12 @@ if (ENABLE_QT)
     ## Components ##
 
     # Best practice is to ask for all components at once, so they are from the same version
-    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network Svg)
+    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network)
+
+    # Svg is optional: nothing links Qt6::Svg or includes its headers, it is only wanted so the
+    # svg image format plugin is available for the icon themes. Some prebuilt Qt packages (the
+    # bundled Windows one included) ship without it, and requiring it fails configure outright.
+    list(APPEND YUZU_QT_OPTIONAL Svg)
     if (PLATFORM_LINUX OR PLATFORM_FREEBSD)
         list(APPEND YUZU_QT_COMPONENTS DBus)
         # Linux distro Qt packages expose private headers through Qt6Gui's
@@ -730,6 +793,53 @@ if (MSVC AND CXX_CLANG)
 endif()
 
 add_subdirectory(src)
+if(SUYU_NO_JIT)
+    target_compile_definitions(common PRIVATE SUYU_NO_JIT=1)
+endif()
+
+option(SUYU_BUILD_IOS_CORE_PROBE "Build iHorizon with the real iOS core initialization probe" OFF)
+if(SUYU_BUILD_IOS_CORE_PROBE)
+    if(NOT IOS OR NOT SUYU_NO_JIT)
+        message(FATAL_ERROR "The iHorizon core probe requires iOS and SUYU_NO_JIT")
+    endif()
+    set(IHORIZON_APP_SOURCE "" CACHE PATH "iHorizon launcher source directory")
+    if(NOT EXISTS "${IHORIZON_APP_SOURCE}/apple/main.mm")
+        message(FATAL_ERROR "Set IHORIZON_APP_SOURCE to the iHorizon checkout")
+    endif()
+    add_subdirectory(research/ios)
+    set_property(TARGET iHorizon PROPERTY SOURCES
+        "${IHORIZON_APP_SOURCE}/apple/main.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/research/ios/src/core_probe.cpp")
+    target_include_directories(iHorizon PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_definitions(iHorizon PRIVATE IHORIZON_WITH_CORE=1)
+    target_compile_options(iHorizon PRIVATE -fno-rtti)
+    target_link_libraries(iHorizon PRIVATE core input_common frontend_common objc ${PLATFORM_LIBRARIES})
+    target_link_libraries(iHorizon PRIVATE "${MOLTENVK_LIBRARY}")
+    # Xcode's simulator SDK does not ship libc++experimental. Keep the global
+    # compile feature flag, but select the ordinary libc++ archive at this final
+    # app link. The physical-device SDK continues to use its existing path.
+    if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+        target_link_options(iHorizon PRIVATE -nostdlib++ -lc++)
+    endif()
+    option(IHORIZON_GAMEPLAY "Build the controlled iOS gameplay frontend" OFF)
+    if(IHORIZON_GAMEPLAY)
+        set(IHORIZON_GAME_IDENTITY_FILE "" CACHE FILEPATH "Private signed content identity manifest")
+        if(NOT EXISTS "${IHORIZON_GAME_IDENTITY_FILE}")
+            message(FATAL_ERROR "Gameplay requires the exact private content identity manifest")
+        endif()
+        target_sources(iHorizon PRIVATE "${IHORIZON_APP_SOURCE}/apple/game_session.mm"
+            "${IHORIZON_APP_SOURCE}/apple/vulkan_probe.mm"
+            "${IHORIZON_APP_SOURCE}/apple/platform_input.mm"
+            "${CMAKE_CURRENT_SOURCE_DIR}/research/ios/src/core_bridge.cpp"
+            "${IHORIZON_GAME_IDENTITY_FILE}")
+        set_source_files_properties("${IHORIZON_GAME_IDENTITY_FILE}" TARGET_DIRECTORY iHorizon
+            PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+        target_compile_definitions(iHorizon PRIVATE IHORIZON_GAMEPLAY=1)
+        target_link_libraries(iHorizon PRIVATE Vulkan::Headers)
+    endif()
+    set_target_properties(iHorizon PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST "${IHORIZON_APP_SOURCE}/apple/Info.plist.in")
+endif()
 
 if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-disas)

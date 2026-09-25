@@ -6,7 +6,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 #include <atomic>
 #ifdef SUYU_BUILD_LIBRETRO_CORE
 // The libretro core is linked without the Android app (native.cpp), so the
@@ -23,7 +23,7 @@ extern std::atomic<bool> g_has_battery;
 
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>
-#if TARGET_OS_MAC
+#if TARGET_OS_OSX
 #include <IOKit/ps/IOPSKeys.h>
 #include <IOKit/ps/IOPowerSources.h>
 #endif
@@ -53,12 +53,15 @@ namespace Common {
             info.has_battery = false;
         }
 
+#elif defined(SUYU_ANDROID_LIBRETRO)
+        // RetroArch supplies input/audio, but no host battery API is negotiated.
+        info.has_battery = false;
 #elif defined(__ANDROID__)
         info.percentage = g_battery_percentage.load(std::memory_order_relaxed);
         info.charging = g_is_charging.load(std::memory_order_relaxed);
         info.has_battery = g_has_battery.load(std::memory_order_relaxed);
 
-#elif defined(__APPLE__) && TARGET_OS_MAC
+#elif defined(__APPLE__) && TARGET_OS_OSX
         CFTypeRef info_ref = IOPSCopyPowerSourcesInfo();
         CFArrayRef sources = IOPSCopyPowerSourcesList(info_ref);
         if (CFArrayGetCount(sources) > 0) {

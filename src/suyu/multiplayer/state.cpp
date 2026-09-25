@@ -34,6 +34,8 @@ MultiplayerState::MultiplayerState(QWidget* parent, QStandardItemModel* game_lis
         error_callback_handle = member->BindOnError(
             [this](const Network::RoomMember::Error& error) { emit NetworkError(error); });
         connect(this, &MultiplayerState::NetworkError, this, &MultiplayerState::OnNetworkError);
+        room_information_callback_handle = member->BindOnRoomInformationChanged(
+            [this](const Network::RoomInformation&) { emit RoomInformationChanged(); });
     }
 
     qRegisterMetaType<Network::RoomMember::State>();
@@ -89,9 +91,12 @@ QString FindLocalGameByNameRecursive(const QAbstractItemModel* model, const QMod
         const auto index = model->index(row, 0, parent);
         const QString title = index.data(Qt::DisplayRole).toString().trimmed().toLower();
         const QString path = index.data(GameListItemPath::FullPathRole).toString();
+        const bool is_game =
+            index.data(GameListItem::TypeRole).value<GameListItemType>() ==
+            GameListItemType::Game;
         // Compare loosely: room names carry decoration ("Smash Ultimate - EU"),
         // so an exact match would rarely fire.
-        if (!path.isEmpty() && !title.isEmpty() &&
+        if (is_game && !path.isEmpty() && !title.isEmpty() &&
             (title.contains(wanted) || wanted.contains(title))) {
             return path;
         }
@@ -155,6 +160,11 @@ void MultiplayerState::Close() {
     if (error_callback_handle) {
         if (auto member = room_network.GetRoomMember().lock()) {
             member->Unbind(error_callback_handle);
+        }
+    }
+    if (room_information_callback_handle) {
+        if (auto member = room_network.GetRoomMember().lock()) {
+            member->Unbind(room_information_callback_handle);
         }
     }
     if (host_room) {

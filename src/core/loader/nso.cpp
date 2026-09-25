@@ -15,6 +15,7 @@
 #include "common/lz4_compression.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/arm/recomp/recomp_gap_session.h"
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"
@@ -218,6 +219,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Load codeset for current process
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
+    // Where this module's code starts, keyed by its build ID, so a recompiled
+    // run can say which module a coverage gap is in (recomp_gaps.json).
+    Core::RecompGaps::NoteModule(load_base + module_start, image_size - module_start, name,
+                                 nso_header.build_id);
     return load_base + image_size;
 }
 
