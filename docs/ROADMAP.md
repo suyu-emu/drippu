@@ -288,7 +288,7 @@ In addition to the six priority items above, drippu continues to track and incre
 
 \- Watch the \[drippu repository](https://github.com/suyu-emu/drippu) and its issues / discussions.
 
-\- Review release notes and the recompiler-compatibility baseline artifacts published by CI.
+\- Review release notes and the active recompiler smoke-test results published by CI.
 
 \- Participate in the suyu / drippu community channels for design discussions and evaluation feedback.
 
@@ -313,6 +313,5 @@ In addition to the six priority items above, drippu continues to track and incre
 
 
 This roadmap is intentionally high-level. Detailed design documents, issue trackers, and experimental branches will expand each item as work progresses.
-
 
 
