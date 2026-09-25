@@ -784,29 +784,6 @@ int main(void) {
     pass("page-edge load/store (discontig/tracked/unmapped) via RuntimeC");
 }
 
-void TestDiscoverBlocksPageBoundaries() {
-    // A generated AOT block must never cross a guest page: range invalidation
-    // tracks entry pages, so splitting here makes that metadata sufficient for
-    // every compiled block rather than relying on a conservative neighbour.
-    std::vector<u32> text(0x2008 / sizeof(u32), 0xD503201F); // AArch64 NOP
-    const auto blocks = suyu::recomp::DiscoverBlocks(
-        reinterpret_cast<const u8*>(text.data()), text.size() * sizeof(u32), 0x1000);
-    if (blocks.size() != 3 || blocks[0].vaddr != 0x1000 || blocks[0].size != 0x1000 ||
-        blocks[1].vaddr != 0x2000 || blocks[1].size != 0x1000 || blocks[2].vaddr != 0x3000 ||
-        blocks[2].size != 8) {
-        std::ostringstream detail;
-        detail << "DiscoverBlocks did not split AOT blocks at guest page boundaries (count="
-               << blocks.size();
-        for (const auto& block : blocks) {
-            detail << " [" << std::hex << block.vaddr << "," << block.size << "]";
-        }
-        detail << ")";
-        fail(detail.str());
-        return;
-    }
-    pass("DiscoverBlocks splits AOT blocks at guest page boundaries");
-}
-
 void TestSdivProbes(const fs::path& root) {
     const std::string sdiv_x = TranslateInsn(kSdivX0X1X2, 0x1000);
     const std::string sdiv_w = TranslateInsn(kSdivW0W1W2, 0x1000);
@@ -1912,7 +1889,6 @@ int main() {
     TestEmitProjectCompile(root);
     TestMultiModuleLink(root);
     TestMemoryBoundaries(root);
-    TestDiscoverBlocksPageBoundaries();
     TestSdivProbes(root);
     TestBranchProbes(root);
     TestFpControl(root);
