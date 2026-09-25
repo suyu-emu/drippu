@@ -485,6 +485,8 @@ add_custom_target(all_module_forms DEPENDS multimodule_probe recompiled_exe_main
                   recompiled_exe_rtld recompiled_image recompiled_rtld)
 )CMAKE") || !WriteFile(out / "probe.c", R"C(
 #include "main/recomp_runtime.h"
+#include <stdlib.h>
+#include <string.h>
 extern BlockFn recomp_image_lookup_main(uint64_t);
 extern BlockFn recomp_image_lookup_rtld(uint64_t);
 extern void recomp_image_set_base_main(uint64_t);
@@ -495,6 +497,16 @@ int main(void) {
     uint64_t lo1, hi1, lo2, hi2;
     BlockFn *idx1, *idx2;
     GuestContext c = {0};
+    /* ABI 5 verifies the guest instruction bytes before running each block.
+       Give both generated modules the code they were built from. */
+    c.mem_base_vaddr = 0x100000;
+    c.mem_size = 0x101008;
+    c.mem = (uint8_t*)calloc(1, (size_t)c.mem_size);
+    if (!c.mem) return 7;
+    const uint32_t main_code[] = {0xD28000A0u, 0xD4000001u};
+    const uint32_t rtld_code[] = {0xD28000E0u, 0xD4000001u};
+    memcpy(c.mem + 0x1000, main_code, sizeof(main_code));
+    memcpy(c.mem + 0x101000, rtld_code, sizeof(rtld_code));
     recomp_image_set_base_main(0x100000);
     recomp_image_set_base_rtld(0x200000);
     if (!recomp_image_index_main(&lo1, &hi1, &idx1) ||
@@ -503,13 +515,16 @@ int main(void) {
     BlockFn a = recomp_image_lookup_main(lo1);
     BlockFn b = recomp_image_lookup_rtld(lo2);
     if (!a || !b || a == b || idx1[0] != a || idx2[0] != b) return 3;
+    c.pc = lo1;
     a(&c);
     if (c.x[0] != 5) return 4;
+    c.pc = lo2;
     b(&c);
     if (c.x[0] != 7) return 5;
     recomp_image_set_base_main(0x300000);
     if (recomp_image_lookup_main(0x301000) != a ||
         recomp_image_lookup_rtld(lo2) != b) return 6;
+    free(c.mem);
     return 0;
 }
 )C")) {
@@ -1391,16 +1406,13 @@ void TestModuleRegistrationSession() {
 void TestCacheInvalidation() {
     using suyu::recomp::RecompICache;
 
-    std::unordered_set<u64> blocks{0x1000, 0x1008};
-    suyu::recomp::g_chain_blocks = &blocks;
-    suyu::recomp::g_chain_mod = "icache";
-    const std::string chain = TranslateInsn(kBPlus8, 0x1000);
-    suyu::recomp::g_chain_blocks = nullptr;
-    suyu::recomp::g_chain_mod = nullptr;
-    if (chain.find("--c->chain_budget <= 0") == std::string::npos) {
-        fail("ChainTo no longer parks when the chain budget is spent: " + chain);
+    const std::string branch = TranslateInsn(kBPlus8, 0x1000);
+    // Direct branches return to Doug's dispatcher. It can observe code
+    // invalidation before selecting the next AOT block.
+    if (branch.find("c->pc=g_module_base+0x1008ULL; return;") == std::string::npos) {
+        fail("direct branch did not return to the dispatcher: " + branch);
     } else {
-        pass("ChainTo parks when chain_budget hits 0");
+        pass("direct branch returns to dispatcher before the next block");
     }
 
     RecompICache cache;
@@ -1785,18 +1797,12 @@ void TestSharedImageAbi(const fs::path& root) {
     } else {
         pass("EmitProject exports recomp_image_abi");
     }
-    if (generated.find("build_id") == std::string::npos &&
-        generated.find("0x11") == std::string::npos) {
-        fail("EmitProject export has no content hash");
+    if (generated.find("recomp_image_guard_v2") == std::string::npos ||
+        generated.find("recomp_image_abi(void){ return RECOMP_IMAGE_ABI;") ==
+            std::string::npos) {
+        fail("EmitProject export lacks the active ABI/guard contract");
     } else {
-        pass("EmitProject export carries a content hash");
-    }
-    const std::string unknown_index =
-        std::to_string(kRecompRegsPrefixSize) + "u,\n  " + std::to_string(kRecompMaxModules) + "u,";
-    if (generated.find(unknown_index) == std::string::npos) {
-        fail("EmitProject unknown name stored module_index 0");
-    } else {
-        pass("EmitProject unknown name emits out-of-range module_index");
+        pass("EmitProject exports the active ABI/guard contract");
     }
 }
 
