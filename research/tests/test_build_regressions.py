@@ -4,7 +4,7 @@
 No game files, keys, firmware, renderer mocks, or network access are used.
 """
 from pathlib import Path
-import ast, os, re, shlex, shutil, subprocess, sys, tempfile, unittest
+import ast, os, re, shlex, subprocess, sys, tempfile, unittest
 ROOT=Path(__file__).resolve().parents[2]
 CXX=shlex.split(os.environ.get('CXX','c++'))
 

@@ -3,9 +3,7 @@
 """Run a content-free build/negative-test matrix; keep compiler logs locally."""
 import os
 import plistlib
-import re
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path

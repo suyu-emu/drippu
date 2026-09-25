@@ -28,8 +28,9 @@ core.retro_set_environment.argtypes = [Environment]
 core.retro_set_environment(environment)
 assert len(options) == 9, options
 # The performance readout is the one option applied live, without a reload.
-assert options.pop("suyu_show_perf") == "Show Game Performance; On|Off"
-assert all("(reload content)" in description for description in options.values())
+assert options.get("suyu_show_perf") == "Show Game Performance; On|Off"
+assert all("(reload content)" in description for key, description in options.items()
+           if key != "suyu_show_perf")
 for unsupported in ("suyu_renderer", "suyu_online_server", "suyu_online_port",
                     "suyu_online_nickname"):
     assert unsupported not in options
