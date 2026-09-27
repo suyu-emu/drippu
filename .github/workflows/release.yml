@@ -21,6 +21,7 @@ permissions:
 
 jobs:
   build-linux:
+    if: github.event.deleted != true
     name: Linux (${{ matrix.variant }})
     runs-on: ubuntu-24.04
     strategy:
@@ -100,6 +101,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    if: github.event.deleted != true
     name: Windows (${{ matrix.variant }})
     # Host link inputs must remain consumable by supported VS 2022 toolchains.
     # windows-latest now selects VS 2026 and can introduce newer STL helpers.
@@ -193,6 +195,7 @@ jobs:
           if-no-files-found: error
 
   build-macos:
+    if: github.event.deleted != true
     name: macOS (arm64)
     # Apple Silicon only. Homebrew supplies Qt, FFmpeg and SDL3; macdeployqt
     # copies them into the bundle so the download does not need Homebrew. The
@@ -276,6 +279,7 @@ jobs:
           if-no-files-found: error
 
   build-libretro:
+    if: github.event.deleted != true
     name: libretro core (${{ matrix.platform }})
     # Built on its own so enabling the core (position-independent code) never
     # changes the standalone binaries above.
@@ -403,6 +407,7 @@ jobs:
           if-no-files-found: error
 
   build-android:
+    if: github.event.deleted != true
     name: Android (arm64)
     runs-on: ubuntu-24.04
     steps:
@@ -466,6 +471,7 @@ jobs:
           if-no-files-found: error
 
   source:
+    if: github.event.deleted != true
     name: Source archive
     runs-on: ubuntu-latest
     steps:
@@ -531,7 +537,7 @@ jobs:
     # Only for a tag, and only when every build succeeded. The previous version
     # used `if: always()`, so a release could go out with a platform missing or
     # a failed build silently omitted.
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && github.event.deleted != true
     needs: [build-linux, build-windows, build-macos, build-libretro, build-android, source]
     runs-on: ubuntu-latest
     steps:
