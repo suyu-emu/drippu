@@ -145,7 +145,7 @@ def check_coverage_loop(root, exporter, build):
         return out
 
     first = export("loop-1")
-    call([executable(build("run-loop-1", f"-DLOOP_DIR={first}"), "smoke_loop"), "record", gaps])
+    call([executable(build("run-loop-1", f"-DLOOP_DIR={first.as_posix()}"), "smoke_loop"), "record", gaps])
     # No usable gaps must leave the output byte-identical: an empty file, and
     # gaps recorded against another build of the module.
     empty = root / "loop-empty.json"
@@ -159,7 +159,7 @@ def check_coverage_loop(root, exporter, build):
     second = export("loop-2", gaps)
     if tree_hash(second) == tree_hash(first):
         raise RuntimeError("the recorded gap did not reach block discovery")
-    call([executable(build("run-loop-2", f"-DLOOP_DIR={second}"), "smoke_loop"), "static", gaps])
+    call([executable(build("run-loop-2", f"-DLOOP_DIR={second.as_posix()}"), "smoke_loop"), "static", gaps])
     print("Coverage loop checks passed.")
 
 
@@ -177,12 +177,12 @@ def main():
         compiler_options = []
         for key, value in (("C", args.cc), ("CXX", args.cxx)):
             if value:
-                compiler_options.append(f"-DCMAKE_{key}_COMPILER={value}")
+                compiler_options.append(f"-DCMAKE_{key}_COMPILER={Path(value).as_posix()}")
 
         def build(name, *options):
             directory = root / name
             call([args.cmake, "-S", test_source, "-B", directory,
-                  f"-DSUYU_SOURCE={source}", "-DCMAKE_BUILD_TYPE=Release", *compiler_options,
+                  f"-DSUYU_SOURCE={source.as_posix()}", "-DCMAKE_BUILD_TYPE=Release", *compiler_options,
                   *options])
             call([args.cmake, "--build", directory, "--config", "Release", "--parallel", "2"])
             return directory
@@ -207,7 +207,7 @@ def main():
 
         for name, switches in VARIANTS:
             guard_gen = "SUYU_RECOMP_AB_GUARD_GEN" in switches
-            run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name]}")
+            run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name].as_posix()}")
             runner = executable(run, "smoke_run")
             hybrid_env = dict(os.environ, SUYU_RECOMP_STRICT="0")
             for mode in ("hybrid-mutated-entry", "hybrid-unmapped-entry",

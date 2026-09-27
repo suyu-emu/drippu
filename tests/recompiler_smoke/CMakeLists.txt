@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 project(recompiler_smoke LANGUAGES C CXX)
+foreach(path_variable SUYU_SOURCE GENERATED_DIR LOOP_DIR)
+  if(DEFINED ${path_variable})
+    file(TO_CMAKE_PATH "${${path_variable}}" normalized_path)
+    set(${path_variable} "${normalized_path}")
+  endif()
+endforeach()
 set(gaps_source "${SUYU_SOURCE}/src/core/arm/recomp/recomp_gaps.cpp")
 if(LOOP_DIR)
   # The coverage loop: a generated module driven with the real gap recorder.
