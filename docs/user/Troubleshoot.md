@@ -42,9 +42,26 @@ Re-export them.
 
 ## Exported game crashes on start-up, or when closing suyu with Export Game open
 
+For a Hybrid package made before v0.0.12, re-export it. Older generated code could
+abort when the game changed an instruction after translation. New Hybrid exports
+return to JIT before executing the changed block. Strict AOT still rejects changes
+it cannot execute safely.
+
 A rare crash can happen right at start-up (system services still starting); just
 launch the game again. Separately, closing suyu while the **Export Game** dialog is
 still open can crash suyu. Both are known issues.
+
+## Hybrid export says the static executable was not produced
+
+Extract the complete Windows release, including `export-build-kit`, and install
+the x64 Visual Studio C++ toolchain, Windows SDK and CMake/Ninja. A compiler alone
+could not build a standalone game from older downloads, because they lacked the
+host link inputs. v0.0.12 includes those inputs and reports missing build support
+before copying the game data.
+
+Keep **Allow Dynarmic fallback** enabled for Hybrid. A large module may exceed
+Windows link limits; Hybrid can then compile the remaining modules and leave that
+module to JIT. Re-exporting is necessary to pick up the corrected module selection.
 
 ## No sound in an exported game
 

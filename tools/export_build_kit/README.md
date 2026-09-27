@@ -12,7 +12,7 @@ Ninja Release build with `SUYU_EXPORT_BUILD_KIT=ON`, then build target
 Point the exporter host configuration at that directory, retaining
 `SUYU_CMD_RECOMP_DIR`, `SUYU_RECOMP_HYBRID`, and optional
 `SUYU_CMD_RECOMP_PREBUILT_DIR`. Pass
-`SUYU_EXPORT_BUILD_KIT_REVISION=suyu-aot-kit-abi6-fm1-gg1-fpx1-r1`.
+`SUYU_EXPORT_BUILD_KIT_REVISION=suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r2`.
 The resulting target is `suyu-cmd-static`, output in `bin`. All ABI 6 handshake
 sidecars and a nonempty `recomp_modules.cmake` are required. Changing the registry
 or host layout requires changing the revision on both sides.

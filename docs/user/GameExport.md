@@ -5,9 +5,10 @@ package is a program you can double-click or launch from Steam, without opening 
 Exporting reads the game on this computer and writes the package to the output folder
 you choose.
 
-> **Re-export builds made with v0.0.10 or earlier.** This release uses a new format
-> for pre-compiled code (ABI 5) and refuses older (ABI 4) builds. Re-exporting also
-> fixes the version number, shader cache, firmware and controller handling.
+> **Re-export static and Hybrid packages for v0.0.12.** The code-guard fix is compiled
+> into each game's generated code. Updating suyu alone does not change an existing
+> game executable. Packages made with v0.0.10 or earlier still need regeneration
+> because their older code format is unsupported.
 
 ## Quick steps (Windows)
 
@@ -58,6 +59,18 @@ Hybrid remains the choice when static won't run a game.
 - **Build** is the default on Windows. It produces a standalone program. The Hybrid
   and static backends compile the generated code, which needs CMake and a C compiler
   and can take a long time for large games.
+
+  The Windows download now includes an **export-build-kit** folder. Keep it beside
+  `suyu.exe`; it supplies the matched host objects and libraries needed to link a
+  game, without a suyu source checkout. Install the x64 Visual Studio C++ Build Tools
+  with a Windows SDK and CMake/Ninja. LLVM/Clang is optional. The kit uses the default
+  AOT features; disabling them through environment overrides requires a configured
+  source build.
+
+  Hybrid can leave a module to JIT if it fails to compile or exceeds Windows binary
+  size limits. The completion result and package manifest identify those modules.
+  Generated source files for a failed module do not cause it to be linked again.
+  Strict AOT stops on these failures instead of silently switching to JIT.
 
   On Windows, the game code runs faster when LLVM/Clang is installed, because the
   export then compiles it with clang-cl instead of Microsoft's compiler (it also

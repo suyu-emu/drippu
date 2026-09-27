@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import shutil
 
-REVISION = "suyu-aot-kit-abi6-fm1-gg1-fpx1-r1"
+REVISION = "suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r2"
 
 
 def ninja_words(value):

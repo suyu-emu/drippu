@@ -20,7 +20,7 @@ foreach(index RANGE ${KIT_LAST_INPUT})
 endforeach()
 file(READ "${CMAKE_CURRENT_LIST_DIR}/revision.txt" KIT_REVISION)
 string(STRIP "${KIT_REVISION}" KIT_REVISION)
-if(NOT KIT_REVISION STREQUAL "suyu-aot-kit-abi6-fm1-gg1-fpx1-r1" OR
+if(NOT KIT_REVISION STREQUAL "suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r2" OR
    NOT SUYU_EXPORT_BUILD_KIT_REVISION STREQUAL KIT_REVISION)
     message(FATAL_ERROR "Export/build-kit revision mismatch; re-export with this release")
 endif()

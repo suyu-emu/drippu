@@ -41,6 +41,7 @@ static int unmapped;
 static uint64_t unmapped_from = UINT64_MAX;
 static GuestContext context;
 static uint64_t abort_pc;
+static int mutate_after_guard;
 
 static void set_page(unsigned page, unsigned char* host, unsigned type) {
     backing[page] = host;
@@ -99,6 +100,15 @@ static uint64_t checked_load(void* user, uint64_t va, uint32_t size) {
     ++reads;
     if (unmapped || va >= unmapped_from || va < 0x1000 || va - 0x1000 > sizeof(memory) - 4) return 0;
     memcpy(&word, memory + va - 0x1000, 4);
+    if (mutate_after_guard && va == 0x1004) {
+        /* Finish the caller's verification with its original branch, then
+           change its direct-chain target before that target is entered. */
+        mutate_after_guard = 0;
+        memory[0] ^= 1;
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+        ++g_recomp_gg_word;
+#endif
+    }
     return word | UINT64_C(0x100000000);
 }
 static void host_store(void* user, uint64_t va, uint32_t size, uint64_t value) {
@@ -449,6 +459,40 @@ int main(int argc, char** argv) {
         recomp_image_run_slice(&context);
         CHECK(context.x[0] == 4096 && context.chain_budget == 0);
         CHECK(reads == 8192 && stack_max - stack_min < 4096);
+    } else if (!strcmp(mode, "hybrid-middle-entry")) {
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+        g_recomp_gg_word = 1;
+#endif
+        reset(0x1018, 3); /* Enter after the block's mov x2,#1. */
+        context.x[0] = 99;
+        context.x[2] = 77;
+        context.x[30] = 0x1028;
+        memory[0x1c] ^= 1; /* Reject the later RET before any native effect. */
+        recomp_image_lookup(context.pc)(&context);
+        CHECK(context.halted == RECOMP_HALT_UNHANDLED && context.pc == 0x1018);
+        CHECK(context.pending_svc == UINT64_MAX && context.x[0] == 99);
+        CHECK(context.x[2] == 77 && context.x[30] == 0x1028);
+    } else if (!strcmp(mode, "hybrid-direct-chain")) {
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+        g_recomp_gg_word = 1;
+#endif
+        /* The 1000 ADD/B block branches directly back to itself through the
+           module slice. The final checked guard read changes the next entry. */
+        bridge.page_entries = NULL;
+        mutate_after_guard = 1;
+        reset(0x1000, 3);
+        context.x[0] = 99;
+        recomp_image_run_slice(&context);
+        CHECK(context.halted == RECOMP_HALT_UNHANDLED && context.pc == 0x1000);
+        CHECK(context.pending_svc == UINT64_MAX && context.x[0] == 100);
+        CHECK(context.chain_budget == 2 && reads == 3);
+        /* Re-enter the rejected target: the completed caller remains once,
+           and a failed GG check must not cache this changed generation. */
+        context.halted = 0;
+        context.chain_budget = 3;
+        recomp_image_lookup(context.pc)(&context);
+        CHECK(context.halted == RECOMP_HALT_UNHANDLED && context.pc == 0x1000);
+        CHECK(context.x[0] == 100 && context.chain_budget == 3 && reads == 4);
     } else if (!strcmp(mode, "hybrid-mutated-entry") ||
                !strcmp(mode, "hybrid-unmapped-entry")) {
 #ifdef RECOMP_FEATURE_GUARD_GEN1

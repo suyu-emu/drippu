@@ -15,10 +15,32 @@
 #include "common/settings_enums.h"
 #include "common/string_util.h"
 #include "common/swap.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "core/loader/loader.h"
 
 namespace FileSys {
+
+bool IsValidControlMetadata(const NCA& nca, u64 program_id) {
+    if (nca.GetStatus() != Loader::ResultStatus::Success ||
+        nca.GetType() != NCAContentType::Control ||
+        GetBaseTitleID(nca.GetTitleId()) != GetBaseTitleID(program_id) || !nca.GetRomFS()) {
+        return false;
+    }
+    const auto directory = ExtractRomFS(nca.GetRomFS());
+    if (!directory) {
+        return false;
+    }
+    auto file = directory->GetFile("control.nacp");
+    if (!file) {
+        file = directory->GetFile("Control.nacp");
+    }
+    std::array<u8, sizeof(RawNACP)> data{};
+    return file && file->Read(data.data(), data.size()) == data.size();
+}
 
 const std::array<const char*, size_t(Language::Count)> LANGUAGE_NAMES{{
     "AmericanEnglish",

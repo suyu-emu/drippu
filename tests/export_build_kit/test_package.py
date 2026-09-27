@@ -16,7 +16,7 @@ class PackageTests(unittest.TestCase):
     def test_real_windows_link_after_producer_tree_removed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            source, build, output = root / 'producer', root / 'build', root / 'kit'
+            source, build, output = root / 'producer with spaces', root / 'build with spaces', root / 'kit [relocated] folder'
             source.mkdir()
             (source / 'host.c').write_text('extern int game(void); int main(void) { return game(); }')
             (source / 'registry_probe.c').write_text('int game(void) { return 1; }')
@@ -29,7 +29,7 @@ class PackageTests(unittest.TestCase):
             # Rename both producer locations: none of their original paths exist.
             source.rename(root / 'hidden-source')
             build.rename(root / 'hidden-build')
-            export = root / 'export'
+            export = root / 'export with spaces [hybrid]'
             (export / 'main').mkdir(parents=True)
             for header in ['recomp_abi_v4.h', 'recomp_guard_v2.h', 'recomp_fastmem_v1.h', 'recomp_features_v1.h', 'recomp_guard_gen_v1.h', 'recomp_fpx_v1.h']:
                 (export / header).write_text('/* synthetic fixture */')

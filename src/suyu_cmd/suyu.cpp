@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <fmt/ostream.h>
+#include <nlohmann/json.hpp>
 #include <stb_image_write.h>
 #include <SDL3/SDL_messagebox.h>
 #include <SDL3/SDL_misc.h>
@@ -45,6 +46,7 @@
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/content_archive.h"
+#include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/card_image.h"
@@ -1889,6 +1891,93 @@ int main(int argc, char** argv) {
             filepath = user_applet_nca->GetFullPath();
     } else {
         load_parameters.applet_id = Service::AM::AppletId::Application;
+    }
+    if (!explicit_content_base) {
+        // Match the Qt frontend's launch registration: a container can carry
+        // control data and additional content besides its primary program.
+        // This provider outlives System and does not install anything into NAND.
+        const auto launch_file = system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read);
+        const auto launch_loader = launch_file ? Loader::GetLoader(system, launch_file) : nullptr;
+        u64 program_id{};
+        if (launch_loader && launch_loader->ReadProgramId(program_id) == Loader::ResultStatus::Success) {
+            const auto type = launch_loader->GetFileType();
+            if (type == Loader::FileType::NCA) {
+                explicit_provider.AddEntry(FileSys::TitleType::Application,
+                    FileSys::GetCRTypeFromNCAType(FileSys::NCA{launch_file}.GetType()),
+                    program_id, launch_file);
+                system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                               &explicit_provider);
+            } else if (type == Loader::FileType::XCI || type == Loader::FileType::NSP) {
+                const auto nsp = type == Loader::FileType::NSP
+                    ? std::make_shared<FileSys::NSP>(launch_file)
+                    : FileSys::XCI{launch_file}.GetSecurePartitionNSP();
+                if (nsp) {
+                    size_t entries{};
+                    for (const auto& [title_id, content] : nsp->GetNCAs()) {
+                        for (const auto& [record, nca] : content) {
+                            explicit_provider.AddEntry(record.first, record.second, title_id,
+                                                       nca->GetBaseFile());
+                            ++entries;
+                        }
+                    }
+                    system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                                   &explicit_provider);
+                    LOG_INFO(Frontend, "Registered {} launch-container content entries", entries);
+                }
+            } else if (type == Loader::FileType::DeconstructedRomDirectory) {
+                const auto launch_path = std::filesystem::u8path(filepath);
+                const auto control_path = launch_path.parent_path() / "control.nca";
+                const auto manifest_path = launch_path.parent_path().parent_path() / "aot_manifest.json";
+                bool required = false;
+                std::error_code manifest_ec;
+                const bool has_manifest = std::filesystem::exists(manifest_path, manifest_ec);
+                std::ifstream manifest{manifest_path};
+                if (manifest_ec || (has_manifest && !manifest.is_open())) {
+                    LOG_CRITICAL(Frontend, "Packaged manifest could not be opened: {}",
+                                 Common::FS::PathToUTF8String(manifest_path));
+                    return 2;
+                }
+                if (manifest.is_open()) {
+                    const auto metadata = nlohmann::json::parse(manifest, nullptr, false);
+                    if (!metadata.is_object()) {
+                        LOG_CRITICAL(Frontend, "Packaged manifest is unreadable: {}",
+                                     Common::FS::PathToUTF8String(manifest_path));
+                        return 2;
+                    }
+                    const auto entry = metadata.find("control_metadata");
+                    if (entry != metadata.end()) {
+                        if (!entry->is_string() || entry->get<std::string>() != "exefs/control.nca") {
+                            LOG_CRITICAL(Frontend, "Packaged control metadata declaration is invalid");
+                            return 2;
+                        }
+                        required = true;
+                    }
+                }
+                const auto control_file = system.GetFilesystem()->OpenFile(
+                    Common::FS::PathToUTF8String(control_path), FileSys::OpenMode::Read);
+                if (!control_file && required) {
+                    LOG_CRITICAL(Frontend, "Packaged control metadata is missing: {}; re-export the game",
+                                 Common::FS::PathToUTF8String(control_path));
+                    return 2;
+                }
+                if (control_file) {
+                    const FileSys::NCA control{control_file};
+                    if (!FileSys::IsValidControlMetadata(control, program_id)) {
+                        LOG_CRITICAL(Frontend,
+                                     "Packaged control metadata is unreadable or belongs to another game: {}; "
+                                     "check installed keys and re-export the game",
+                                     Common::FS::PathToUTF8String(control_path));
+                        return 2;
+                    }
+                    explicit_provider.AddEntry(FileSys::TitleType::Application,
+                                               FileSys::ContentRecordType::Control,
+                                               program_id, control_file);
+                    system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                                   &explicit_provider);
+                    LOG_INFO(Frontend, "Registered packaged control metadata for {:016X}", program_id);
+                }
+            }
+        }
     }
     LOG_INFO(Frontend, "suyu-cmd: Calling system.Load for '{}'...", filepath);
     // A deconstructed ROM may have no control metadata for GetGameName.

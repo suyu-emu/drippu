@@ -74,6 +74,7 @@
 #include "common/swap.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
+#include "core/file_sys/control_metadata.h"
 #include "core/arm/recomp/recomp_gap_session.h"
 #include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/recomp/recomp_image_features.h"
@@ -3000,7 +3001,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !suyu::recomp::g_emit_fastmem ||
                 contents.contains(QStringLiteral("\"image_features\": %1,").arg(image_features));
             const bool same_correctness_revision = contents.contains(
-                QStringLiteral("\"correctness_revision\": \"20260927-hybrid-guard-fallback-v1\","));
+                QStringLiteral("\"correctness_revision\": \"20260927-hybrid-guard-control-units-v3\","));
             const bool same_translate_all = contents.contains(
                 QStringLiteral("\"translate_all\": ") +
                 (translate_all ? QStringLiteral("true,") : QStringLiteral("false,")));
@@ -3824,7 +3825,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const QStringList kit_config_args =
                 use_portable_kit
                     ? QStringList{QStringLiteral("-DSUYU_EXPORT_BUILD_KIT_REVISION=") +
-                                  QStringLiteral("suyu-aot-kit-abi6-fm1-gg1-fpx1-r1")}
+                                  QStringLiteral("suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r2")}
                     : QStringList{};
             bool clang_linked = false;
 #ifdef _WIN32
@@ -4392,7 +4393,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (suyu::recomp::g_emit_fastmem) {
             out << "  \"image_features\": " << image_features << ",\n";
         }
-        out << "  \"correctness_revision\": \"20260927-hybrid-guard-fallback-v1\",\n";
+        out << "  \"correctness_revision\": \"20260927-hybrid-guard-control-units-v3\",\n";
         out << "  \"source_exefs_sha256\": \"" << source_hash << "\",\n";
         out << "  \"translate_all\": " << (translate_all ? "true" : "false") << ",\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
@@ -4485,6 +4486,72 @@ static QString AotCacheDirFor(const QString& output_dir, const QString& game_nam
     }
 }
 
+static FileSys::VirtualFile ExportControlNca(const QString& rom_path, Core::System& system,
+                                           u64 program_id) {
+    static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    const QFileInfo source{rom_path};
+    if (source.isDir() || source.fileName() == QStringLiteral("main")) {
+        const QString directory = source.isDir() ? rom_path : source.absolutePath();
+        const QString exefs = QDir(directory).exists(QStringLiteral("exefs"))
+                                  ? directory + QStringLiteral("/exefs") : directory;
+        const QString control_path = exefs + QStringLiteral("/control.nca");
+        return vfs->OpenFile(control_path.toStdString(),
+                             FileSys::OpenMode::Read);
+    }
+    const u64 base_id = FileSys::GetBaseTitleID(program_id);
+    const u64 update_id = FileSys::GetUpdateTitleID(base_id);
+    const auto& provider = system.GetContentProvider();
+    const FileSys::PatchManager pm{base_id, system.GetFileSystemController(), provider};
+    const auto installed = pm.GetExeFSUpdate();
+    if (installed && installed->slot) {
+        const auto* slot = system.GetContentProviderUnion().GetSlotProvider(*installed->slot);
+        if (slot) {
+            FileSys::VirtualFile control;
+            if (*installed->slot == FileSys::ContentProviderUnionSlot::External) {
+                const auto* external = static_cast<const FileSys::ExternalContentProvider*>(slot);
+                control = external->ListUpdateVersions(update_id).empty()
+                              ? external->GetEntryRaw(update_id, FileSys::ContentRecordType::Control)
+                              : external->GetEntryForVersion(update_id, FileSys::ContentRecordType::Control,
+                                                             installed->version);
+            } else if (*installed->slot == FileSys::ContentProviderUnionSlot::FrontendManual) {
+                const auto* manual = static_cast<const FileSys::ManualContentProvider*>(slot);
+                control = manual->ListUpdateVersions(update_id).empty()
+                              ? manual->GetEntryRaw(update_id, FileSys::ContentRecordType::Control)
+                              : manual->GetEntryForVersion(update_id, FileSys::ContentRecordType::Control,
+                                                          installed->version);
+            } else {
+                control = slot->GetEntryRaw(update_id, FileSys::ContentRecordType::Control);
+            }
+            if (control) {
+                return control;
+            }
+        }
+    }
+    const auto file = vfs->OpenFile(rom_path.toStdString(), FileSys::OpenMode::Read);
+    const auto loader = file ? Loader::GetLoader(system, file) : nullptr;
+    std::shared_ptr<FileSys::NSP> nsp;
+    if (loader && loader->GetFileType() == Loader::FileType::XCI) {
+        nsp = FileSys::XCI{file}.GetSecurePartitionNSP();
+    } else if (loader && loader->GetFileType() == Loader::FileType::NSP) {
+        nsp = std::make_shared<FileSys::NSP>(file);
+    }
+    if (nsp && nsp->GetStatus() == Loader::ResultStatus::Success) {
+        // Match the bundled update selected by the ExeFS extractor. An
+        // installed update already chosen above takes precedence.
+        if (!installed && nsp->GetNCA(update_id, FileSys::ContentRecordType::Program,
+                                      FileSys::TitleType::Update)) {
+            if (const auto control = nsp->GetNCAFile(update_id, FileSys::ContentRecordType::Control,
+                                                    FileSys::TitleType::Update)) {
+                return control;
+            }
+        }
+        if (const auto control = nsp->GetNCAFile(base_id, FileSys::ContentRecordType::Control)) {
+            return control;
+        }
+    }
+    return provider.GetEntryRaw(base_id, FileSys::ContentRecordType::Control);
+}
+
 bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QString& cache_dir,
                                            const QString& output_dir, const QString& game_name,
                                            TargetPlatform platform, RecompileBackend backend) {
@@ -4545,6 +4612,25 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         if (!exefs_ok || !QFile::exists(exefs_dst + QStringLiteral("/main"))) {
             LOG_ERROR(Frontend, "Could not extract the effective ExeFS for export");
             return false;
+        }
+        // Control content supplies save/application metadata that some games
+        // need before their first frame. It is small and independent of the
+        // original multi-gigabyte Program NCA and its already extracted RomFS.
+        const auto control = ExportControlNca(rom_path, system_, SelectedProgramId());
+        if (control) {
+            const FileSys::NCA nca{control};
+            if (!FileSys::IsValidControlMetadata(nca, SelectedProgramId())) {
+                LOG_ERROR(Frontend, "Could not read matching control metadata for this export");
+                return false;
+            }
+            const auto bytes = control->ReadAllBytes();
+            QFile output(exefs_dst + QStringLiteral("/control.nca"));
+            if (bytes.size() != control->GetSize() || !output.open(QIODevice::WriteOnly) ||
+                output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()) !=
+                    static_cast<qint64>(bytes.size()) || !output.flush()) {
+                LOG_ERROR(Frontend, "Could not package control metadata");
+                return false;
+            }
         }
 
         // ── Extract romfs → <pkg>/exefs/romfs.bin ────────────────────────────────
@@ -4757,6 +4843,33 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
         } else {
             QDir(pkg_dir + QStringLiteral("/aot_cache/launcher")).removeRecursively();
         }
+        if (control) {
+            const QString manifest_file = pkg_dir + QStringLiteral("/aot_manifest.json");
+            QFile input(manifest_file);
+            QJsonObject metadata;
+            if (input.exists()) {
+                if (!input.open(QIODevice::ReadOnly)) {
+                    LOG_ERROR(Frontend, "Could not read packaged manifest");
+                    return false;
+                }
+                QJsonParseError error;
+                const auto document = QJsonDocument::fromJson(input.readAll(), &error);
+                if (error.error != QJsonParseError::NoError || !document.isObject()) {
+                    LOG_ERROR(Frontend, "Packaged manifest is invalid");
+                    return false;
+                }
+                metadata = document.object();
+                input.close();
+            }
+            metadata[QStringLiteral("control_metadata")] = QStringLiteral("exefs/control.nca");
+            QFile output(manifest_file);
+            const auto bytes = QJsonDocument(metadata).toJson(QJsonDocument::Indented);
+            if (!output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() ||
+                !output.flush()) {
+                LOG_ERROR(Frontend, "Could not write packaged control metadata manifest");
+                return false;
+            }
+        }
 
         // Mods/patches live beside the exe (see SetSuyuPath(LoadDir) in
         // suyu_cmd/suyu.cpp); create it so the layout is discoverable.
@@ -4814,6 +4927,9 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             out << "- exefs/        : the game's own executables and data, extracted once at\n";
             out << "                    export time so no ROM is needed to run (keys and firmware\n";
             out << "                    are read from the installed suyu, never from this folder)\n";
+            if (control) {
+                out << "- exefs/control.nca : application and save metadata; uses installed keys\n";
+            }
             out << "- *.dll           : runtime libraries (FFmpeg, Vulkan, OpenSSL)\n";
             out << "- mods/           : optional; drop <title_id>/<mod name>/ folders here\n";
             out << "- user/           : this game's own config, saves, and logs (not suyu's)\n\n";

@@ -210,7 +210,8 @@ def main():
             run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name]}")
             runner = executable(run, "smoke_run")
             hybrid_env = dict(os.environ, SUYU_RECOMP_STRICT="0")
-            for mode in ("hybrid-mutated-entry", "hybrid-unmapped-entry"):
+            for mode in ("hybrid-mutated-entry", "hybrid-unmapped-entry",
+                         "hybrid-middle-entry", "hybrid-direct-chain"):
                 call([runner, mode], timeout=15, env=hybrid_env)
             for mode in ("slice", "ordinary-page", "cross-page", "special-page",
                          "mem-ordinary", "mem-unmapped", "mem-special", "mem-cross",

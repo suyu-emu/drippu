@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 option(SUYU_EXPORT_BUILD_KIT "Build relocatable Windows AOT host link inputs" OFF)
-set(SUYU_EXPORT_BUILD_KIT_REVISION "suyu-aot-kit-abi6-fm1-gg1-fpx1-r1")
+set(SUYU_EXPORT_BUILD_KIT_REVISION "suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r2")
 
 # Call in src/suyu_cmd before its shared target-configuration loop.
 function(suyu_export_build_kit_add_probes)

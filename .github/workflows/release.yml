@@ -69,6 +69,10 @@ jobs:
         run: python tests/recompiler_smoke/run.py
       - name: Test Hybrid module selection
         run: python tests/export_regression/test_module_selection.py
+      - name: Test bounded source partitioning
+        run: python tests/recompiler_partition/run.py --build build-partition-test
+      - name: Test selected update control metadata
+        run: python tests/control_metadata/run.py --cc c++
       - name: Configure
         # fmt_FORCE_BUNDLED: the system fmt 9 has no format_string::get(), and
         # suyu only forces the bundled copy inside a branch that does not apply
@@ -137,6 +141,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Module selection tests failed' }
           python tests/export_build_kit/test_package.py
           if ($LASTEXITCODE -ne 0) { throw 'Build kit relocation tests failed' }
+          python tests/appdata_path/run.py
+          if ($LASTEXITCODE -ne 0) { throw 'APPDATA path tests failed' }
+          python tests/control_metadata/run.py
+          if ($LASTEXITCODE -ne 0) { throw 'Selected control metadata tests failed' }
+          python tests/recompiler_partition/run.py --build build-partition-test
+          if ($LASTEXITCODE -ne 0) { throw 'Source partition tests failed' }
       - name: Configure
         shell: bash
         env:
@@ -190,6 +200,10 @@ jobs:
           brew install cmake ninja pkgconf boost ffmpeg sdl3 libusb enet glslang nasm qt
       - name: Test static recompiler
         run: python3 tests/recompiler_smoke/run.py
+      - name: Test bounded source partitioning
+        run: python3 tests/recompiler_partition/run.py --build build-partition-test
+      - name: Test selected update control metadata
+        run: python3 tests/control_metadata/run.py --cc clang++
       - name: Configure
         run: |
           cmake --version
