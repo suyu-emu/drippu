@@ -28,7 +28,10 @@ class PackageTests(unittest.TestCase):
             (source / 'registry_probe.c').write_text('int game(void) { return 1; }')
             (source / 'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 3.22)\nproject(fixture C CXX)\nforeach(mode strict hybrid)\nadd_executable(suyu-export-host-${mode} host.c registry_probe.c)\nendforeach()\n')
             def run(*args):
-                subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if result.returncode:
+                    print(result.stdout.decode(errors='replace'), flush=True)
+                    raise subprocess.CalledProcessError(result.returncode, args, output=result.stdout)
             run('cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release')
             run('cmake', '--build', str(build))
             kit.package(build, output, kit.REVISION)
