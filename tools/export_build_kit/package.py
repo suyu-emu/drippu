@@ -6,7 +6,19 @@ from pathlib import Path
 import re
 import shutil
 
-REVISION = "suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r2"
+REVISION = "suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r3"
+
+
+def producer_compiler_version(build):
+    versions = set()
+    for metadata in (build / 'CMakeFiles').glob('*/CMakeCXXCompiler.cmake'):
+        match = re.search(r'set\(CMAKE_CXX_COMPILER_VERSION "([0-9]+(?:\.[0-9]+)+)"\)',
+                          metadata.read_text(encoding='utf-8'))
+        if match:
+            versions.add(match[1])
+    if len(versions) != 1:
+        raise ValueError('Build kit requires unambiguous producer C++ compiler version metadata')
+    return versions.pop()
 
 
 def ninja_words(value):
@@ -51,6 +63,7 @@ def package(build, output, revision):
     if revision != REVISION:
         raise ValueError("Unsupported build-kit revision")
     build, output = Path(build).resolve(), Path(output).resolve()
+    compiler_version = producer_compiler_version(build)
     manifest = (build / "build.ninja").read_text(encoding="utf-8")
     output.mkdir(parents=True, exist_ok=True)
     copied = {}
@@ -93,7 +106,7 @@ def package(build, output, revision):
     scaffold.mkdir(parents=True, exist_ok=True)
     shutil.copy2(module_project, scaffold / 'CMakeLists.txt')
     (output / 'revision.txt').write_text(REVISION + '\n', encoding='ascii')
-    (output / 'manifest.json').write_text(json.dumps({'revision': REVISION, 'inputs':
+    (output / 'manifest.json').write_text(json.dumps({'revision': REVISION, 'producer_compiler_version': compiler_version, 'inputs':
         {relative: hashlib.sha256((output / relative).read_bytes()).hexdigest() for relative in copied.values()}}, indent=2), encoding='utf-8')
 
 

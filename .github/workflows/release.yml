@@ -101,7 +101,9 @@ jobs:
 
   build-windows:
     name: Windows (${{ matrix.variant }})
-    runs-on: windows-latest
+    # Host link inputs must remain consumable by supported VS 2022 toolchains.
+    # windows-latest now selects VS 2026 and can introduce newer STL helpers.
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +119,9 @@ jobs:
           submodules: recursive
           fetch-depth: 0
       - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: '2022'
+          toolset: '14.44'
       - uses: jurplel/install-qt-action@v4
         with:
           version: '6.9.3'
@@ -163,6 +168,11 @@ jobs:
       - name: Build
         shell: bash
         run: cmake --build build --target suyu suyu-cmd export-build-kit
+      - name: Verify production export build kit
+        shell: pwsh
+        run: |
+          python tests/export_build_kit/test_release_kit.py --kit build/bin/export-build-kit --output build-release-kit-check
+          if ($LASTEXITCODE -ne 0) { throw 'Production build kit link check failed' }
       - name: Package
         shell: pwsh
         run: |
@@ -277,7 +287,7 @@ jobs:
             os: ubuntu-24.04
             archive: suyu-libretro-linux-x86_64.tar.gz
           - platform: windows
-            os: windows-latest
+            os: windows-2022
             archive: suyu-libretro-windows-x86_64.zip
           - platform: macos
             os: macos-15
@@ -312,6 +322,9 @@ jobs:
           sudo tar xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
           echo /opt/cmake/bin >> "$GITHUB_PATH"
       - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: '2022'
+          toolset: '14.44'
         if: matrix.platform == 'windows'
       - name: Install dependencies (Windows)
         if: matrix.platform == 'windows'

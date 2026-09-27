@@ -3825,7 +3825,8 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             const QStringList kit_config_args =
                 use_portable_kit
                     ? QStringList{QStringLiteral("-DSUYU_EXPORT_BUILD_KIT_REVISION=") +
-                                  QStringLiteral("suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r2")}
+                                  QStringLiteral("suyu-aot-kit-abi6-fm1-gg1-fpx1-control-r3"),
+                                  QStringLiteral("-DCMAKE_BUILD_TYPE=Release")}
                     : QStringList{};
             bool clang_linked = false;
 #ifdef _WIN32
