@@ -67,6 +67,8 @@ jobs:
           echo /opt/cmake/bin >> "$GITHUB_PATH"
       - name: Test static recompiler
         run: python tests/recompiler_smoke/run.py
+      - name: Test Hybrid module selection
+        run: python tests/export_regression/test_module_selection.py
       - name: Configure
         # fmt_FORCE_BUNDLED: the system fmt 9 has no format_string::get(), and
         # suyu only forces the bundled copy inside a branch that does not apply
@@ -128,6 +130,13 @@ jobs:
       - name: Test static recompiler
         shell: pwsh
         run: python tests/recompiler_smoke/run.py
+      - name: Test export build kit and module selection
+        shell: pwsh
+        run: |
+          python tests/export_regression/test_module_selection.py
+          if ($LASTEXITCODE -ne 0) { throw 'Module selection tests failed' }
+          python tests/export_build_kit/test_package.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build kit relocation tests failed' }
       - name: Configure
         shell: bash
         env:
@@ -139,10 +148,11 @@ jobs:
             -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
             -DSUYU_NO_JIT=${{ matrix.no_jit }} \
+            -DSUYU_EXPORT_BUILD_KIT=ON \
             '-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.linker_flags }}'
       - name: Build
         shell: bash
-        run: cmake --build build --target suyu suyu-cmd
+        run: cmake --build build --target suyu suyu-cmd export-build-kit
       - name: Package
         shell: pwsh
         run: |
@@ -150,6 +160,8 @@ jobs:
           Copy-Item build\bin\suyu.exe, build\bin\suyu-cmd.exe _pkg\
           Get-ChildItem build\bin -Filter *.dll | Copy-Item -Destination _pkg\
           if (Test-Path build\bin\plugins) { Copy-Item build\bin\plugins _pkg\ -Recurse }
+          if (!(Test-Path build\bin\export-build-kit\manifest.json)) { throw 'Export build kit missing' }
+          Copy-Item build\bin\export-build-kit _pkg\ -Recurse
           windeployqt --release --no-translations _pkg\suyu.exe
           if ($LASTEXITCODE -ne 0) { throw 'Qt deployment failed' }
           Copy-Item LICENSE.txt _pkg\

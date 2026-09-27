@@ -11,14 +11,14 @@ import tempfile
 # SHA-256 of the whole generated smoke tree (every file, by relative path) with
 # the fast-path emit option off. That output must stay byte-identical to ABI 5;
 # update this only for a deliberate ABI 5 emitter change, never for ABI 6 work.
-ABI5_GOLDEN = "79c6670cdbda8d52600ff5e53ee7bd1982455dcb635f72cffdb8c924f0825a95"
+ABI5_GOLDEN = "63c1ed5bafc2c68e2b6a53282c304cf1edc2c43d899a73371b49f41de4d1597a"
 # The same for ABI 6 with FM1 alone (GG1 and FPX1 both off), which neither
 # feature may move, and with FM1 and FPX1 (exact native FP) on, tracked so any
 # change is deliberate. Recomputed against this integration tree, since the FP
 # exactness fixes touch the shared emitter and so this text too; GG1's own
 # switch-off contract (DESIGN.md sec 0) guarantees it does not move these.
-FM1_GOLDEN = "d1ef5cbec953fce3bfb5ddfcf7fd2032d6bfa147f9902bfa0ffb3ac139a6a004"
-FPX_GOLDEN = "565d78a55c5d3a1c5b0cdb52c88afb35184cd9467327c478324b05945e844d96"
+FM1_GOLDEN = "371f92332302eb6e3b2d62dc94c6720b1812aeb9af515255c44cff892bca3fc7"
+FPX_GOLDEN = "d49e15934ccea66de199558ffce883a32edbf523b16a738eda73fdc094292417"
 
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}
@@ -209,13 +209,17 @@ def main():
             guard_gen = "SUYU_RECOMP_AB_GUARD_GEN" in switches
             run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name]}")
             runner = executable(run, "smoke_run")
+            hybrid_env = dict(os.environ, SUYU_RECOMP_STRICT="0")
+            for mode in ("hybrid-mutated-entry", "hybrid-unmapped-entry"):
+                call([runner, mode], timeout=15, env=hybrid_env)
             for mode in ("slice", "ordinary-page", "cross-page", "special-page",
                          "mem-ordinary", "mem-unmapped", "mem-special", "mem-cross",
                          "mem-unaligned", "mem-limit", "mem-protected"):
                 call([runner, mode], timeout=15)
             for mode in ("mutated", "mutated-entry", "unmapped-zero",
                          "cross-page-mutated", "cross-page-unmapped"):
-                call([runner, mode], expected=86, timeout=15)
+                call([runner, mode], expected=86, timeout=15,
+                     env=dict(os.environ, SUYU_RECOMP_STRICT="1"))
             call([executable(run, "smoke_static")], timeout=15)
             if name != "abi5":
                 call([executable(run, "smoke_features")], timeout=15)
@@ -224,10 +228,12 @@ def main():
                 for mode in GG_HOST_PASS:
                     call([host, mode], timeout=120)
                 for mode in GG_HOST_ABORT:
-                    call([host, mode], expected=86, timeout=15)
+                    call([host, mode], expected=86, timeout=15,
+                         env=dict(os.environ, SUYU_RECOMP_STRICT="1"))
                 # The cross-thread catch, at a spread of mutation times.
                 for delay in range(0, 2000, 40):
-                    call([host, f"race-mutate-{delay}"], expected=86, timeout=15)
+                    call([host, f"race-mutate-{delay}"], expected=86, timeout=15,
+                         env=dict(os.environ, SUYU_RECOMP_STRICT="1"))
             print(f"All synthetic {name.upper()} smoke checks passed.")
 
 

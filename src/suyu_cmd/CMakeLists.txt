@@ -96,6 +96,12 @@ if (SUYU_CMD OR YUZU_CMD)
         string(REPLACE "@LBRACKET@" "[[]" _recomp_dir_escaped "${_recomp_dir_escaped}")
         file(GLOB _recomp_children RELATIVE "${SUYU_CMD_RECOMP_DIR}"
              "${_recomp_dir_escaped}/*")
+        # Hybrid exports retain generated sources for modules that failed to
+        # build. Only the modules in the registry may participate in the link.
+        if (EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_modules.cmake")
+            include("${SUYU_CMD_RECOMP_DIR}/recomp_modules.cmake")
+            set(_recomp_children "${SUYU_RECOMP_MODULES}")
+        endif()
         # SUYU_CMD_RECOMP_PREBUILT_DIR: the modules were already compiled by
         # recomp_modules/ (the Windows Build export does that with clang-cl,
         # since one CMake project has one C compiler). Link its libraries
@@ -215,6 +221,9 @@ if (SUYU_CMD OR YUZU_CMD)
 
     create_resource("../../dist/suyu.bmp" "suyu_cmd/suyu_icon.h" "suyu_icon")
 
+    include(ExportBuildKit)
+    suyu_export_build_kit_add_probes()
+
     foreach(_t ${SUYU_CMD_TARGETS})
         if (USE_DISCORD_PRESENCE)
             target_link_libraries(${_t} PRIVATE DiscordRPC::discord-rpc)
@@ -267,6 +276,8 @@ if (SUYU_CMD OR YUZU_CMD)
 
         create_target_directory_groups(${_t})
     endforeach()
+
+    suyu_export_build_kit_add_package()
 
     if(UNIX AND NOT APPLE)
         install(TARGETS suyu-cmd)

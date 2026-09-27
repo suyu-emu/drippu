@@ -5257,6 +5257,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
             rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
                    "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
         }
+        rcu += "    if(c->halted) return;\n";
         // Lookup indexes every emitted instruction, not only block starts. An
         // indirect transfer can therefore enter the middle of this function.
         // Direct chains publish their exact target PC before calling, so any
@@ -7223,13 +7224,14 @@ inline const char* GuardGenC() {
    loaded. The acquire fence pairs with the host's release store of `gen`, so
    the check below reads code and mappings no older than the event that
    produced it. The check itself is the unchanged per-entry guard, with the
-   same diagnostics and abort. Only after it passes does the seen word take
-   `gen`, with release so another core that skips on it cannot get ahead of
+   same strict rejection or hybrid JIT handoff. Only after it passes does the
+   seen word take `gen`, with release so another core that skips on it cannot get ahead of
    this check's reads. VERIFY_ALWAYS is never recorded. */
 void recomp_code_guard_gen(GuestContext* c,uint64_t pc,const uint32_t* expected,uint32_t count,
                            int host_guard_version,uint32_t* seen,uint32_t gen){
   RECOMP_GG_ACQUIRE_FENCE();
   recomp_code_guard(c,pc,expected,count,host_guard_version);
+  if(c->halted) return;
   if(gen!=RECOMP_GG_VERIFY_ALWAYS) RECOMP_GG_STORE_RELEASE(*seen,gen);
 }
 )RT";
@@ -7372,6 +7374,17 @@ void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint
       if(valid) memcpy(&actual,c->mem+off,4);
     }
     if(!valid || (uint32_t)actual!=expected[k]){
+#ifdef SUYU_HOSTED_RECOMP
+      /* Hybrid hosts already understand halted=2 as a request to execute the
+         current PC on the JIT. Keep the original entry PC: no instruction of
+         this block has run, including when only a later word changed. */
+      const char* strict=getenv("SUYU_RECOMP_STRICT");
+      if(strict && *strict=='0'){
+        c->halted=RECOMP_HALT_UNHANDLED;
+        c->pending_svc=~UINT64_C(0);
+        return;
+      }
+#endif
       c->pc=va;
       fprintf(stderr,"[recomp] unsupported code change or unavailable code at 0x%llx (expected %08x, read %08x)\n",
               (unsigned long long)va,expected[k],(unsigned)(uint32_t)actual);

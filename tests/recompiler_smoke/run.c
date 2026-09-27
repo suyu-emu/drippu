@@ -449,6 +449,29 @@ int main(int argc, char** argv) {
         recomp_image_run_slice(&context);
         CHECK(context.x[0] == 4096 && context.chain_budget == 0);
         CHECK(reads == 8192 && stack_max - stack_min < 4096);
+    } else if (!strcmp(mode, "hybrid-mutated-entry") ||
+               !strcmp(mode, "hybrid-unmapped-entry")) {
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+        g_recomp_gg_word = 1; /* Enable caching to detect a rejected generation being recorded. */
+#endif
+        reset(0x1000, 3);
+        context.x[0] = 99;
+        if (!strcmp(mode, "hybrid-mutated-entry")) {
+            /* Reject a later instruction before the first instruction's effect. */
+            memory[4] ^= 1;
+        } else {
+            set_page(1, NULL, T_UNMAPPED);
+            unmapped = 1;
+        }
+        recomp_image_run_slice(&context);
+        CHECK(context.halted == RECOMP_HALT_UNHANDLED && context.pc == 0x1000);
+        CHECK(context.pending_svc == UINT64_MAX && context.x[0] == 99);
+        /* A failed GG verification must never mark changed code verified. */
+        reset(0x1000, 3);
+        context.x[0] = 99;
+        recomp_image_run_slice(&context);
+        CHECK(context.halted == RECOMP_HALT_UNHANDLED && context.pc == 0x1000);
+        CHECK(context.x[0] == 99);
     } else if (!strcmp(mode, "mutated-entry")) {
         reset(0x1000, 3);
         context.x[0] = 99;
