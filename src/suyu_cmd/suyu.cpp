@@ -31,6 +31,7 @@
 #include "suyu_cmd/native_status.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
+#include "common/package_policy.h"
 #include "common/fs/path_util.h"
 #include "common/nvidia_flags.h"
 #include "common/scm_rev.h"
@@ -1030,20 +1031,30 @@ int main(int argc, char** argv) {
             // as path_util does for it; otherwise it is the usual location.
             const std::filesystem::path recorded_suyu = RecordedSuyuExecutable(user_root);
             std::error_code portable_ec;
-            std::filesystem::path installed_root;
-            std::filesystem::path installed_config;
+#ifdef _WIN32
+            const std::filesystem::path default_root = FS::GetAppDataRoamingDirectory() / "suyu";
+            const std::filesystem::path default_config = default_root / "config";
+#else
+            const std::filesystem::path default_root =
+                FS::GetDataDirectory("XDG_DATA_HOME") / "suyu";
+            const std::filesystem::path default_config =
+                FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
+#endif
+            std::filesystem::path installed_root = default_root;
+            std::filesystem::path installed_config = default_config;
             if (!recorded_suyu.empty() &&
                 std::filesystem::is_directory(recorded_suyu.parent_path() / "user", portable_ec)) {
-                installed_root = recorded_suyu.parent_path() / "user";
-                installed_config = installed_root / "config";
-            } else {
-#ifdef _WIN32
-                installed_root = FS::GetAppDataRoamingDirectory() / "suyu";
-                installed_config = installed_root / "config";
-#else
-                installed_root = FS::GetDataDirectory("XDG_DATA_HOME") / "suyu";
-                installed_config = FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
-#endif
+                // Keys and firmware must come from an installation outside this
+                // package. A record leading back into it - a copy of suyu placed
+                // inside, or an edited path - is ignored rather than letting the
+                // package supply its own.
+                if (Common::PackagePolicy::AcceptInstalledRoot(
+                        exe_dir, recorded_suyu.parent_path() / "user")) {
+                    installed_root = recorded_suyu.parent_path() / "user";
+                    installed_config = installed_root / "config";
+                } else {
+                    std::fprintf(stderr, "Ignoring a recorded suyu inside this package\n");
+                }
             }
             // Coverage gaps are pooled in the installed suyu's user folder, which
             // its exporter reads; with no installed suyu there is nowhere to pool.
@@ -1056,6 +1067,11 @@ int main(int argc, char** argv) {
             std::filesystem::create_directories(installed_root / "keys", portable_ec);
             FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_root / "keys");
             installed_nand = InstalledNandDirectory(installed_root, installed_config);
+            // The installed suyu's own NAND setting may not point back in here either.
+            if (!Common::PackagePolicy::AcceptInstalledRoot(exe_dir, installed_nand)) {
+                std::fprintf(stderr, "Ignoring an installed NAND folder inside this package\n");
+                installed_nand = installed_root / "nand";
+            }
             export_user_root = user_root;
             g_export_package = true;
         }
@@ -1752,8 +1768,27 @@ int main(int argc, char** argv) {
             return 2;
         }
         // Same rule as the filesystem fallback: this package's own NAND wins,
-        // otherwise the installed one is read.
+        // otherwise the installed one is read. A package made by the validated
+        // exporter (export-package.json) never contains firmware, so firmware
+        // found in its NAND was put there afterwards and is not used in place of
+        // the installed firmware.
         const auto registered = std::filesystem::path("system") / "Contents" / "registered";
+        std::error_code manifest_ec;
+        const auto package_nand_firmware = export_user_root / "nand" / registered;
+        if (std::filesystem::is_regular_file(
+                export_user_root.parent_path() / Common::PackagePolicy::kExportManifestName,
+                manifest_ec) &&
+            HasEntries(package_nand_firmware)) {
+            ReportExportProblem(
+                "Firmware inside the export",
+                fmt::format("This exported game has system firmware in its own folder ({}).\n\n"
+                            "Exported games read firmware only from the installed suyu. Remove "
+                            "that folder, then start the game again.",
+                            Common::FS::PathToUTF8String(package_nand_firmware)),
+                package_nand_firmware, false, suyu_exe, "-install-firmware",
+                "Install firmware in suyu");
+            return 2;
+        }
         if (!HasEntries(export_user_root / "nand" / registered) &&
             !HasEntries(installed_nand / registered)) {
             const auto firmware_dir = installed_nand / registered;
