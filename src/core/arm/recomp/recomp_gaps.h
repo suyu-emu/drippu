@@ -3,13 +3,23 @@
 
 #pragma once
 
-// Recorded AOT coverage gaps (recomp_gaps.json).
+// Recorded AOT coverage gaps.
 //
 // A Hybrid run records where it had to leave recompiled code, so a later export
 // of the same title can seed block discovery at those addresses and a player
-// can tell whether a strict static export would run at all. The file holds only
-// title and build IDs, module-relative offsets, counts and opcode encodings:
-// never game code and never a path, so it can be shared between players.
+// can tell whether a strict static export would run at all.
+//
+// Two formats, kept apart:
+//  - GapData / recomp_gaps.json ("suyu-recomp-gaps") is this machine's local
+//    diagnostic store. Besides IDs, offsets and counts it keeps the raw 32-bit
+//    encodings of instructions the recompiler could not handle, for development.
+//    It stays local.
+//  - SharedCoverage ("suyu-shared-coverage") is what Export Coverage writes and
+//    what is meant to be passed between players: execution metadata only -
+//    title and build IDs, code offsets, counts and aggregate totals. It has no
+//    raw instruction words, module names, paths or free text, and its reader
+//    rejects any field the schema does not define. Legacy recomp_gaps files are
+//    imported through the same conversion, so their opcodes never reach it.
 //
 // Standard library only: the recompiler smoke tests build this file on its own.
 
@@ -34,6 +44,15 @@ inline constexpr std::size_t kMaxOffsetsPerModule = 65536;
 inline constexpr std::size_t kMaxOpcodes = 4096;
 inline constexpr std::size_t kMaxFileBytes = 64u << 20;
 
+inline constexpr std::string_view kSharedSchemaName = "suyu-shared-coverage";
+inline constexpr std::uint64_t kSharedSchemaVersion = 1;
+inline constexpr std::string_view kSharedDescription =
+    "Execution metadata; no raw instruction bytes included.";
+/// Counts stay exact in any JSON reader.
+inline constexpr std::uint64_t kMaxSharedCount = (1ull << 53) - 1;
+/// Module-relative code offsets: instruction-aligned and below 4 GiB.
+inline constexpr std::uint64_t kMaxSharedOffset = 1ull << 32;
+
 struct ModuleGaps {
     std::string name;     ///< informational only; build_id is the key
     std::string build_id; ///< 64 lower-case hex digits
@@ -57,13 +76,43 @@ struct GapData {
     std::map<std::string, ModuleGaps> modules;
     /// Modules that executed without any recompiled image, keyed by build ID.
     std::map<std::string, ModuleGaps> no_image;
-    /// Guest encoding -> times it forced a fallback.
+    /// Guest encoding -> times it forced a fallback. Local diagnostics only.
     std::map<std::uint32_t, std::uint64_t> unimplemented;
+    /// Unsupported-instruction totals imported from shared coverage, which carries
+    /// counts but no encodings, so they cannot be merged into `unimplemented`.
+    std::uint64_t imported_unsupported_kinds = 0;
+    std::uint64_t imported_unsupported_hits = 0;
 
     std::uint64_t GapOffsets() const;
     std::uint64_t Misses() const;
+    /// Distinct unsupported instructions known: recorded here, or at least as many
+    /// as an imported file reported. A lower bound when both are present.
+    std::uint64_t UnsupportedInstructionKinds() const;
     /// Nothing left recompiled code: no miss of any kind and no opcode.
     bool Clean() const;
+};
+
+struct SharedModule {
+    std::uint64_t hits = 0;
+    /// Module-relative offset -> times execution reached it with no block.
+    std::map<std::uint64_t, std::uint64_t> offsets;
+};
+
+/// Shareable execution metadata. See the top of this file.
+struct SharedCoverage {
+    std::string title_id; ///< 16 upper-case hex digits
+    std::uint64_t runs = 0;
+    std::uint64_t hybrid_runs = 0;
+    std::uint64_t strict_runs = 0;
+    std::uint64_t clean_runs = 0;
+    bool truncated = false;
+    std::uint64_t unattributed_misses = 0;
+    std::uint64_t unsupported_instruction_kinds = 0;
+    std::uint64_t unsupported_instruction_hits = 0;
+    /// Build ID -> offsets inside modules that have a recompiled image.
+    std::map<std::string, SharedModule> modules;
+    /// Build ID -> misses in modules that ran without any recompiled image.
+    std::map<std::string, std::uint64_t> modules_without_image;
 };
 
 std::string TitleIdHex(std::uint64_t title_id);
@@ -88,7 +137,24 @@ std::vector<std::uint64_t> RootsFor(const GapData& data, std::string_view build_
 /// change it. Empty when there are no offsets.
 std::string Fingerprint(const GapData& data);
 
+/// The shareable subset of local diagnostics: names, raw encodings and invalid
+/// offsets are dropped; unsupported instructions become totals.
+SharedCoverage ToShared(const GapData& data);
+std::string SerializeShared(const SharedCoverage& data);
+/// Strict: unknown or duplicate fields, wrong types and out-of-range values are errors.
+std::optional<SharedCoverage> ParseShared(std::string_view json, std::string* error = nullptr);
+/// Reads a shared file, or a legacy recomp_gaps file converted through ToShared.
+std::optional<SharedCoverage> ParseImport(std::string_view json, std::string* error = nullptr,
+                                          bool* legacy = nullptr);
+/// Adds imported coverage into local diagnostics without touching their opcodes.
+void MergeShared(GapData& into, const SharedCoverage& from);
+
 std::optional<GapData> ReadFile(const std::filesystem::path& path, std::string* error = nullptr);
+std::optional<SharedCoverage> ReadImportFile(const std::filesystem::path& path,
+                                             std::string* error = nullptr,
+                                             bool* legacy = nullptr);
+bool WriteSharedFile(const std::filesystem::path& path, const SharedCoverage& data,
+                     std::string* error = nullptr);
 /// Writes through a temporary file and a rename, so a reader never sees half.
 bool WriteFile(const std::filesystem::path& path, const GapData& data,
                std::string* error = nullptr);
