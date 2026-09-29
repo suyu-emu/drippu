@@ -1219,7 +1219,14 @@ quint64 GameExportDialog::SelectedProgramId() const {
         return 0;
     }
     static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
-    const auto file = vfs->OpenFile(path.toStdString(), FileSys::OpenMode::Read);
+    // An extracted folder names its title in main.npdm, read through its main module.
+    QString file_path = path;
+    if (QFileInfo(path).isDir()) {
+        file_path = QDir(path).exists(QStringLiteral("exefs"))
+                        ? path + QStringLiteral("/exefs/main")
+                        : path + QStringLiteral("/main");
+    }
+    const auto file = vfs->OpenFile(file_path.toStdString(), FileSys::OpenMode::Read);
     if (!file) {
         return 0;
     }
