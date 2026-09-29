@@ -962,6 +962,9 @@ int main(int argc, char** argv) {
     // Both stay empty when this executable is not an exported package.
     std::filesystem::path installed_nand;
     std::filesystem::path export_user_root;
+    // Logged once logging is up: which recorded locations led back into the package.
+    bool ignored_package_suyu = false;
+    bool ignored_package_nand = false;
     {
         namespace FS = Common::FS;
 #ifdef _WIN32
@@ -1053,7 +1056,7 @@ int main(int argc, char** argv) {
                     installed_root = recorded_suyu.parent_path() / "user";
                     installed_config = installed_root / "config";
                 } else {
-                    std::fprintf(stderr, "Ignoring a recorded suyu inside this package\n");
+                    ignored_package_suyu = true;
                 }
             }
             // Coverage gaps are pooled in the installed suyu's user folder, which
@@ -1069,7 +1072,7 @@ int main(int argc, char** argv) {
             installed_nand = InstalledNandDirectory(installed_root, installed_config);
             // The installed suyu's own NAND setting may not point back in here either.
             if (!Common::PackagePolicy::AcceptInstalledRoot(exe_dir, installed_nand)) {
-                std::fprintf(stderr, "Ignoring an installed NAND folder inside this package\n");
+                ignored_package_nand = true;
                 installed_nand = installed_root / "nand";
             }
             export_user_root = user_root;
@@ -1080,6 +1083,13 @@ int main(int argc, char** argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+    if (ignored_package_suyu) {
+        LOG_WARNING(Frontend, "Ignoring a recorded suyu inside this package; keys and firmware "
+                              "come from the default installation");
+    }
+    if (ignored_package_nand) {
+        LOG_WARNING(Frontend, "Ignoring an installed NAND folder inside this package");
+    }
 
     // mk8-recomp: --probe-isa <rom> prints the title's CPU architecture and
     // exits, before any config, window or emulation setup.
