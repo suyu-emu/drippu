@@ -87,7 +87,11 @@ resolved only where CPM had fetched boost.
 export is a standalone program with your settings, optional shader cache and
 automatic controller setup, and can be added to Steam directly. Linux and macOS
 exports are Source only. Exports never contain keys or firmware; they read them from
-the installed suyu. See the [Export Game guide](docs/user/GameExport.md).
+the installed suyu. An export is a local package made from the game file you select:
+it contains the game's extracted executables and decrypted data and, for Hybrid and
+static exports (Source included), code translated from the game. It is not an official
+suyu release, and official suyu downloads contain no game material. See the
+[Export Game guide](docs/user/GameExport.md).
 
 Static and Hybrid execution are experimental and tested on MK8D. In its race, a
 v0.0.11 static export runs at about 56 fps on Windows (with Clang installed) and

@@ -5,6 +5,14 @@ package is a program you can double-click or launch from Steam, without opening 
 Exporting reads the game on this computer and writes the package to the output folder
 you choose.
 
+> **An export is a local package of game material, not a suyu release.** Official suyu
+> downloads contain no games, keys or firmware. An export does contain material from
+> the game file you selected: its executables and decrypted data, and for Hybrid and
+> static exports code translated from the game - the **Source** format included. It is
+> made for use on this computer. The exporter does not check who owns the game, and
+> nothing about how an export is made shows that it may be shared. Do not upload
+> exports, or logs and dumps made with them, to suyu's release or support channels.
+
 > **Re-export static and Hybrid packages for v0.0.12.** The code-guard fix is compiled
 > into each game's generated code. Updating suyu alone does not change an existing
 > game executable. Packages made with v0.0.10 or earlier still need regeneration
@@ -17,7 +25,8 @@ you choose.
    not installed.
 3. Leave **CPU Backend** on **suyu Dynarmic JIT (Baseline)** and **Export Format** on
    **Build**.
-4. Tick **Include transferable shader cache** if you have played the game in suyu.
+4. Optional: tick **Include transferable shader cache** if you have played the game in
+   suyu. Saves, shader cache and per-game settings are off unless you tick them.
 5. Optional: tick **Add to Steam library when the export finishes**.
 6. Click export and wait for the progress bar to finish.
 7. Open the package folder and run the game's `.exe` (or `launch.bat`).
@@ -51,8 +60,14 @@ The dialog also shows a coverage line for the selected game, for example whether
 AOT looks safe to try, or how much code still needs Hybrid's JIT fallback. Playing a
 Hybrid export records any code that still needed the JIT, so re-exporting the same game
 later can cover more of it. **Import / Export coverage file** lets players share this
-information; the file only holds module IDs, code offsets and counts, no game code.
-Hybrid remains the choice when static won't run a game.
+information. A shared coverage file is execution metadata: the game's title ID, module
+build IDs, code offsets and counts, and how many unsupported instructions were seen. No
+raw instruction bytes, module names, file paths or free text are included, and suyu
+refuses a file with any other field. Older coverage files can still be imported; the
+instruction encodings in them are dropped. The coverage line says "at least" for
+unsupported instructions once imported files are merged, because shared files carry the
+count but not the instructions themselves. Hybrid remains the choice when static won't
+run a game.
 
 ## Select an export format
 
@@ -82,7 +97,9 @@ Hybrid remains the choice when static won't run a game.
   compiler anyway, set `SUYU_RECOMP_COMPILER=msvc`.
 - **Source** writes the generated C project, its `CMakeLists.txt` and a build script,
   and stops there. It does not include a compiled program. This is the only format for
-  Linux and macOS.
+  Linux and macOS. The generated C is translated from the game's code, and the project
+  keeps the game's modules and data segments beside it, so a Source export contains
+  game material just like a Build export.
 
 While exporting, the progress bar follows the real work. The status line shows what
 is happening, for example "Compiling 312/940 files (main)" or "Copying game data:
@@ -128,27 +145,64 @@ The default output folder is:
 
 Keep the path short. Very long output paths can break the build; the dialog warns you.
 
+Each export is built in a hidden `.suyu-export-<id>` folder beside the package and
+only becomes the package once it is complete and has passed a content check. If the
+export fails or stops, that folder is removed and nothing else is touched. An export is
+never merged into an existing folder. If a folder with the package's name already
+exists, suyu asks first:
+
+- **Save as New Folder** writes the new export to `<name> (2)` and leaves the old one.
+- **Replace (Keep Old as Backup)**, offered only for an earlier export, renames the old
+  folder to `<name>.previous-<date>` - saves played from it included - and puts the new
+  export in its place. The backup is never deleted for you.
+
 ## What goes into the package
 
-**Always:** the game data needed to run, and a copy of your suyu settings: graphics,
-CPU, audio, system and applet settings. Debug and unsafe settings, folder paths, input
-devices and personal data are left out.
+**Always:**
+
+- `exefs/`: the game's executables (`main`, `rtld`, `sdk`, ...), `main.npdm`, its
+  decrypted RomFS as `romfs.bin`, and the game's control data. These are extracted from
+  the selected game file.
+- On Windows, the program: for the Dynarmic JIT a copy of suyu's command-line
+  frontend, for Build exports of Hybrid and static the game's recompiled code linked
+  with suyu's backend. Source exports keep the generated C project in `aot_cache/`
+  instead.
+- A copy of your suyu settings, taken from one fixed list: graphics, CPU, audio,
+  system and applet settings. Debug and unsafe settings, folder paths, input and output
+  devices, the console name, the selected user, web service credentials and everything
+  else stay behind.
+- `LICENSES/`: suyu's license, notices for the runtime libraries, and `SOURCE.txt`
+  naming the suyu revision the program was built from and where its source is
+  published. The game material is not suyu's and is not covered by those licenses.
+- `export-package.json`, which records what the package holds (title ID, backend,
+  format, which optional data was included). `game_source.txt` names the game file by
+  file name only; the full path stays in suyu's own settings.
 
 **Optional** (needs a game whose title ID suyu can read, such as one chosen **From
-Library**):
+Library** or an extracted folder with a `main.npdm`), off unless ticked:
 
-- **Include save data for this game**.
+- **Include save data for this game**: only this game's save folders.
 - **Include transferable shader cache**. Shaders your GPU has already built are
   reused, so the game stutters less the first time you play. On the Mario Kart 8
-  Deluxe JIT package this removed a 5-second freeze at race start.
+  Deluxe JIT package this removed a 5-second freeze at race start. A shader cache is
+  built from the game's shaders, so it stays with this local package.
 - **Include custom game configuration**. The game's own settings from suyu are added
-  on top of your global settings.
+  on top of your global settings, taken from the same fixed list. The settings file
+  itself is not copied.
 
-Ticking these boxes now reliably includes save data, shader cache and per-game settings
-in the package. Older exports could leave them out even when the box was ticked;
-re-export if that happened to you.
+What was not ticked is not in the package, even when an earlier export had it.
 
 **Never:** keys or firmware. See the next section.
+
+### Exporting from an extracted folder
+
+An extracted ExeFS folder may hold only what a game's ExeFS holds: the modules `rtld`,
+`main`, `sdk` and `subsdk0` to `subsdk9`, `main.npdm`, `romfs.bin` (or `romfs`),
+`control.nca`, `control.nacp` and `icon_<Language>.dat`. Each is checked for its
+format. Anything else - notes, key files, firmware, shortcuts or links - stops the export
+and names the file; move it out and export again. Subfolders and `desktop.ini`,
+`Thumbs.db` and `.DS_Store` are ignored. A `main.npdm` belonging to another title is
+refused.
 
 ## Keys and firmware
 
@@ -157,6 +211,26 @@ Exported games read keys and firmware from the suyu installed on the same comput
 - Windows: `%APPDATA%\suyu\keys` and `%APPDATA%\suyu\nand`.
 - A portable suyu: its `user\` folder.
 - A custom NAND folder set in suyu is honoured.
+
+The exporter never copies keys or firmware into a package, never generates them and
+never downloads them. A location that would lead back into the package itself is
+ignored, and an export made by this version refuses to start if firmware has been
+placed in its own `user\nand` folder: firmware comes only from the installed suyu.
+
+What is needed when:
+
+| | At export time | When the exported game runs |
+|---|---|---|
+| Game file | Yes, to extract and translate it | No: its material is already in the package |
+| Keys | Yes, for encrypted game files (to read them) | Yes, from the installed suyu |
+| Firmware | No (suyu warns if none is installed) | From the installed suyu; some screens need it |
+
+Keys that decrypt a game, and hashes or checks that match a game's content, do not show
+who owns the game or that it may be shared.
+
+A portable suyu - `suyu.exe` with a `user\` folder you have added keys and firmware to -
+is your own installation. Leave that data in place; a populated portable folder is not
+an official suyu download and should not be shared as one.
 
 Before exporting, suyu warns if no firmware is installed.
 
@@ -232,3 +306,5 @@ to the game's `.exe`.
 - Exports check that the game code and game data come from the same version, but this
   can't catch every mismatch. Test a package before relying on it.
 - Standalone `.nca` exports stop when an installed update changes RomFS.
+- A repeat export always builds from scratch; it no longer reuses generated code left
+  in an earlier package.
