@@ -1,5 +1,7 @@
 """Link both consumers against the actual release kit, outside shipped content."""
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +17,24 @@ def run(command, *, env=None):
     return result.stdout
 
 
+def check_manifest(kit):
+    """The kit manifest must name its policy and producer and hash every other file."""
+    manifest = json.loads((kit / 'manifest.json').read_text(encoding='utf-8'))
+    policy = json.loads((Path(__file__).resolve().parents[2] / 'tools/package_policy/policy.json')
+                        .read_text(encoding='utf-8'))
+    if manifest.get('policy_version') != policy['policy_version']:
+        raise AssertionError('Kit manifest policy_version does not match policy.json')
+    if not str(manifest.get('producer_source_revision', '')).strip():
+        raise AssertionError('Kit manifest has no producer_source_revision')
+    files = manifest.get('files')
+    actual = {p.relative_to(kit).as_posix() for p in kit.rglob('*') if p.is_file()}
+    if not isinstance(files, dict) or actual != set(files) | {'manifest.json'}:
+        raise AssertionError('Kit files differ from the manifest file table')
+    for relative, digest in files.items():
+        if hashlib.sha256((kit / relative).read_bytes()).hexdigest() != digest:
+            raise AssertionError('Kit file hash mismatch: ' + relative)
+
+
 def check_release_kit(kit, output):
     kit, output = kit.resolve(), output.resolve()
     if kit == output or kit in output.parents or output in kit.parents:
@@ -25,6 +45,7 @@ def check_release_kit(kit, output):
     for name in ('manifest.json', 'revision.txt', 'CMakeLists.txt', 'strict.cmake', 'hybrid.cmake'):
         if not (kit / name).is_file():
             raise FileNotFoundError(kit / name)
+    check_manifest(kit)
     revision = (kit / 'revision.txt').read_text(encoding='utf-8').strip()
     export = output / 'synthetic-export'
     module = export / 'main'
