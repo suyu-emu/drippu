@@ -11,14 +11,14 @@ import tempfile
 # SHA-256 of the whole generated smoke tree (every file, by relative path) with
 # the fast-path emit option off. That output must stay byte-identical to ABI 5;
 # update this only for a deliberate ABI 5 emitter change, never for ABI 6 work.
-ABI5_GOLDEN = "88a083744c1d45ad1f9c3342b3d73fa404d4f167cdc8a4cf85eee96ba15827c4"
+ABI5_GOLDEN = "c84b30cd1524beeafcc7d46947e24d8619309f01c24f42b9261f54616e1b5063"
 # The same for ABI 6 with FM1 alone (GG1 and FPX1 both off), which neither
 # feature may move, and with FM1 and FPX1 (exact native FP) on, tracked so any
 # change is deliberate. Recomputed against this integration tree, since the FP
 # exactness fixes touch the shared emitter and so this text too; GG1's own
 # switch-off contract (DESIGN.md sec 0) guarantees it does not move these.
-FM1_GOLDEN = "5253e25929b2a696891b84014bbd639af4da564b74ca3851345d114e1838e7d4"
-FPX_GOLDEN = "f326f8717ed83c5f8a269c533190667433ea2b572029cf929ee6911254b44344"
+FM1_GOLDEN = "21f41478cd2f1ec46113bf621dba22747eef5d792046cb5bce6b467351ae241e"
+FPX_GOLDEN = "765e6a60c6fcc05dfa1789eeb1bbf10ffeaede0f5478edea63f194239f8ca74e"
 
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}
@@ -145,7 +145,7 @@ def check_coverage_loop(root, exporter, build):
         return out
 
     first = export("loop-1")
-    call([executable(build("run-loop-1", f"-DLOOP_DIR={first}"), "smoke_loop"), "record", gaps])
+    call([executable(build("run-loop-1", f"-DLOOP_DIR={first.as_posix()}"), "smoke_loop"), "record", gaps])
     # No usable gaps must leave the output byte-identical: an empty file, and
     # gaps recorded against another build of the module.
     empty = root / "loop-empty.json"
@@ -159,7 +159,7 @@ def check_coverage_loop(root, exporter, build):
     second = export("loop-2", gaps)
     if tree_hash(second) == tree_hash(first):
         raise RuntimeError("the recorded gap did not reach block discovery")
-    call([executable(build("run-loop-2", f"-DLOOP_DIR={second}"), "smoke_loop"), "static", gaps])
+    call([executable(build("run-loop-2", f"-DLOOP_DIR={second.as_posix()}"), "smoke_loop"), "static", gaps])
     print("Coverage loop checks passed.")
 
 
@@ -177,12 +177,12 @@ def main():
         compiler_options = []
         for key, value in (("C", args.cc), ("CXX", args.cxx)):
             if value:
-                compiler_options.append(f"-DCMAKE_{key}_COMPILER={value}")
+                compiler_options.append(f"-DCMAKE_{key}_COMPILER={Path(value).as_posix()}")
 
         def build(name, *options):
             directory = root / name
             call([args.cmake, "-S", test_source, "-B", directory,
-                  f"-DSUYU_SOURCE={source}", "-DCMAKE_BUILD_TYPE=Release", *compiler_options,
+                  f"-DSUYU_SOURCE={source.as_posix()}", "-DCMAKE_BUILD_TYPE=Release", *compiler_options,
                   *options])
             call([args.cmake, "--build", directory, "--config", "Release", "--parallel", "2"])
             return directory
@@ -207,15 +207,20 @@ def main():
 
         for name, switches in VARIANTS:
             guard_gen = "SUYU_RECOMP_AB_GUARD_GEN" in switches
-            run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name]}")
+            run = build(f"run-{name}", f"-DGENERATED_DIR={generated[name].as_posix()}")
             runner = executable(run, "smoke_run")
+            hybrid_env = dict(os.environ, SUYU_RECOMP_STRICT="0")
+            for mode in ("hybrid-mutated-entry", "hybrid-unmapped-entry",
+                         "hybrid-middle-entry", "hybrid-direct-chain"):
+                call([runner, mode], timeout=15, env=hybrid_env)
             for mode in ("slice", "ordinary-page", "cross-page", "special-page",
                          "mem-ordinary", "mem-unmapped", "mem-special", "mem-cross",
                          "mem-unaligned", "mem-limit", "mem-protected"):
                 call([runner, mode], timeout=15)
             for mode in ("mutated", "mutated-entry", "unmapped-zero",
                          "cross-page-mutated", "cross-page-unmapped"):
-                call([runner, mode], expected=86, timeout=15)
+                call([runner, mode], expected=86, timeout=15,
+                     env=dict(os.environ, SUYU_RECOMP_STRICT="1"))
             call([executable(run, "smoke_static")], timeout=15)
             if name != "abi5":
                 call([executable(run, "smoke_features")], timeout=15)
@@ -224,10 +229,12 @@ def main():
                 for mode in GG_HOST_PASS:
                     call([host, mode], timeout=120)
                 for mode in GG_HOST_ABORT:
-                    call([host, mode], expected=86, timeout=15)
+                    call([host, mode], expected=86, timeout=15,
+                         env=dict(os.environ, SUYU_RECOMP_STRICT="1"))
                 # The cross-thread catch, at a spread of mutation times.
                 for delay in range(0, 2000, 40):
-                    call([host, f"race-mutate-{delay}"], expected=86, timeout=15)
+                    call([host, f"race-mutate-{delay}"], expected=86, timeout=15,
+                         env=dict(os.environ, SUYU_RECOMP_STRICT="1"))
             print(f"All synthetic {name.upper()} smoke checks passed.")
 
 

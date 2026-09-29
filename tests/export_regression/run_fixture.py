@@ -55,6 +55,13 @@ def main() -> int:
     pair_guard = extract(
         source, "const auto validate_base_fallback =", "const auto romfs_from_nsp ="
     )
+    registration = extract(
+        source, "const auto write_registration =", "if (!write_registration(recomp_module_dirs))"
+    )
+    registration_helper = (
+        "static bool WriteRegistration(const QString& recomp_root, const QStringList& mods) {\n"
+        + registration + "\nreturn write_registration(mods);\n}\n"
+    )
     prefix = r'''
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -76,6 +83,11 @@ def main() -> int:
 #define LOG_ERROR(...) do {} while (false)
 using u64 = std::uint64_t;
 using u32 = std::uint32_t;
+namespace suyu::recomp {
+bool g_emit_fastmem = false;
+bool g_emit_fpx = false;
+bool EmitGuardGen() { return false; }
+}
 namespace FileSys {
 struct VfsFile {
     std::string name;
@@ -177,6 +189,35 @@ int main(int argc, char** argv) {
             ini.contains("System/application_display_version_override") ||
             ini.value("Other/retained").toString() != "yes") return 19;
     }
+    const QString registry_root = root + "/registry";
+    const QStringList selected{QStringLiteral("main"), QStringLiteral("subsdk1")};
+    if (!QDir().mkpath(registry_root) || !WriteRegistration(registry_root, selected)) return 20;
+    {
+        QFile selection(registry_root + "/recomp_modules.cmake");
+        QFile registry(registry_root + "/recomp_registration.c");
+        if (!selection.open(QIODevice::ReadOnly) || !registry.open(QIODevice::ReadOnly)) return 21;
+        const auto selection_text = selection.readAll();
+        const auto registry_text = registry.readAll();
+        if (!selection_text.contains("set(SUYU_RECOMP_MODULES main subsdk1)") ||
+            !registry_text.contains("recomp_image_lookup_main(") ||
+            !registry_text.contains("recomp_image_lookup_subsdk1(") ||
+            registry_text.contains("recomp_image_lookup_sdk(")) return 22;
+    }
+    // A false result must stop the caller before it can configure or link.
+    int builds_started = 0;
+    const auto try_build = [&](const QString& path) {
+        if (!WriteRegistration(path, selected)) return false;
+        ++builds_started;
+        return true;
+    };
+    const QString registry_failure = root + "/registry-failure";
+    if (!QDir().mkpath(registry_failure + "/recomp_registration.c") ||
+        try_build(registry_failure) || builds_started != 0 ||
+        !QFile::exists(registry_failure + "/recomp_modules.cmake")) return 23;
+    const QString selection_failure = root + "/selection-failure";
+    if (!QDir().mkpath(selection_failure + "/recomp_modules.cmake") ||
+        try_build(selection_failure) || builds_started != 0 ||
+        QFile::exists(selection_failure + "/recomp_registration.c")) return 24;
     return 0;
 }
 '''
@@ -185,7 +226,7 @@ int main(int argc, char** argv) {
         directory = Path(temp)
         cpp = directory / "fixture.cpp"
         exe = directory / "fixture.exe"
-        cpp.write_text(prefix + helpers + body, encoding="utf-8")
+        cpp.write_text(prefix + helpers + registration_helper + body, encoding="utf-8")
         command = [
             str(Path(env["VCTOOLSINSTALLDIR"]) / "bin/Hostx64/x64/cl.exe"),
             "/nologo", "/EHsc", "/std:c++20", "/Zc:__cplusplus", "/utf-8", "/MD",
@@ -196,7 +237,7 @@ int main(int argc, char** argv) {
         subprocess.run(command, cwd=directory, env=env, check=True)
         env["PATH"] = str(qt_root / "bin") + os.pathsep + env.get("PATH", "")
         subprocess.run([exe, directory / "fixture"], env=env, check=True)
-    print("PASS: ExeFS/cache, Source cleanup, NCA pairing, fallback policy, version reset")
+    print("PASS: ExeFS/cache, Source cleanup, NCA pairing, fallback policy, version reset, registry write failures")
     return 0
 
 
