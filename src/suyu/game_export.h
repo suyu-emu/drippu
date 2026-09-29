@@ -17,6 +17,7 @@
 #include <QStringList>
 #include <QVector>
 
+#include "common/package_policy.h"
 #include "suyu/wikipedia_cover.h"
 
 namespace Core {
@@ -73,6 +74,22 @@ public:
                                  int format_index = -1, int backend_index = -1,
                                  int full_scan = -1, quint32 app_version = 0,
                                  const QString& display_version = {});
+    /// Test-only options for the next TriggerExportForTesting() run.
+    struct TestExportOptions {
+        /// What happens to an existing folder with the package's name. Headless runs never
+        /// answer a prompt: the default reports a conflict and changes nothing.
+        Common::PackagePolicy::ConflictPolicy conflict = Common::PackagePolicy::ConflictPolicy::Fail;
+        /// Optional data checkboxes: -1 leaves them, 0/1 sets them.
+        int include_save = -1;
+        int include_shader = -1;
+        int include_config = -1;
+        /// Throws at this step ("precompile", "package", "validate") so tests can prove a
+        /// failed export leaves no package and the previous one untouched.
+        QString fail_at;
+    };
+    void SetTestExportOptions(const TestExportOptions& options);
+    /// True when the last test export stopped because its destination already existed.
+    bool ExportConflictForTesting() const;
     bool IsExportInProgressForTesting() const;
     bool HasExportResultForTesting() const;
     bool ExportSucceededForTesting() const;
@@ -104,6 +121,11 @@ public:
     static QString DefaultExportRoot();
     /// Remember @p dir as an export output root for future lookups.
     static void RememberOutputRoot(const QString& dir);
+    /// The game file an export was made from is kept in this suyu's settings, by the
+    /// package's export ID, rather than as a path inside a package that may be moved.
+    static void RememberExportSource(const QString& export_id, const QString& rom_path);
+    /// The recorded game file for the package in @p package_dir, or empty.
+    static QString RecordedExportSource(const QString& package_dir);
 
     enum class TargetPlatform {
         Windows,
@@ -126,9 +148,10 @@ private slots:
     void OnBrowseOutput();
     void OnExport();
     void OnInstallUpdate();
-    /// Merge a coverage file from another player into this suyu's store for the game.
+    /// Merge a shared coverage file into this suyu's store for the game.
     void OnImportCoverage();
-    /// Save the game's recorded coverage (IDs, offsets, counts, opcodes only) to share.
+    /// Save the game's recorded coverage as shareable execution metadata: build IDs, code
+    /// offsets and counts. No raw instruction bytes, names or paths are written.
     void OnExportCoverage();
 
 protected:
@@ -184,6 +207,8 @@ private:
     QString test_export_output;
     quint32 test_app_version{};
     QString test_display_version;
+    TestExportOptions test_options_;
+    bool test_export_conflict{false};
     /// Modules the last export routed to the Dynarmic JIT after a recompile or
     /// compile failure. Reported to the user when the export finishes, so a
     /// partially-degraded package cannot look like a clean one.
@@ -199,9 +224,10 @@ private:
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,
                              RecompileBackend backend, const QString& game_name);
 
-    /// Package the translated output into a platform-specific export bundle.
+    /// Package the translated output into a platform-specific export bundle rooted at
+    /// @p package_root, the staging folder that becomes the package once validated.
     bool PackageNativeExport(const QString& rom_path, const QString& cache_dir,
-                             const QString& output_dir, const QString& game_name,
+                             const QString& package_root, const QString& game_name,
                              TargetPlatform platform, RecompileBackend backend);
 
     QLineEdit* rom_path_edit{};

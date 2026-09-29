@@ -5740,6 +5740,7 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                         dialog->IsExportInProgressForTesting()},
                                        {QStringLiteral("done"), dialog->HasExportResultForTesting()},
                                        {QStringLiteral("success"), dialog->ExportSucceededForTesting()},
+                                       {QStringLiteral("conflict"), dialog->ExportConflictForTesting()},
                                        {QStringLiteral("progress"), dialog->ExportProgressForTesting()},
                                        {QStringLiteral("status"), dialog->ExportStatusForTesting()},
                                        {QStringLiteral("output_path"),
@@ -6089,6 +6090,26 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                             static_cast<quint32>(params[QStringLiteral("app_version")].toInteger());
                         const QString display_version =
                             params[QStringLiteral("display_version")].toString();
+                        // Headless runs never answer a prompt: an existing destination
+                        // is a reported conflict unless the caller chooses otherwise.
+                        GameExportDialog::TestExportOptions options;
+                        const QString conflict =
+                            params[QStringLiteral("conflict")].toString().trimmed().toLower();
+                        options.conflict =
+                            conflict == QStringLiteral("keep_both")
+                                ? Common::PackagePolicy::ConflictPolicy::KeepBoth
+                            : conflict == QStringLiteral("replace")
+                                ? Common::PackagePolicy::ConflictPolicy::ReplaceWithBackup
+                                : Common::PackagePolicy::ConflictPolicy::Fail;
+                        const auto tri_state = [&params](const char* key) {
+                            const QString name = QString::fromLatin1(key);
+                            return params.contains(name) ? (params[name].toBool() ? 1 : 0) : -1;
+                        };
+                        options.include_save = tri_state("include_save");
+                        options.include_shader = tri_state("include_shader");
+                        options.include_config = tri_state("include_config");
+                        options.fail_at = params[QStringLiteral("fail_at")].toString().trimmed();
+                        dialog->SetTestExportOptions(options);
                         QTimer::singleShot(0, dialog, [dialog, rom_path, output_dir, format_index,
                                                        backend_index, full_scan, app_version,
                                                        display_version] {
@@ -6791,13 +6812,23 @@ void GMainWindow::OnLaunchStaticBuild(const QString& executable) {
     // manifest checks. When the export records its source title, open that
     // title in this host instead; LoadROM will select the current cached bundle
     // before creating the guest process.
+    // Current packages record only a title and file name; the full path of the game
+    // file stays in this suyu's settings, found through the package's export ID. Packages
+    // from before that carried the path in game_source.txt.
+    QString recorded_source = GameExportDialog::RecordedExportSource(build.absolutePath());
     QFile source_reference(build.absolutePath() + QDir::separator() +
                            QStringLiteral("game_source.txt"));
-    if (source_reference.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    if (recorded_source.isEmpty() &&
+        source_reference.open(QIODevice::ReadOnly | QIODevice::Text)) {
         const QString line = QString::fromUtf8(source_reference.readLine()).trimmed();
         const QString prefix = QStringLiteral("Recompiled from: ");
         if (line.startsWith(prefix)) {
-            const QString source_path = QDir::fromNativeSeparators(line.mid(prefix.size()));
+            recorded_source = line.mid(prefix.size());
+        }
+    }
+    {
+        if (!recorded_source.isEmpty()) {
+            const QString source_path = QDir::fromNativeSeparators(recorded_source);
             if (QFileInfo::exists(source_path)) {
                 QString launch_path = source_path;
                 u64 hosted_program_id = 0;
