@@ -5900,6 +5900,20 @@ void GameExportDialog::OnExport() {
                                         : work_dir + QStringLiteral("/jit_baseline");
     QDir().mkpath(cache_work);
 
+    // An extracted folder is checked before anything is built, whichever backend
+    // runs, so the dialog names what does not belong in it.
+    if (QFileInfo(rom_path).isDir()) {
+        const QString exefs_source = QDir(rom_path).exists(QStringLiteral("exefs"))
+                                         ? rom_path + QStringLiteral("/exefs")
+                                         : rom_path;
+        const auto plan = PackagePolicy::PlanExtractedExeFs(ToFsPath(exefs_source));
+        if (!plan.Ok()) {
+            finish_failed(tr("Export stopped: %1")
+                              .arg(QString::fromStdString(PackagePolicy::Describe(plan.rejected))));
+            return;
+        }
+    }
+
     if (uses_aot) {
         // Step 2: ExeFS extraction is handled inside RunAotPrecompile via VFS.
         // An extracted folder is copied to the work area here, by role only.
