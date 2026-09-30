@@ -2076,15 +2076,24 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
         }
 
         if (!ContentManager::AreKeysPresent()) {
-            const auto response = QMessageBox::warning(
-                this, tr("No Decryption Keys Detected"),
-                tr("No local decryption keys were detected.\n\n"
-                   "Install your keys via\n"
-                   "Tools > Install Decryption Keys,\n"
-                   "or configure an external decryption tool if you prefer.\n\n"
-                   "If your games are already decrypted, choose Continue."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
+            QMessageBox box(QMessageBox::Warning, tr("Decryption Keys Missing"),
+                            tr("suyu has no decryption keys installed.\n\n"
+                               "Games need the keys dumped from your own Switch. suyu does not "
+                               "provide, generate or download them.\n\n"
+                               "Install your keys now? Choose Continue only for content that "
+                               "needs no keys, such as homebrew."),
+                            QMessageBox::NoButton, this);
+            QPushButton* install =
+                box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
+            QPushButton* proceed = box.addButton(tr("Continue"), QMessageBox::DestructiveRole);
+            box.addButton(QMessageBox::Cancel);
+            box.setDefaultButton(install);
+            box.exec();
+            if (box.clickedButton() == install) {
+                QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
+                return false;
+            }
+            if (box.clickedButton() != proceed) {
                 return false;
             }
         }
@@ -2237,6 +2246,34 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
                 const u16 error_id = static_cast<u16>(result) - loader_id;
                 const std::string error_code = fmt::format("({:04X}-{:04X})", loader_id, error_id);
                 LOG_CRITICAL(Frontend, "Failed to load ROM! {}", error_code);
+
+                // A key the game needs is not installed: say so and offer to install keys,
+                // rather than suggesting the dump is bad.
+                using Loader::ResultStatus;
+                const auto status = static_cast<ResultStatus>(error_id);
+                if (status == ResultStatus::ErrorMissingHeaderKey ||
+                    status == ResultStatus::ErrorMissingProductionKeyFile ||
+                    status == ResultStatus::ErrorMissingTitlekey ||
+                    status == ResultStatus::ErrorMissingTitlekek ||
+                    status == ResultStatus::ErrorMissingKeyAreaKey ||
+                    status == ResultStatus::ErrorMissingSDSeed) {
+                    QMessageBox box(
+                        QMessageBox::Warning, tr("Decryption Keys Missing"),
+                        tr("This game cannot be read because a decryption key is missing (%1).\n\n"
+                           "Install the keys dumped from your own Switch, then start the game "
+                           "again. suyu does not provide, generate or download keys.")
+                            .arg(QString::fromStdString(GetResultStatusString(status))),
+                        QMessageBox::NoButton, this);
+                    QPushButton* install =
+                        box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
+                    box.addButton(QMessageBox::Cancel);
+                    box.setDefaultButton(install);
+                    box.exec();
+                    if (box.clickedButton() == install) {
+                        QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
+                    }
+                    break;
+                }
 
                 const auto title =
                     tr("Error while loading ROM! %1", "%1 signifies a numeric error code.")
