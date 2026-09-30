@@ -145,7 +145,7 @@ QPixmap RoundedRectPixmap(const QPixmap& source, int size, int radius) {
 }
 
 std::filesystem::path BackgroundImagePath() {
-    return Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) /
+    return FS::GetSuyuPath(SuyuPath::CacheDir) /
            "nextendo_profile_background.png";
 }
 

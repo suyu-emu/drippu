@@ -33,7 +33,6 @@
 #include "suyu/nextendo_chat_client.h"
 #include "suyu/nextendo_chat_room.h"
 #include "suyu/nextendo_chat_room_member_delegate.h"
-#include "suyu/theme.h"
 #include "suyu/uisettings.h"
 #include "ui_nextendo_chat_room.h"
 #include "web_service/nextendo_api.h"
@@ -640,7 +639,8 @@ void NextendoChatRoom::HighlightPlayer(u64 pid) {
 
 void NextendoChatRoom::UpdateTheme() {
     QString style_sheet;
-    const QString accent_color = Theme::GetAccentColor();
+    const QString accent_color =
+        QString::fromStdString(UISettings::values.accent_color.GetValue());
     if (UISettings::IsDarkTheme()) {
         style_sheet = QStringLiteral(R"(
             NextendoChatRoom { background-color: #121212; }

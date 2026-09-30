@@ -29,7 +29,7 @@ std::string g_updated_utc;
 bool g_refreshing = false;
 
 std::filesystem::path CachePath() {
-    return Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) / "nextendo_population.json";
+    return FS::GetSuyuPath(SuyuPath::CacheDir) / "nextendo_population.json";
 }
 
 int LocalUtcOffsetHours() {

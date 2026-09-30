@@ -38,7 +38,9 @@ public:
     virtual void SetSocket(std::shared_ptr<Network::SocketBase> socket) = 0;
     virtual Result SetHostName(const std::string& hostname) = 0;
     virtual void SetVerifyOption(u32 option) = 0;
-    virtual Result DoHandshake() = 0;
+    // requested_alpn_protos carries whatever the guest set via SetNextAlpnProto, so
+    // backends can honour protocols beyond http/1.1 when a title needs them.
+    virtual Result DoHandshake(std::span<const std::string> requested_alpn_protos) = 0;
     virtual Result Read(size_t* out_size, std::span<u8> data) = 0;
     virtual Result Write(size_t* out_size, std::span<const u8> data) = 0;
     virtual Result GetServerCerts(std::vector<std::vector<u8>>* out_certs) = 0;

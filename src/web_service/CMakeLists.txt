@@ -14,6 +14,8 @@ add_library(web_service STATIC
     web_backend.cpp
     web_backend.h
     web_result.h
+    nextendo_api.cpp
+    nextendo_api.h
 )
 
 create_target_directory_groups(web_service)

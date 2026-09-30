@@ -45,6 +45,15 @@ void OneTimeInit();
 void OneTimeInitLogFile();
 bool OneTimeInitBIO();
 
+// NPLN (Splatoon 3's gRPC/HTTP2 stack) needs h2; everyone else needs http/1.1-only.
+// Substring match: NPLN's session transport connects via SNI "gs.nintendo.net", which
+// doesn't contain "npln".
+bool IsNplnHost(std::string_view hostname) {
+    const std::string lower = Common::ToLower(std::string(hostname));
+    return lower.find("npln") != std::string::npos ||
+           lower.find("gs.nintendo.net") != std::string::npos;
+}
+
 #ifdef YUZU_BUNDLED_OPENSSL
 // This is ported from httplib
 struct scope_exit {
@@ -184,7 +193,33 @@ public:
         }
     }
 
-    Result DoHandshake() override {
+    Result DoHandshake(std::span<const std::string> requested_alpn_protos) override {
+        // NPLN (Splatoon 3's gRPC/HTTP2 stack) needs h2; every other title needs
+        // http/1.1-only, since NEX rides a WebSocket Upgrade that h2 breaks. Match on
+        // substring: NPLN's session transport connects via SNI "gs.nintendo.net", which
+        // does not contain "npln".
+        static constexpr unsigned char kHttp11Only[] = "\x08http/1.1";
+        std::vector<unsigned char> alpn_wire;
+        const char* servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+        if (servername && IsNplnHost(servername)) {
+            for (const std::string& proto : requested_alpn_protos) {
+                if (proto != "h2" && proto != "http/1.1") {
+                    continue;
+                }
+                alpn_wire.push_back(static_cast<unsigned char>(proto.size()));
+                alpn_wire.insert(alpn_wire.end(), proto.begin(), proto.end());
+            }
+        }
+        if (!alpn_wire.empty()) {
+            LOG_INFO(Service_SSL,
+                     "[Nextendo] NPLN host '{}': honoring game-requested ALPN ({} byte(s))",
+                     servername, alpn_wire.size());
+            SSL_set_alpn_protos(ssl, alpn_wire.data(),
+                                static_cast<unsigned int>(alpn_wire.size()));
+        } else {
+            SSL_set_alpn_protos(ssl, kHttp11Only, sizeof(kHttp11Only) - 1);
+        }
+
         SSL_set_verify_result(ssl, X509_V_OK);
         const int ret = SSL_do_handshake(ssl);
 

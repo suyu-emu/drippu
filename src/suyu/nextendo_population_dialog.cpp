@@ -19,7 +19,6 @@
 
 #include "suyu/nextendo_online_counts.h"
 #include "suyu/nextendo_population_history.h"
-#include "suyu/theme.h"
 #include "suyu/ui/population_bar_chart.h"
 #include "suyu/uisettings.h"
 #include "common/common_types.h"

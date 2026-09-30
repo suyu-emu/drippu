@@ -26,7 +26,7 @@
 #include "web_service/nextendo_api.h"
 #endif
 
-#ifdef CITRON_ENABLE_LIBARCHIVE
+#ifdef SUYU_ENABLE_LIBARCHIVE
 #include <archive.h>
 #include <archive_entry.h>
 #endif
@@ -35,7 +35,7 @@ namespace Nextendo::SaveSync {
 
 namespace {
 
-#if defined(CITRON_ENABLE_LIBARCHIVE) || defined(_WIN32)
+#if defined(SUYU_ENABLE_LIBARCHIVE) || defined(_WIN32)
 
 // Only ever called from the real-backend paths below (libarchive, or the Windows PowerShell
 // fallback) -- kept inside this guard so an unused-function error doesn't fire on builds with
@@ -60,9 +60,9 @@ bool HasLocalContent(const FileSys::VirtualDir& dir) {
     return false;
 }
 
-#endif // CITRON_ENABLE_LIBARCHIVE || _WIN32
+#endif // SUYU_ENABLE_LIBARCHIVE || _WIN32
 
-#ifdef CITRON_ENABLE_LIBARCHIVE
+#ifdef SUYU_ENABLE_LIBARCHIVE
 
 void AddDirectoryToArchive(struct archive* a, const FileSys::VirtualDir& dir,
                            const std::string& prefix) {
@@ -157,9 +157,9 @@ bool UnzipToDirectory(std::span<const u8> zip_data, const std::filesystem::path&
     return true;
 }
 
-#endif // CITRON_ENABLE_LIBARCHIVE
+#endif // SUYU_ENABLE_LIBARCHIVE
 
-#if !defined(CITRON_ENABLE_LIBARCHIVE) && defined(_WIN32)
+#if !defined(SUYU_ENABLE_LIBARCHIVE) && defined(_WIN32)
 
 // No libarchive available for this target (e.g. the llvm-mingw cross-compiled Windows build has
 // no mingw port of it wired up). GetFullPath() on a save directory is always a real path on
@@ -214,12 +214,12 @@ bool UnzipToDirectoryPowerShell(std::span<const u8> zip_data, const std::filesys
     return ok;
 }
 
-#endif // !CITRON_ENABLE_LIBARCHIVE && _WIN32
+#endif // !SUYU_ENABLE_LIBARCHIVE && _WIN32
 
 } // namespace
 
 void Pull(Core::System& system, u64 title_id, bool force) {
-#if defined(ENABLE_WEB_SERVICE) && (defined(CITRON_ENABLE_LIBARCHIVE) || defined(_WIN32))
+#if defined(ENABLE_WEB_SERVICE) && (defined(SUYU_ENABLE_LIBARCHIVE) || defined(_WIN32))
     if (!IsEligible(title_id)) {
         return;
     }
@@ -240,7 +240,7 @@ void Pull(Core::System& system, u64 title_id, bool force) {
         return;
     }
 
-#ifdef CITRON_ENABLE_LIBARCHIVE
+#ifdef SUYU_ENABLE_LIBARCHIVE
     const bool applied = UnzipToDirectory(*zip, save_dir->GetFullPath());
 #else
     const bool applied = UnzipToDirectoryPowerShell(*zip, save_dir->GetFullPath(), title_id);
@@ -255,7 +255,7 @@ void Pull(Core::System& system, u64 title_id, bool force) {
 }
 
 std::vector<u8> CaptureForPush(Core::System& system, u64 title_id) {
-#if defined(CITRON_ENABLE_LIBARCHIVE) || defined(_WIN32)
+#if defined(SUYU_ENABLE_LIBARCHIVE) || defined(_WIN32)
     if (!IsEligible(title_id)) {
         return {};
     }
@@ -264,7 +264,7 @@ std::vector<u8> CaptureForPush(Core::System& system, u64 title_id) {
     if (!save_dir) {
         return {};
     }
-#ifdef CITRON_ENABLE_LIBARCHIVE
+#ifdef SUYU_ENABLE_LIBARCHIVE
     return ZipDirectory(save_dir);
 #else
     return ZipDirectoryPowerShell(save_dir, title_id);
