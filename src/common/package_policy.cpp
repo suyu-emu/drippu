@@ -1019,6 +1019,40 @@ PromoteResult Promote(const Staging& staging, const fs::path& destination, Confl
 
 // ---- local export validation ----
 
+bool IsGameDataInAotCache(std::string_view relative_lower) {
+    // relative_lower starts at "aot_cache/". The analysed modules (exefs/nso), the
+    // bundled segments of a standalone runner (<module>/data), that runner itself
+    // (<module>/main.c) and debug dumps of guest code (debug/) are copies of the game's
+    // own executables, or a way to run them without suyu and the user's keys.
+    const auto parts_of = [](std::string_view text) {
+        std::vector<std::string_view> parts;
+        while (!text.empty()) {
+            const auto slash = text.find('/');
+            parts.push_back(text.substr(0, slash));
+            if (slash == std::string_view::npos) {
+                break;
+            }
+            text.remove_prefix(slash + 1);
+        }
+        return parts;
+    };
+    const auto parts = parts_of(relative_lower);
+    if (parts.size() < 2 || parts[0] != "aot_cache") {
+        return false;
+    }
+    if (parts[1] == "debug") {
+        return true;
+    }
+    if (parts.size() >= 3 && parts[1] == "exefs" && parts[2] == "nso") {
+        return true;
+    }
+    // aot_cache/exefs/<module>/data/... and aot_cache/exefs/<module>/main.c
+    if (parts.size() >= 4 && parts[1] == "exefs" && parts[3] == "data") {
+        return true;
+    }
+    return parts.size() == 4 && parts[1] == "exefs" && parts[3] == "main.c";
+}
+
 std::vector<Finding> ValidateLocalExport(const fs::path& root,
                                          const LocalExportExpectation& expect) {
     std::vector<Finding> findings;
@@ -1062,7 +1096,7 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
             return true;
         }
         const auto parts = split(rel);
-        if (expect.platform == Platform::Windows && (rel == "exefs" || rel == "mods")) {
+        if (expect.platform == Platform::Windows && rel == "mods") {
             return true;
         }
         if (expect.platform == Platform::Linux && (rel == "usr" || rel == "usr/bin")) {
@@ -1071,7 +1105,8 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
         if (expect.platform == Platform::MacOS && (rel == "contents" || rel == "contents/resources")) {
             return true;
         }
-        if (expect.allow_aot_cache && (rel + "/").starts_with(bin + "aot_cache/")) {
+        if (expect.allow_aot_cache && (rel + "/").starts_with(bin + "aot_cache/") &&
+            !IsGameDataInAotCache(rel.substr(bin.size()) + "/")) {
             return true;
         }
         if (parts.size() >= 5 && parts[0] == "user" && parts[1] == "nand" && parts[2] == "user" &&
@@ -1114,27 +1149,13 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
         if (expect.platform != Platform::Windows && rel == bin + "game_source.txt") {
             return true;
         }
-        if (expect.platform == Platform::Windows && parts.size() == 2 && parts[0] == "exefs") {
-            if (std::find(kModuleNames.begin(), kModuleNames.end(), name) != kModuleNames.end()) {
-                signature = "Nintendo NSO executable";
-                return true;
-            }
-            if (name == "main.npdm") {
-                signature = "Nintendo NPDM metadata";
-                return true;
-            }
-            return name == "romfs.bin" || name == "control.nca" || name == "control.nacp" ||
-                   std::regex_match(name, std::regex{R"(^icon_[a-z]+\.dat$)"});
-        }
-        if (rel == "user/config/sdl2-config.ini" || rel == "user/config/suyu-install.txt") {
+        if (rel == "user/config/sdl2-config.ini" || rel == "user/config/suyu-install.txt" ||
+            rel == "user/config/game-source.ini") {
             return true;
         }
+        // The generated project only: never the game's modules, segments or dumps.
         if (expect.allow_aot_cache && rel.starts_with(bin + "aot_cache/")) {
-            // Raw modules the recompiler read, kept with the generated project.
-            if (rel.starts_with(bin + "aot_cache/exefs/nso/")) {
-                signature = name == "main.npdm" ? "Nintendo NPDM metadata" : "Nintendo NSO executable";
-            }
-            return true;
+            return !IsGameDataInAotCache(rel.substr(bin.size()));
         }
         // A file somewhere inside this title's save folder.
         if (parts.size() >= 8 && parts[0] == "user" && parts[1] == "nand" && parts[2] == "user" &&
@@ -1180,8 +1201,7 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
         }
         const std::string extension = ToLower(Utf8(path.extension()));
         if (std::find(kGameContainerExtensions.begin(), kGameContainerExtensions.end(),
-                      extension) != kGameContainerExtensions.end() &&
-            lower != "exefs/control.nca") {
+                      extension) != kGameContainerExtensions.end()) {
             findings.push_back({relative, "game-container", "game containers are never packaged"});
             continue;
         }

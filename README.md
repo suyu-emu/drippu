@@ -84,13 +84,13 @@ resolved only where CPM had fetched boost.
 ## Static recompilation
 
 **File > Export Game** turns a game into its own package. On Windows, a **Build**
-export is a standalone program with your settings, optional shader cache and
-automatic controller setup, and can be added to Steam directly. Linux and macOS
-exports are Source only. Exports never contain keys or firmware; they read them from
-the installed suyu. An export is a local package made from the game file you select:
-it contains the game's extracted executables and decrypted data and, for Hybrid and
-static exports (Source included), code translated from the game. It is not an official
-suyu release, and official suyu downloads contain no game material. See the
+export is a program with your settings, optional shader cache and automatic
+controller setup, and can be added to Steam directly. Linux and macOS exports are
+Source only. An export contains no game files, keys or firmware: every time it starts
+it reads your own game file and decrypts it with the keys installed in suyu, so it
+does not run without them. Hybrid and static exports (Source included) contain code
+translated from the game, which only runs that way. An export is a local package, not
+an official suyu release; official suyu downloads contain no game material. See the
 [Export Game guide](docs/user/GameExport.md).
 
 Static and Hybrid execution are experimental and tested on MK8D. In its race, a

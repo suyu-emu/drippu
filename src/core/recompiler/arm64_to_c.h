@@ -302,6 +302,13 @@ inline std::string ChainTo(u64 t);
 // instruction, so the forms that lose to the JIT are turned on here.
 inline bool g_translate_all = false;
 
+// The per-module standalone runner: main.c plus the module's text, rodata and
+// data segments bundled beside it, so the translated code can run on its own
+// with no emulator, no game file and no keys. The recompiler's own tests use it
+// with synthetic code. The game exporter turns it off: a game's translated code
+// may only run inside suyu, loaded against the user's own game file and keys.
+inline bool g_emit_standalone_runner = true;
+
 // ABI 6 "FM1": memory helpers that read the host page table directly and fall
 // back to the unchanged ABI 5 helpers for anything else. Off by default; while
 // it is off the emitted text is byte-identical to ABI 5, which
@@ -5633,7 +5640,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "
           "\"${_recomp_opt}\")\n"
        << "endif()\n\n"
-       << "if(NOT RECOMP_STATIC_ONLY)\n"
+       << (g_emit_standalone_runner ? "if(NOT RECOMP_STATIC_ONLY)\n" : "if(FALSE)\n")
        << "add_executable(recompiled main.c recomp_runtime.c ${RECOMP_SOURCES})\n"
        << "if(RECOMP_JOB_POOL)\n"
        << "  set_target_properties(recompiled PROPERTIES JOB_POOL_COMPILE ${RECOMP_JOB_POOL})\n"
@@ -5870,7 +5877,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     // with them rather than at the top level.
     write("src/recompiled_" + mod + ".c", rc);
     // finish_unit closed each block translation unit before reaching here.
-    write("main.c", mc.str());
+    if (g_emit_standalone_runner) {
+        write("main.c", mc.str());
+    }
     std::string export_text = ex.str();
     if (EmitGuardGen()) {
         // A module moved to another base must be re-verified there: drop back
@@ -5944,8 +5953,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         write("recomp_coverage.json", cov.str());
     }
 
-    // Bundle text/rodata/data as binary blobs so the exe can load them at startup
-    {
+    // Bundle text/rodata/data as binary blobs so the exe can load them at startup.
+    // Only for the standalone runner: nothing else reads them.
+    if (g_emit_standalone_runner) {
         std::string data_subdir = out_dir + "/data";
         make_dir(data_subdir);
         // Always write text.bin

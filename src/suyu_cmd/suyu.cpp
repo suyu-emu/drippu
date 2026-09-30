@@ -756,42 +756,59 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
 // export built elsewhere) or when that suyu is no longer there.
 // Each line is one way to find it, first match wins: a path relative to the
 // record, then an absolute one that may start with an %ENVIRONMENT% variable.
+/// A path as the exporter records it: absolute, relative to `base`, or starting with a
+/// %VARIABLE% (the home folder) expanded here. Empty when it cannot be expanded.
+static std::filesystem::path ExpandRecordedPath(std::string line, const std::filesystem::path& base) {
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    std::filesystem::path exe;
+    const auto close = line.starts_with('%') ? line.find('%', 1) : std::string::npos;
+    if (close != std::string::npos) {
+        const std::string name = line.substr(1, close - 1);
+#ifdef _WIN32
+        const wchar_t* value = _wgetenv(Common::UTF8ToUTF16W(name).c_str());
+        if (value == nullptr) {
+            return {};
+        }
+        exe = std::filesystem::path{std::wstring(value) +
+                                    Common::UTF8ToUTF16W(line.substr(close + 1))};
+#else
+        const char* value = std::getenv(name.c_str());
+        if (value == nullptr) {
+            return {};
+        }
+        exe = std::filesystem::path{std::string(value) + line.substr(close + 1)};
+#endif
+    } else {
+        exe = std::filesystem::path{Common::FS::ToU8String(line)};
+    }
+    if (!exe.empty() && exe.is_relative()) {
+        exe = (base / exe).lexically_normal();
+    }
+    return exe;
+}
+
+/// The user's own game file (or extracted folder) a validated export starts, as the
+/// exporter recorded it in user/config/game-source.ini. The package holds no game data.
+static std::filesystem::path RecordedGameSource(const std::filesystem::path& user_root) {
+    std::ifstream in(user_root / "config" / "game-source.ini");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.starts_with("path=")) {
+            return ExpandRecordedPath(line.substr(5), user_root / "config");
+        }
+    }
+    return {};
+}
+
 static std::filesystem::path RecordedSuyuExecutable(const std::filesystem::path& user_root) {
     std::ifstream in(user_root / "config" / "suyu-install.txt");
     std::string line;
     while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        std::filesystem::path exe;
-        const auto close = line.starts_with('%') ? line.find('%', 1) : std::string::npos;
-        if (close != std::string::npos) {
-            const std::string name = line.substr(1, close - 1);
-#ifdef _WIN32
-            const wchar_t* value = _wgetenv(Common::UTF8ToUTF16W(name).c_str());
-            if (value == nullptr) {
-                continue;
-            }
-            exe = std::filesystem::path{std::wstring(value) +
-                                        Common::UTF8ToUTF16W(line.substr(close + 1))};
-#else
-            const char* value = std::getenv(name.c_str());
-            if (value == nullptr) {
-                continue;
-            }
-            exe = std::filesystem::path{std::string(value) + line.substr(close + 1)};
-#endif
-        } else {
-            exe = std::filesystem::path{Common::FS::ToU8String(line)};
-        }
-        if (exe.empty()) {
-            continue;
-        }
-        if (exe.is_relative()) {
-            exe = (user_root / "config" / exe).lexically_normal();
-        }
+        const auto exe = ExpandRecordedPath(line, user_root / "config");
         std::error_code ec;
-        if (std::filesystem::is_regular_file(exe, ec)) {
+        if (!exe.empty() && std::filesystem::is_regular_file(exe, ec)) {
             return exe;
         }
     }
@@ -1368,6 +1385,36 @@ int main(int argc, char** argv) {
     };
 
     Common::ConfigureNvidiaEnvironmentFlags();
+
+    // A package made by the validated exporter carries no game data. It starts the
+    // user's own game file, which is read and decrypted with the keys installed in suyu,
+    // exactly as suyu itself would; nothing inside the package is used in its place.
+    if (filepath.empty() && !export_user_root.empty() &&
+        std::filesystem::is_regular_file(
+            export_user_root.parent_path() / Common::PackagePolicy::kExportManifestName)) {
+        const auto source = RecordedGameSource(export_user_root);
+        std::error_code source_ec;
+        std::filesystem::path launch = source;
+        if (!source.empty() && std::filesystem::is_directory(source, source_ec)) {
+            launch = std::filesystem::is_directory(source / "exefs", source_ec)
+                         ? source / "exefs" / "main"
+                         : source / "main";
+        }
+        if (source.empty() || !std::filesystem::is_regular_file(launch, source_ec)) {
+            ReportExportProblem(
+                "Game file not found",
+                fmt::format("This exported game starts your own copy of the game, which was not "
+                            "found{}{}.\n\nPut the game file back, or export the game again "
+                            "from where it is now.",
+                            source.empty() ? "" : " at\n",
+                            source.empty() ? "" : Common::FS::PathToUTF8String(source)),
+                source.empty() ? export_user_root / "config" : source.parent_path(), false, {},
+                "", "");
+            return 2;
+        }
+        filepath = Common::FS::PathToUTF8String(launch);
+        LOG_INFO(Frontend, "Export: starting the user's game file {}", filepath);
+    }
 
     // Auto-detect ROM / exefs alongside the executable when no -g flag is given
     if (filepath.empty() && !static_cast<u32>(load_parameters.applet_id)) {

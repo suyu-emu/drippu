@@ -196,8 +196,11 @@ static constexpr const char* kExportRuntimeDlls[] = {
 // What every local export says about itself, in its README and the exporter's warning.
 static constexpr char kExportContentNotice[] =
     "This is a local game export, made on this computer from a game file you selected.\n"
-    "It contains game material extracted from that file (its executables and decrypted\n"
-    "data) and, for AOT exports, code translated from the game - Source exports too.\n"
+    "It contains no game data: each time it starts it reads your own game file, and\n"
+    "suyu decrypts it with the keys you installed from your own Switch, exactly as when\n"
+    "you play it in suyu. Without that file and those keys it does not run. Keys and\n"
+    "firmware are never copied into it. Hybrid and static exports also contain code\n"
+    "translated from the game (Source exports as C), which only runs that way.\n"
     "It is not an official suyu release. How it was made does not show that anyone owns\n"
     "the game or may redistribute it. Do not upload it, or logs and dumps made with it,\n"
     "to suyu's release or support channels.\n";
@@ -903,10 +906,10 @@ static bool PrepareAotSourcePackage(const QString& pkg_dir, const QString& packa
     QTextStream out(&readme);
     out << "AOT source export (local game export); no compiled launcher is included.\n\n"
            "Generated C, CMake project files, and build scripts are in aot_cache/. The C is\n"
-           "translated from the game's code, and aot_cache/ also keeps the game's raw modules\n"
-           "and data segments: this is game-derived material, not a content-free project.\n"
-           "The extracted ExeFS and decrypted RomFS are in exefs/.\n"
-           "Compile the generated project before attempting to run this export.\n\n"
+           "translated from the game's code: it is game-derived material, not a content-free\n"
+           "project. It carries none of the game's own files - no modules, data segments,\n"
+           "ExeFS or RomFS - and builds only libraries that suyu loads alongside your game\n"
+           "file, read with your keys. There is no standalone program to build from it.\n\n"
         << kExportContentNotice;
     return out.status() == QTextStream::Ok;
 }
@@ -2984,6 +2987,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
     const auto enabled = [](const char* name) {
         return qEnvironmentVariable(name) != QStringLiteral("0");
     };
+    // No standalone runner and no bundled segments: the translated code runs only inside
+    // suyu, against the user's own game file.
+    suyu::recomp::g_emit_standalone_runner = false;
     suyu::recomp::g_emit_fastmem = enabled("SUYU_AOT_FASTMEM");
     // GG1 and FPX1 are ABI 6 features, so they need FM1.
     suyu::recomp::g_emit_guard_gen = enabled("SUYU_AOT_GUARD_GEN");
@@ -4452,6 +4458,13 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         }
     }
 
+    // The raw modules were only read to translate them; no copy of the game's own
+    // executables stays in the project or the package.
+    if (!QDir(recomp_root + QStringLiteral("/nso")).removeRecursively()) {
+        LOG_ERROR(Frontend, "Could not remove the analysed modules from the AOT cache");
+        return {};
+    }
+
     // Write the final fallback outcome, including compile-time module failures.
     last_fallback_modules = fallback_modules;
     QJsonArray fallback_array;
@@ -4557,70 +4570,57 @@ static QString AotCacheDirFor(const QString& package_root,
     }
 }
 
-static FileSys::VirtualFile ExportControlNca(const QString& rom_path, Core::System& system,
-                                           u64 program_id) {
-    static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
-    const QFileInfo source{rom_path};
-    if (source.isDir() || source.fileName() == QStringLiteral("main")) {
-        const QString directory = source.isDir() ? rom_path : source.absolutePath();
-        const QString exefs = QDir(directory).exists(QStringLiteral("exefs"))
-                                  ? directory + QStringLiteral("/exefs") : directory;
-        const QString control_path = exefs + QStringLiteral("/control.nca");
-        return vfs->OpenFile(control_path.toStdString(),
-                             FileSys::OpenMode::Read);
+// The game file (or extracted folder) an export starts. Written as the launcher reads
+// it: the home folder as %USERPROFILE% (%HOME% elsewhere), so a package names no account.
+static bool WriteGameSourceRecord(const QString& package_root, const QString& rom_path,
+                                  u64 program_id, QString* error) {
+    const QString config_dir = package_root + QStringLiteral("/user/config");
+    if (!QDir().mkpath(config_dir)) {
+        *error = QStringLiteral("cannot create the package config folder");
+        return false;
     }
-    const u64 base_id = FileSys::GetBaseTitleID(program_id);
-    const u64 update_id = FileSys::GetUpdateTitleID(base_id);
-    const auto& provider = system.GetContentProvider();
-    const FileSys::PatchManager pm{base_id, system.GetFileSystemController(), provider};
-    const auto installed = pm.GetExeFSUpdate();
-    if (installed && installed->slot) {
-        const auto* slot = system.GetContentProviderUnion().GetSlotProvider(*installed->slot);
-        if (slot) {
-            FileSys::VirtualFile control;
-            if (*installed->slot == FileSys::ContentProviderUnionSlot::External) {
-                const auto* external = static_cast<const FileSys::ExternalContentProvider*>(slot);
-                control = external->ListUpdateVersions(update_id).empty()
-                              ? external->GetEntryRaw(update_id, FileSys::ContentRecordType::Control)
-                              : external->GetEntryForVersion(update_id, FileSys::ContentRecordType::Control,
-                                                             installed->version);
-            } else if (*installed->slot == FileSys::ContentProviderUnionSlot::FrontendManual) {
-                const auto* manual = static_cast<const FileSys::ManualContentProvider*>(slot);
-                control = manual->ListUpdateVersions(update_id).empty()
-                              ? manual->GetEntryRaw(update_id, FileSys::ContentRecordType::Control)
-                              : manual->GetEntryForVersion(update_id, FileSys::ContentRecordType::Control,
-                                                          installed->version);
-            } else {
-                control = slot->GetEntryRaw(update_id, FileSys::ContentRecordType::Control);
-            }
-            if (control) {
-                return control;
-            }
-        }
+    const QString source = QDir::cleanPath(QFileInfo(rom_path).absoluteFilePath());
+    const QString home = QDir::cleanPath(QDir::homePath());
+#ifdef _WIN32
+    const QString home_token = QStringLiteral("%USERPROFILE%");
+    constexpr auto home_case = Qt::CaseInsensitive;
+#else
+    const QString home_token = QStringLiteral("%HOME%");
+    constexpr auto home_case = Qt::CaseSensitive;
+#endif
+    const QString recorded = source.startsWith(home + QLatin1Char('/'), home_case)
+                                 ? home_token + source.mid(home.size())
+                                 : source;
+    QSaveFile file(config_dir + QStringLiteral("/game-source.ini"));
+    QByteArray text = "; The game file this export starts. suyu reads it with the keys installed\n"
+                      "; on this computer; the package itself contains no game data.\n";
+    text += "path=" + QDir::toNativeSeparators(recorded).toUtf8() + "\n";
+    text += "title_id=" +
+            QStringLiteral("%1").arg(program_id, 16, 16, QLatin1Char('0')).toUpper().toUtf8() +
+            "\n";
+    if (!file.open(QIODevice::WriteOnly) || file.write(text) != text.size() || !file.commit()) {
+        *error = QStringLiteral("cannot record the game file in the package");
+        return false;
     }
-    const auto file = vfs->OpenFile(rom_path.toStdString(), FileSys::OpenMode::Read);
-    const auto loader = file ? Loader::GetLoader(system, file) : nullptr;
-    std::shared_ptr<FileSys::NSP> nsp;
-    if (loader && loader->GetFileType() == Loader::FileType::XCI) {
-        nsp = FileSys::XCI{file}.GetSecurePartitionNSP();
-    } else if (loader && loader->GetFileType() == Loader::FileType::NSP) {
-        nsp = std::make_shared<FileSys::NSP>(file);
+    return true;
+}
+
+// An exported game loads the update suyu has installed, or one bundled in the game file.
+// An update used from anywhere else (an SD card folder, a game-list folder) would not be
+// there when the package starts, so the export asks for it to be installed first.
+static QString UpdateOutsideInstalledContent(Core::System& system, u64 program_id) {
+    if (program_id == 0) {
+        return {};
     }
-    if (nsp && nsp->GetStatus() == Loader::ResultStatus::Success) {
-        // Match the bundled update selected by the ExeFS extractor. An
-        // installed update already chosen above takes precedence.
-        if (!installed && nsp->GetNCA(update_id, FileSys::ContentRecordType::Program,
-                                      FileSys::TitleType::Update)) {
-            if (const auto control = nsp->GetNCAFile(update_id, FileSys::ContentRecordType::Control,
-                                                    FileSys::TitleType::Update)) {
-                return control;
-            }
-        }
-        if (const auto control = nsp->GetNCAFile(base_id, FileSys::ContentRecordType::Control)) {
-            return control;
-        }
+    const FileSys::PatchManager pm{FileSys::GetBaseTitleID(program_id),
+                                   system.GetFileSystemController(), system.GetContentProvider()};
+    const auto update = pm.GetExeFSUpdate();
+    if (!update || !update->slot || *update->slot == FileSys::ContentProviderUnionSlot::UserNAND ||
+        *update->slot == FileSys::ContentProviderUnionSlot::SysNAND) {
+        return {};
     }
-    return provider.GetEntryRaw(base_id, FileSys::ContentRecordType::Control);
+    return QStringLiteral("the game update comes from outside suyu's installed content. Install "
+                          "it with Install Update File..., then export again");
 }
 
 bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QString& cache_dir,
@@ -4670,111 +4670,23 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             return false;
         }
 
-        // ── Extract exefs (NSO executables) → <pkg>/exefs/ ──────────────────────
-        // This gives the package the same structure as Switch ROM viewers show.
-        // suyu-cmd auto-detects exefs/main next to it and loads from there.
-        const QString exefs_dst = pkg_dir + QStringLiteral("/exefs");
-        const bool deconstructed = QFileInfo(rom_path).isDir();
-        const QString source_exefs = QDir(rom_path).exists(QStringLiteral("exefs"))
-                                         ? rom_path + QStringLiteral("/exefs") : rom_path;
-        QString reason;
-        FileSys::VirtualDir exefs_vdir;
-        std::optional<PackagePolicy::ExeFsPlan> source_plan;
-        if (deconstructed) {
-            source_plan = PackagePolicy::PlanExtractedExeFs(ToFsPath(source_exefs));
-            if (!CopyDeconstructedExeFs(source_exefs, exefs_dst, &reason) ||
-                !NpdmMatchesTitle(exefs_dst, program_id, &reason)) {
-                return fail(reason);
-            }
-        } else {
-            exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString(), system_);
-            if (!exefs_vdir || DumpVirtualDir(exefs_vdir, exefs_dst) < 0) {
-                return fail(QStringLiteral("could not extract the effective ExeFS"));
-            }
-            // Only the files an ExeFS consists of, whatever the container held.
-            const auto dumped = PackagePolicy::PlanExtractedExeFs(ToFsPath(exefs_dst));
-            if (!dumped.Ok()) {
-                return fail(QString::fromStdString(PackagePolicy::Describe(dumped.rejected)));
+        // The package holds no game data: no extracted ExeFS, no RomFS, no control data.
+        // It records the user's own game file, which the launcher opens each time it
+        // starts and which suyu reads with the keys installed on this computer - the
+        // same requirement as playing the game in suyu itself.
+        // The existing checks still run here, on the user's file with the user's keys: the
+        // effective code and data must read and pair up (base, update, versions), or the
+        // export stops. Nothing read here is written into the package.
+        if (!QFileInfo(rom_path).isDir()) {
+            const auto exefs_vdir = ExtractExeFsFromRom(rom_path.toStdString(), system_);
+            if (!exefs_vdir || !ExtractRomFsFromRom(rom_path.toStdString(), system_, exefs_vdir)) {
+                return fail(QStringLiteral("the game's code and data could not be read as a "
+                                           "matching pair with the installed keys and update"));
             }
         }
-        if (!QFile::exists(exefs_dst + QStringLiteral("/main"))) {
-            return fail(QStringLiteral("the effective ExeFS has no main module"));
-        }
-        // Control content supplies save/application metadata that some games
-        // need before their first frame. It is small and independent of the
-        // original multi-gigabyte Program NCA and its already extracted RomFS.
-        const auto control = ExportControlNca(rom_path, system_, program_id);
-        if (control) {
-            const FileSys::NCA nca{control};
-            if (!FileSys::IsValidControlMetadata(nca, program_id)) {
-                return fail(QStringLiteral("could not read matching control metadata"));
-            }
-            const auto bytes = control->ReadAllBytes();
-            QFile output(exefs_dst + QStringLiteral("/control.nca"));
-            if (bytes.size() != control->GetSize() || !output.open(QIODevice::WriteOnly) ||
-                output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()) !=
-                    static_cast<qint64>(bytes.size()) || !output.flush()) {
-                return fail(QStringLiteral("could not package control metadata"));
-            }
-        }
-
-        // ── RomFS → <pkg>/exefs/romfs.bin ──────────────────────────────────────
-        // The deconstructed loader reads romfs.bin beside the NSOs. It is copied
-        // into the package so the export runs without the original file.
-        // Streamed in chunks because RomFS can be many GB.
-        const QString romfs_dst = exefs_dst + QStringLiteral("/romfs.bin");
-        if (deconstructed) {
-            const auto* romfs = source_plan ? source_plan->Find(PackagePolicy::ExeFsRole::RomFs)
-                                            : nullptr;
-            if (!romfs) {
-                return fail(QStringLiteral("the extracted folder has no romfs.bin"));
-            }
-            std::string copy_error;
-            if (!PackagePolicy::CopyFileNoFollow(
-                    ToFsPath(source_exefs), romfs->source, ToFsPath(romfs_dst), &copy_error,
-                    [this](u64 done, u64 total) {
-                        if (total != 0 && (done & ((64ULL << 20) - 1)) == 0) {
-                            ReportStage(ExportStage::Package,
-                                        0.05 + 0.85 * static_cast<double>(done) / total,
-                                        tr("Copying game data: %1 of %2 MB")
-                                            .arg(done >> 20)
-                                            .arg(total >> 20));
-                        }
-                    })) {
-                return fail(QString::fromStdString(copy_error));
-            }
-        } else {
-            const auto romfs_vf = ExtractRomFsFromRom(rom_path.toStdString(), system_, exefs_vdir);
-            if (!romfs_vf) {
-                return fail(QStringLiteral("could not extract the effective RomFS"));
-            }
-            QFile rf(romfs_dst);
-            if (!rf.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
-                return fail(QStringLiteral("could not open packaged RomFS: %1").arg(rf.errorString()));
-            }
-            constexpr u64 kChunk = 64ULL * 1024 * 1024;
-            const u64 total = romfs_vf->GetSize();
-            for (u64 off = 0; off < total; off += kChunk) {
-                // Game data is most of packaging; the rest (ExeFS, launcher, DLLs) is small.
-                ReportStage(ExportStage::Package, 0.05 + 0.85 * static_cast<double>(off) / total,
-                            tr("Copying game data: %1 of %2 MB")
-                                .arg(off >> 20)
-                                .arg(total >> 20));
-                const u64 len = std::min(kChunk, total - off);
-                const auto bytes = romfs_vf->ReadBytes(len, off);
-                if (bytes.size() != len ||
-                    rf.write(reinterpret_cast<const char*>(bytes.data()),
-                             static_cast<qint64>(bytes.size())) != static_cast<qint64>(len)) {
-                    return fail(QStringLiteral("RomFS stream failed at offset %1 of %2 bytes")
-                                    .arg(off)
-                                    .arg(total));
-                }
-            }
-            if (!rf.flush() || rf.error() != QFile::NoError ||
-                rf.size() != static_cast<qint64>(total)) {
-                return fail(QStringLiteral("RomFS write did not complete: %1").arg(rf.errorString()));
-            }
-            rf.close();
+        QString source_error;
+        if (!WriteGameSourceRecord(pkg_dir, rom_path, program_id, &source_error)) {
+            return fail(source_error);
         }
 
         // Bundle suyu-cmd.exe (renamed to the game name) and its runtime DLLs so the
@@ -4891,12 +4803,8 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             }
         }
 
-        // No -g argument: the exe auto-detects exefs/main (and romfs.bin
-        // alongside it) next to itself, both already extracted and decrypted
-        // into this package above. Passing the original ROM path here would
-        // bypass that and force suyu-cmd to re-open the encrypted source ROM
-        // instead - needing keys and the original file present, exactly what
-        // bundling exefs/romfs was meant to avoid.
+        // No -g argument: the exe reads user/config/game-source.ini and starts the
+        // user's own game file with the keys installed in suyu.
         QFile bat(pkg_dir + QDir::separator() + QStringLiteral("launch.bat"));
         if (bat.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream out(&bat);
@@ -4924,7 +4832,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             }
         }
         const QString manifest_file = pkg_dir + QStringLiteral("/aot_manifest.json");
-        if (control || QFile::exists(manifest_file)) {
+        if (QFile::exists(manifest_file)) {
             QFile input(manifest_file);
             QJsonObject metadata;
             if (input.exists()) {
@@ -4938,9 +4846,6 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
                 }
                 metadata = document.object();
                 input.close();
-            }
-            if (control) {
-                metadata[QStringLiteral("control_metadata")] = QStringLiteral("exefs/control.nca");
             }
             // The compiler's location names this machine; its file name is enough.
             if (metadata.contains(QStringLiteral("recomp_compiler"))) {
@@ -4969,9 +4874,7 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
                     << "The game's extracted ARM64 code runs through the Dynarmic JIT. This build\n"
                     << "is the baseline for comparing suyu static AOT (Experimental) and\n"
                     << "suyu Hybrid JIT + AOT.\n\n"
-                    << kExportContentNotice
-                    << "\nNo original ROM is needed at runtime. Keys and system firmware are read\n"
-                    << "from the installed suyu and are never copied into this package.\n";
+                    << kExportContentNotice;
                 readme.close();
                 return true;
             }
@@ -4980,8 +4883,9 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
                         : "Recompiled native build — suyu static AOT (Experimental), no JIT "
                           "fallback (local game export)\n\n");
             out << "Run: double-click launch.bat (or " << package_name << ".exe directly)\n\n";
-            out << "The game's code, statically recompiled to x86 machine code, is linked into\n";
-            out << package_name << ".exe alongside suyu's HLE/GPU/audio backend.\n\n";
+            out << "Code translated from the game, compiled to x86 machine code, is linked into\n";
+            out << package_name << ".exe alongside suyu's HLE/GPU/audio backend. It runs only\n";
+            out << "together with your game file, read with your keys.\n\n";
             out << kExportContentNotice << "\n";
             if (!last_recomp_compiler.isEmpty()) {
                 out << "Game code compiled with: " << QFileInfo(last_recomp_compiler).fileName()
@@ -5012,17 +4916,12 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             if (has_static_launcher) {
                 out << "- aot_manifest.json : how the game code was recompiled and compiled\n";
             }
-            out << "- exefs/        : the game's own executables and decrypted data, extracted\n";
-            out << "                    at export time so no ROM is needed to run\n";
-            if (control) {
-                out << "- exefs/control.nca : application and save metadata; uses installed keys\n";
-            }
+            out << "- user/config/game-source.ini : where your game file is; the game is read\n";
+            out << "                    from it each time, with the keys installed in suyu\n";
             out << "- *.dll           : runtime libraries (FFmpeg, DirectX shader compiler, OpenSSL)\n";
             out << "- LICENSES/       : suyu's license, third-party notices and source information\n";
             out << "- mods/           : optional; drop <title_id>/<mod name>/ folders here\n";
             out << "- user/           : this game's own config, saves, and logs (not suyu's)\n\n";
-            out << "Keys and system firmware are read from the installed suyu when the game\n";
-            out << "starts; they are never copied into this folder.\n\n";
             out << "Press F12 in-game for the debug panel (status, mods, folders).\n";
             readme.close();
         }
@@ -5444,13 +5343,15 @@ static bool WriteLicenseNotices(const QString& package_root, bool uses_aot) {
            "source at the revision above. That source, with its license texts, is published\n"
            "by the suyu project as the source archive of the matching release, and at\n"
            "https://github.com/suyu-emu/suyu-main.\n\n"
-           "The game material in this package (exefs/";
+           "This package contains no game files: it reads the user's own game file when it\n"
+           "starts.";
     if (uses_aot) {
-        out << ", the game code recompiled into the launcher, and any aot_cache/ folder";
+        out << " The code translated from the game - compiled into the launcher, or the\n"
+               "C in aot_cache/ - is not suyu's. It is not covered by suyu's license and the\n"
+               "suyu project does not publish it. It was produced on this computer from the\n"
+               "game file selected for the export.";
     }
-    out << ") is not\n"
-           "suyu's. It is not covered by suyu's license and the suyu project does not publish\n"
-           "it. It was produced on this computer from the game file selected for the export.\n";
+    out << "\n";
     return out.status() == QTextStream::Ok;
 }
 
@@ -5480,12 +5381,15 @@ static bool WriteExportManifest(const QString& package_root, const QString& expo
                                          : compiled ? QStringLiteral("build")
                                                     : QStringLiteral("source");
     manifest[QStringLiteral("contains")] = QJsonObject{
-        {QStringLiteral("extracted_exefs"), true},
-        {QStringLiteral("decrypted_romfs"), true},
+        {QStringLiteral("extracted_exefs"), false},
+        {QStringLiteral("decrypted_romfs"), false},
         {QStringLiteral("translated_game_code"), uses_aot},
         {QStringLiteral("nintendo_keys"), false},
         {QStringLiteral("system_firmware"), false},
     };
+    // What it needs each time it runs, supplied by the user.
+    manifest[QStringLiteral("requires_at_launch")] =
+        QJsonArray{QStringLiteral("user_game_file"), QStringLiteral("user_keys")};
     manifest[QStringLiteral("optional_data")] = QJsonObject{
         {QStringLiteral("saves"), saves},
         {QStringLiteral("shader_cache"), shader_cache},
@@ -5914,6 +5818,14 @@ void GameExportDialog::OnExport() {
         }
     }
 
+    // The package will load this game's update from suyu's installed content or from the
+    // game file itself; anything else would be missing when it starts.
+    if (const QString reason = UpdateOutsideInstalledContent(system_, export_program_id);
+        !reason.isEmpty() && !QFileInfo(rom_path).isDir()) {
+        finish_failed(tr("Export stopped: %1").arg(reason));
+        return;
+    }
+
     if (uses_aot) {
         // Step 2: ExeFS extraction is handled inside RunAotPrecompile via VFS.
         // An extracted folder is copied to the work area here, by role only.
@@ -6165,8 +6077,9 @@ void GameExportDialog::OnExport() {
     }
     fallback_note += backup_note + steam_note;
     const QString local_note =
-        tr("\n\nThis is a local export containing game material. Keys and firmware were not "
-           "copied into it. Do not upload it to suyu's release or support channels.");
+        tr("\n\nThis is a local export. It contains no game files or keys: it starts your "
+           "game file with the keys installed in suyu. Do not upload it to suyu's release or "
+           "support channels.");
 
     if (!uses_aot) {
         QMessageBox::information(
@@ -6193,9 +6106,8 @@ void GameExportDialog::OnExport() {
                "Performance varies by game; compare it with the suyu Hybrid JIT + AOT and suyu "
                "Dynarmic JIT exports.\n\n"
                "The package contains:\n"
-               "- %2.exe — the recompiled game code, statically linked with suyu's HLE/GPU "
-               "backend\n"
-               "- exefs/ — the game's extracted executables and decrypted data\n"
+               "- %2.exe — code translated from the game, statically linked with suyu's "
+               "HLE/GPU backend. It starts your game file with your installed keys.\n"
                "- mods/ — drop patch/mod folders here\n"
                "- user/ — this export's own config, save data, and logs (independent of suyu's)\n"
                "- LICENSES/ — suyu's license, third-party notices and source information\n"
@@ -6209,10 +6121,10 @@ void GameExportDialog::OnExport() {
             tr("Game exported as C source to:\n%1\n\n"
                 "The package contains:\n"
                 "- C source translated from the game's code, and CMake project files\n"
-                "- The game's data segments, extracted ExeFS and decrypted RomFS\n"
                 "- Build scripts for Windows (.cmd) and Unix (.sh)\n\n"
-                "No compiled game launcher is included. Run build_native_windows.cmd "
-                "(or build_native_unix.sh) in aot_cache/exefs/ to compile the generated project.\n\n"
+                "It contains none of the game's own files. The scripts in aot_cache/exefs/ build "
+                "libraries that suyu loads alongside your game file; there is no standalone "
+                "program.\n\n"
                 "(Choose \"Build\" instead of \"Source\" as the Export Format to have suyu compile "
                "this for you automatically.)")
                 .arg(final_path) +

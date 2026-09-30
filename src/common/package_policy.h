@@ -167,6 +167,11 @@ struct LocalExportExpectation {
     std::vector<std::string> runtime_dlls; ///< names allowed beside the launcher
 };
 
+/// True for a path under aot_cache/ that holds the game's own executables or a way to
+/// run them outside suyu: analysed modules, bundled segments, the standalone runner
+/// and guest-code dumps. `relative_lower` is lower-case and starts with "aot_cache/".
+bool IsGameDataInAotCache(std::string_view relative_lower);
+
 /// Walks a complete staging package and reports anything the exporter does
 /// not produce: links, key files or key-shaped text, firmware, stray Nintendo
 /// containers, and files outside the documented layout.

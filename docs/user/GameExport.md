@@ -1,17 +1,19 @@
 # Exporting a Game
 
 Use **File > Export Game...** to turn a game into its own package. On Windows the
-package is a program you can double-click or launch from Steam, without opening suyu.
-Exporting reads the game on this computer and writes the package to the output folder
-you choose.
+package is a program you can double-click or launch from Steam, without opening suyu's
+window. Each time it starts it reads **your own game file**, which suyu decrypts with
+**the keys you installed** from your own Switch - exactly as when you play the game in
+suyu. Without that file and those keys an export does not run.
 
-> **An export is a local package of game material, not a suyu release.** Official suyu
-> downloads contain no games, keys or firmware. An export does contain material from
-> the game file you selected: its executables and decrypted data, and for Hybrid and
-> static exports code translated from the game - the **Source** format included. It is
-> made for use on this computer. The exporter does not check who owns the game, and
-> nothing about how an export is made shows that it may be shared. Do not upload
-> exports, or logs and dumps made with them, to suyu's release or support channels.
+> **An export is a local package, not a suyu release, and not a copy of the game.**
+> Official suyu downloads contain no games, keys or firmware. An export contains no game
+> files, keys or firmware either: it records where your game file is. Hybrid and static
+> exports do contain code translated from the game (the **Source** format as C), which
+> only runs inside suyu together with your game file and keys; there is no standalone
+> program. The exporter does not check who owns the game, and nothing about how an
+> export is made shows that it may be shared. Do not upload exports, or logs and dumps
+> made with them, to suyu's release or support channels.
 
 > **Re-export static and Hybrid packages for v0.0.12.** The code-guard fix is compiled
 > into each game's generated code. Updating suyu alone does not change an existing
@@ -71,7 +73,8 @@ run a game.
 
 ## Select an export format
 
-- **Build** is the default on Windows. It produces a standalone program. The Hybrid
+- **Build** is the default on Windows. It produces a program that starts your game
+  file with your keys; it does not contain the game. The Hybrid
   and static backends compile the generated code, which needs CMake and a C compiler
   and can take a long time for large games.
 
@@ -97,14 +100,14 @@ run a game.
   compiler anyway, set `SUYU_RECOMP_COMPILER=msvc`.
 - **Source** writes the generated C project, its `CMakeLists.txt` and a build script,
   and stops there. It does not include a compiled program. This is the only format for
-  Linux and macOS. The generated C is translated from the game's code, and the project
-  keeps the game's modules and data segments beside it, so a Source export contains
-  game material just like a Build export.
+  Linux and macOS. The generated C is translated from the game's code, so a Source
+  export is game-derived, but it carries none of the game's own files (no modules, data
+  segments, ExeFS or RomFS). It builds only libraries that suyu loads alongside your game
+  file; there is no standalone program to build from it.
 
 While exporting, the progress bar follows the real work. The status line shows what
-is happening, for example "Compiling 312/940 files (main)" or "Copying game data:
-X of Y MB". During some setup steps the bar pauses while the status line keeps
-updating.
+is happening, for example "Compiling 312/940 files (main)". During some setup steps
+the bar pauses while the status line keeps updating.
 
 The **Full code scan** option is hidden; it would not change the generated code.
 For Hybrid, **Allow Dynarmic fallback if a module fails to recompile** lets the
@@ -160,13 +163,13 @@ exists, suyu asks first:
 
 **Always:**
 
-- `exefs/`: the game's executables (`main`, `rtld`, `sdk`, ...), `main.npdm`, its
-  decrypted RomFS as `romfs.bin`, and the game's control data. These are extracted from
-  the selected game file.
+- `user/config/game-source.ini`: where your game file (or extracted folder) is. The
+  program reads the game from there every time it starts. If you move the game file,
+  export again.
 - On Windows, the program: for the Dynarmic JIT a copy of suyu's command-line
-  frontend, for Build exports of Hybrid and static the game's recompiled code linked
-  with suyu's backend. Source exports keep the generated C project in `aot_cache/`
-  instead.
+  frontend, for Build exports of Hybrid and static the code translated from the game,
+  linked with suyu's backend. Source exports keep the generated C project in
+  `aot_cache/` instead.
 - A copy of your suyu settings, taken from one fixed list: graphics, CPU, audio,
   system and applet settings. Debug and unsafe settings, folder paths, input and output
   devices, the console name, the selected user, web service credentials and everything
@@ -175,8 +178,7 @@ exists, suyu asks first:
   naming the suyu revision the program was built from and where its source is
   published. The game material is not suyu's and is not covered by those licenses.
 - `export-package.json`, which records what the package holds (title ID, backend,
-  format, which optional data was included). `game_source.txt` names the game file by
-  file name only; the full path stays in suyu's own settings.
+  format, which optional data was included) and that it needs your game file and keys.
 
 **Optional** (needs a game whose title ID suyu can read, such as one chosen **From
 Library** or an extracted folder with a `main.npdm`), off unless ticked:
@@ -192,11 +194,13 @@ Library** or an extracted folder with a `main.npdm`), off unless ticked:
 
 What was not ticked is not in the package, even when an earlier export had it.
 
-**Never:** keys or firmware. See the next section.
+**Never:** game files (ExeFS, RomFS, NSP, XCI or NCA), keys or firmware. See the next
+section.
 
 ### Exporting from an extracted folder
 
-An extracted ExeFS folder may hold only what a game's ExeFS holds: the modules `rtld`,
+An export from an extracted folder reads that folder each time it starts, so keep it
+where it is. It may hold only what a game's ExeFS holds: the modules `rtld`,
 `main`, `sdk` and `subsdk0` to `subsdk9`, `main.npdm`, `romfs.bin` (or `romfs`),
 `control.nca`, `control.nacp` and `icon_<Language>.dat`. Each is checked for its
 format. Anything else - notes, key files, firmware, shortcuts or links - stops the export
@@ -212,17 +216,20 @@ Exported games read keys and firmware from the suyu installed on the same comput
 - A portable suyu: its `user\` folder.
 - A custom NAND folder set in suyu is honoured.
 
-The exporter never copies keys or firmware into a package, never generates them and
-never downloads them. A location that would lead back into the package itself is
-ignored, and an export made by this version refuses to start if firmware has been
-placed in its own `user\nand` folder: firmware comes only from the installed suyu.
+suyu never copies keys or firmware into a package, never generates them and never
+downloads them; it only reads the key files you install. A location that would lead
+back into the package itself is ignored, and an export refuses to start if firmware has
+been placed in its own `user\nand` folder: firmware comes only from the installed suyu.
+Updates are read from those installed in suyu (**Install Update File...**) or from the
+game file itself; an export that would need an update from anywhere else asks you to
+install it first.
 
 What is needed when:
 
 | | At export time | When the exported game runs |
 |---|---|---|
-| Game file | Yes, to extract and translate it | No: its material is already in the package |
-| Keys | Yes, for encrypted game files (to read them) | Yes, from the installed suyu |
+| Game file | Yes, to read and translate it | Yes, every time; the package has no game data |
+| Keys | Yes, for encrypted game files | Yes, from the installed suyu, to decrypt the game file |
 | Firmware | No (suyu warns if none is installed) | From the installed suyu; some screens need it |
 
 Keys that decrypt a game, and hashes or checks that match a game's content, do not show

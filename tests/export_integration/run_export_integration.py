@@ -188,9 +188,19 @@ class Run:
                     and manifest['contains']['nintendo_keys'] is False
                     and manifest['contains']['system_firmware'] is False,
                     json.dumps(manifest.get('format')))
-        self.record(name + ': ExeFS by role', {'exefs/main', 'exefs/main.npdm', 'exefs/romfs.bin'} <= names
-                    and not any(n.startswith('exefs/') and n.split('/')[1] not in
-                                ('main', 'main.npdm', 'romfs.bin', 'control.nca') for n in names))
+        # No game data at all: the package names the user's game file instead.
+        self.record(name + ': no game files in the package',
+                    not any(n.startswith('exefs/') or n.endswith('romfs.bin') for n in names)
+                    and manifest['contains']['extracted_exefs'] is False
+                    and manifest['contains']['decrypted_romfs'] is False)
+        if expect_launcher:
+            self.record(name + ': records the game file', 'user/config/game-source.ini' in names and
+                        str(self.fixture.name) in (package / 'user/config/game-source.ini').read_text())
+        # Source projects keep no module copies, segments, runner or guest dumps.
+        self.record(name + ': no module copies or standalone runner',
+                    not any(n.startswith('aot_cache/exefs/nso/') or '/data/' in n or
+                            n.endswith('/main.c') or n.startswith('aot_cache/debug/')
+                            for n in names))
         self.record(name + ': licenses', {'LICENSES/LICENSE.txt', 'LICENSES/THIRD-PARTY-NOTICES.txt',
                                           'LICENSES/SOURCE.txt'} <= names)
         self.record(name + ': aot_cache ' + ('kept' if expect_aot_cache else 'absent'),
@@ -208,10 +218,42 @@ class Run:
         manifest_text = (package / 'aot_manifest.json').read_text() if (package / 'aot_manifest.json').exists() else ''
         self.record(name + ': no machine paths in manifests', ':\\\\' not in manifest_text and
                     ':/' not in manifest_text and str(self.work) not in json.dumps(manifest))
+        (self.work / 'scan-export.json').unlink(missing_ok=True)
         scan = subprocess.run([sys.executable, str(ROOT / 'tools/package_policy/scan_release.py'),
                                '--kind', 'windows', '--report', str(self.work / 'scan-export.json'),
                                str(self.zip_of(package))], stdout=subprocess.PIPE, text=True)
-        self.record(name + ': public-release scan rejects the export', scan.returncode == 1)
+        report = self.work / 'scan-export.json'
+        rules = set()
+        if report.exists():
+            rules = {f['rule'] for a in json.loads(report.read_text())['archives']
+                     for f in a['findings']}
+        self.record(name + ': public-release scan rejects the export',
+                    scan.returncode == 1 and 'export-marker' in rules, ','.join(sorted(rules)))
+
+    def missing_key_check(self, package, exe):
+        # The configuration that used to crash (divide-by-zero in the AES layer): an
+        # encrypted file, a prod.keys present but without header_key. The launcher must
+        # now say the keys do not fit and stop.
+        nca = self.work / 'encrypted-looking.nca'
+        nca.write_bytes(os.urandom(0x8000))
+        record = package / 'user' / 'config' / 'game-source.ini'
+        original = record.read_text()
+        record.write_text('path=' + str(nca) + '\n')
+        keys = self.work / 'appdata' / 'suyu' / 'keys' / 'prod.keys'
+        keys.write_text('# placeholder without header_key\n')
+        log_dir = package / 'user' / 'log'
+        shutil.rmtree(log_dir, ignore_errors=True)
+        try:
+            code = subprocess.run([str(package / exe)], env=self.env, cwd=str(package),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  timeout=90).returncode
+        except subprocess.TimeoutExpired:
+            code = None
+        log = ''.join(p.read_text(errors='replace') for p in log_dir.glob('*.txt'))             if log_dir.exists() else ''
+        self.record('missing header key is reported, not a crash',
+                    code == 2 and 'could not be decrypted' in log, 'exit=%s' % code)
+        record.write_text(original)
+        keys.write_text(PLACEHOLDER_KEYS)
 
     def zip_of(self, package):
         target = self.work / 'zips' / (package.name + '.zip')
@@ -244,6 +286,9 @@ class Run:
             except Exception:
                 self.process.kill()
         self.record('registry unchanged by test exports', registry_dump() == registry_before)
+        # suyu and the launchers only read keys; nothing may be written beside them.
+        keys = sorted(p.name for p in (self.work / 'appdata' / 'suyu' / 'keys').iterdir())
+        self.record('no key files created', keys == ['prod.keys'], ', '.join(keys))
         report = self.work / 'integration-report.json'
         report.write_text(json.dumps(self.results, indent=2))
         failed = [r for r in self.results if not r['ok']]
@@ -279,6 +324,15 @@ class Run:
         self.record('launcher: runs after the package is moved', marker in log, 'exit=%s' % code)
         shutil.move(str(moved), str(jit))
 
+        # The package runs only with the user's own game file present.
+        hidden = self.work / 'SynthFixture-hidden'
+        self.fixture.rename(hidden)
+        code, output, log = self.launch(jit, exe, keys=True)
+        self.record('launcher: refuses to start without the user\'s game file',
+                    code == 2 and 'Game file not found' in log and marker not in log,
+                    'exit=%s' % code)
+        hidden.rename(self.fixture)
+
         # Keys or firmware placed inside the package are not used.
         fake = jit / 'fakesuyu'
         (fake / 'user' / 'keys').mkdir(parents=True)
@@ -306,6 +360,8 @@ class Run:
                     code == 2 and 'Firmware inside the export' in log, 'exit=%s' % code)
         shutil.rmtree(firmware)
         firmware.mkdir()
+
+        self.missing_key_check(jit, exe)
 
         # Conflicts: a headless export never merges or replaces by default.
         (jit / 'user' / 'nand' / 'user' / 'save' / '0000000000000000' /
@@ -365,7 +421,7 @@ class Run:
         if status.get('success'):
             self.check_package('Hybrid Source', source_pkg, True, False)
             readme = (source_pkg / 'README_NATIVE_EXPORT.txt').read_text(encoding='utf-8')
-            self.record('Source README says it is game-derived', 'not a content-free project' in readme)
+            self.record('Source README says it is game-derived', 'game-derived material' in readme and 'no standalone program' in readme)
             shutil.rmtree(source_pkg)
 
         for backend, name in (('hybrid', 'SynthFixture - Hybrid AOT + JIT'), ('static', 'SynthFixture')):

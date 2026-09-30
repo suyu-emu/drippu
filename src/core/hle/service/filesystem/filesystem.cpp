@@ -749,9 +749,28 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
                             Common::FS::PathToUTF8String(system_content_fallback));
             }
         }
+        // The same rule for installed games and updates: an exported game reads the ones
+        // installed in suyu, read-only, and loads the user's own game file with them.
+        FileSys::VirtualDir user_registered;
+        const auto own_user =
+            nand_directory ? nand_directory->GetDirectoryRelative("user/Contents/registered")
+                           : nullptr;
+        const bool own_user_is_empty = own_user == nullptr || (own_user->GetFiles().empty() &&
+                                                               own_user->GetSubdirectories().empty());
+        if (own_user_is_empty && !system_content_fallback.empty()) {
+            auto fallback = vfs.OpenDirectory(
+                Common::FS::PathToUTF8String(system_content_fallback / "user" / "Contents" /
+                                             "registered"),
+                FileSys::OpenMode::Read);
+            if (fallback != nullptr) {
+                LOG_INFO(Service_FS, "Reading installed games and updates from {}",
+                         Common::FS::PathToUTF8String(system_content_fallback));
+                user_registered = std::move(fallback);
+            }
+        }
         bis_factory = std::make_unique<FileSys::BISFactory>(
             nand_directory, std::move(load_directory), std::move(dump_directory),
-            std::move(system_registered));
+            std::move(system_registered), std::move(user_registered));
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::SysNAND,
                                        bis_factory->GetSystemNANDContents());
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::UserNAND,

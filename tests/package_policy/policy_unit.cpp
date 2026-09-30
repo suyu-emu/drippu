@@ -287,9 +287,7 @@ fs::path MakePackage(const Staging& staging, const std::string& title) {
     Write(pkg / "export-package.json",
           "{\"schema\": \"" + std::string{kExportManifestSchema} + "\"}\n");
     Write(pkg / "avcodec-61.dll", "MZ dll");
-    Write(pkg / "exefs" / "main", Nso());
-    Write(pkg / "exefs" / "main.npdm", Npdm());
-    Write(pkg / "exefs" / "romfs.bin", RomFs());
+    Write(pkg / "user" / "config" / "game-source.ini", "path=%USERPROFILE%\\Games\\game.nsp\n");
     Write(pkg / "LICENSES" / "LICENSE.txt", "GPL\n");
     fs::create_directories(pkg / "mods");
     Write(pkg / "user" / "config" / "sdl2-config.ini", "[Renderer]\nbackend=1\n");
@@ -317,9 +315,10 @@ void TestValidation(const fs::path& root) {
     CHECK(ValidateLocalExport(pkg, Expect(title)).empty());
 
     Write(pkg / "user" / "keys" / "prod.keys", KeyText());
-    Write(pkg / "exefs" / "notes.txt", "x");
+    // No game data of any kind: not the ExeFS, not the RomFS, not a container.
+    Write(pkg / "exefs" / "main", Nso());
+    Write(pkg / "exefs" / "romfs.bin", RomFs());
     Write(pkg / "stray.txt", "x");
-    Write(pkg / "exefs" / "control.nca", std::string(0xC00, '\0'));
     Write(pkg / "user" / "nand" / "user" / "save" / "0000000000000000" /
               "00112233445566778899aabbccddeeff" / "0100000000020000" / "other.bin",
           "other title");
@@ -328,12 +327,11 @@ void TestValidation(const fs::path& root) {
     Write(pkg / "user" / "cache" / "shader" / "0100000000020000" / "vulkan.bin", "x");
     const auto findings = ValidateLocalExport(pkg, Expect(title));
     CHECK(HasRule(findings, "user/keys", "unexpected"));
-    CHECK(HasRule(findings, "exefs/notes.txt", "unexpected"));
+    CHECK(HasRule(findings, "exefs", "unexpected"));
     CHECK(HasRule(findings, "stray.txt", "unexpected"));
     CHECK(HasRule(findings, "user/nand/system", "unexpected"));
     CHECK(HasRule(findings, "mods/leftover.txt", "unexpected"));
     CHECK(HasRule(findings, "user/cache/shader/0100000000020000", "unexpected"));
-    CHECK(!HasRule(findings, "exefs/control.nca", "unexpected"));
     bool other_title = false;
     for (const auto& finding : findings) {
         other_title |= finding.path.find("0100000000020000") != std::string::npos;
@@ -345,8 +343,26 @@ void TestValidation(const fs::path& root) {
     const fs::path src_pkg = MakePackage(*source, title);
     auto expect = Expect(title);
     expect.allow_aot_cache = true;
-    Write(src_pkg / "aot_cache" / "exefs" / "nso" / "main", Nso());
     Write(src_pkg / "aot_cache" / "exefs" / "main" / "src" / "unit0.c", "int x = 1;\n");
+    Write(src_pkg / "aot_cache" / "exefs" / "main" / "CMakeLists.txt", "project(x C)\n");
+    CHECK(ValidateLocalExport(src_pkg, expect).empty());
+    // The game's own modules, bundled segments, a standalone runner or guest dumps
+    // never travel with the generated project.
+    Write(src_pkg / "aot_cache" / "exefs" / "nso" / "main", Nso());
+    Write(src_pkg / "aot_cache" / "exefs" / "main" / "data" / "text.bin", "code");
+    Write(src_pkg / "aot_cache" / "exefs" / "main" / "main.c", "int main(void){}\n");
+    Write(src_pkg / "aot_cache" / "debug" / "code" / "main" / "b.guest.bin", "code");
+    {
+        const auto game_data = ValidateLocalExport(src_pkg, expect);
+        CHECK(HasRule(game_data, "aot_cache/exefs/nso", "unexpected"));
+        CHECK(HasRule(game_data, "aot_cache/exefs/main/data", "unexpected"));
+        CHECK(HasRule(game_data, "aot_cache/exefs/main/main.c", "unexpected"));
+        CHECK(HasRule(game_data, "aot_cache/debug", "unexpected"));
+    }
+    fs::remove_all(src_pkg / "aot_cache" / "exefs" / "nso");
+    fs::remove_all(src_pkg / "aot_cache" / "exefs" / "main" / "data");
+    fs::remove(src_pkg / "aot_cache" / "exefs" / "main" / "main.c");
+    fs::remove_all(src_pkg / "aot_cache" / "debug");
     CHECK(ValidateLocalExport(src_pkg, expect).empty());
     Write(src_pkg / "aot_cache" / "game.nsp", "PFS0" + std::string(60, '\0'));
     Write(src_pkg / "aot_cache" / "exefs" / "main" / "src" / "keys.h", KeyText());
@@ -405,7 +421,7 @@ void TestPromotion(const fs::path& root) {
     CHECK(!fs::exists(dest / "user" / "config" / "custom"));
     CHECK(ValidateLocalExport(dest, Expect(title)).empty());
     CHECK(RemoveStaging(*staging, &error)); // marker and work folder only
-    CHECK(fs::exists(dest / "exefs" / "main"));
+    CHECK(fs::exists(dest / "Game.exe"));
 
     // KeepBoth picks a fresh name.
     staging = CreateStaging(out, &error);
