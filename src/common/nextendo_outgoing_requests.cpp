@@ -22,7 +22,7 @@ bool g_loaded = false;
 std::vector<Entry> g_entries;
 
 std::filesystem::path FilePath() {
-    return FS::GetSuyuPath(SuyuPath::ConfigDir) / "nextendo_outgoing_requests.txt";
+    return Common::FS::GetSuyuPath(Common::FS::SuyuPath::ConfigDir) / "nextendo_outgoing_requests.txt";
 }
 
 // Caller holds g_mutex.

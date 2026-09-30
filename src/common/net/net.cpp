@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <optional>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -8,6 +9,7 @@
 
 #include <fmt/format.h>
 #include "common/scm_rev.h"
+#include "common/settings.h"
 #include "net.h"
 
 #include "common/logging.h"
@@ -116,7 +118,8 @@ static inline u64 ParseIsoTimestamp(const std::string& iso) {
 }
 
 std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::string& host,
-                                         const std::string& repo) {
+                                         const std::string& repo,
+                                         const std::string& website) {
     Release rel;
     if (!json.is_object())
         return std::nullopt;
@@ -138,8 +141,11 @@ std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::
 
     rel.host = host;
 
-    const auto release_base =
-        fmt::format("{}/{}/releases", Common::g_build_auto_update_website, repo);
+    // Custom sources carry their own website (a fork's Forgejo instance, say);
+    // without one the compiled-in site is the only sensible fallback.
+    const std::string& site =
+        website.empty() ? Common::g_build_auto_update_website : website;
+    const auto release_base = fmt::format("{}/{}/releases", site, repo);
     const auto fallback_html = fmt::format("{}/tag/{}", release_base, rel.tag);
     rel.html_url = json.value("html_url", fallback_html);
 
@@ -170,9 +176,10 @@ std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::
 }
 
 std::optional<Release> Release::FromJson(const std::string_view& json, const std::string& host,
-                                         const std::string& repo) {
+                                         const std::string& repo,
+                                         const std::string& website) {
     try {
-        return FromJson(nlohmann::json::parse(json), host, repo);
+        return FromJson(nlohmann::json::parse(json), host, repo, website);
     } catch (std::exception& e) {
         LOG_WARNING(Common, "Failed to parse JSON: {}", e.what());
     }
@@ -181,13 +188,14 @@ std::optional<Release> Release::FromJson(const std::string_view& json, const std
 }
 
 std::vector<Release> Release::ListFromJson(const nlohmann::json& json, const std::string& host,
-                                           const std::string& repo) {
+                                           const std::string& repo,
+                                           const std::string& website) {
     if (!json.is_array())
         return {};
 
     std::vector<Release> releases;
     for (const auto& obj : json) {
-        auto rel = Release::FromJson(obj, host, repo);
+        auto rel = Release::FromJson(obj, host, repo, website);
         if (rel)
             releases.emplace_back(rel.value());
     }
@@ -195,9 +203,10 @@ std::vector<Release> Release::ListFromJson(const nlohmann::json& json, const std
 }
 
 std::vector<Release> Release::ListFromJson(const std::string_view& json, const std::string& host,
-                                           const std::string& repo) {
+                                           const std::string& repo,
+                                           const std::string& website) {
     try {
-        return ListFromJson(nlohmann::json::parse(json), host, repo);
+        return ListFromJson(nlohmann::json::parse(json), host, repo, website);
     } catch (std::exception& e) {
         LOG_WARNING(Common, "Failed to parse JSON: {}", e.what());
     }
@@ -288,6 +297,153 @@ std::optional<std::string> GetReleasesBody() {
     const auto url = fmt::format("https://{}", Common::g_build_auto_update_stable_api);
 
     return MakeRequest(url, releases_path);
+}
+
+UpdateSource UpdateSource::Default() {
+    return UpdateSource{
+        .name = "Built-in",
+        .api_host = Common::g_build_auto_update_api,
+        .api_path = Common::g_build_auto_update_api_path,
+        .repo = Common::g_build_auto_update_repo,
+        .website = Common::g_build_auto_update_website,
+    };
+}
+
+UpdateSource UpdateSource::FromRepoSlug(const std::string& repo_slug, const std::string& name) {
+    return UpdateSource{
+        .name = name.empty() ? repo_slug : name,
+        .api_host = "api.github.com",
+        .api_path = fmt::format("/repos/{}/releases/latest", repo_slug),
+        .repo = repo_slug,
+        .website = "https://github.com",
+    };
+}
+
+std::string UpdateSource::Serialize() const {
+    return fmt::format("{}|{}|{}|{}|{}", name, api_host, api_path, repo, website);
+}
+
+std::optional<UpdateSource> UpdateSource::Deserialize(const std::string& text) {
+    // No escaping: '|' separates fields and newlines separate entries, so a
+    // field containing either is malformed input, not data to preserve.
+    if (text.find_first_of("\r\n") != std::string::npos) {
+        return std::nullopt;
+    }
+    std::vector<std::string> parts;
+    std::string rest = text;
+    for (int i = 0; i < 4; ++i) {
+        const auto pos = rest.find('|');
+        if (pos == std::string::npos) {
+            return std::nullopt;
+        }
+        parts.emplace_back(rest.substr(0, pos));
+        rest = rest.substr(pos + 1);
+    }
+    parts.emplace_back(std::move(rest));
+    // A fifth pipe means six fields, not five with an escaped pipe.
+    if (parts.size() != 5 || parts[4].find('|') != std::string::npos) {
+        return std::nullopt;
+    }
+    UpdateSource out{
+        .name = parts[0],
+        .api_host = parts[1],
+        .api_path = parts[2],
+        .repo = parts[3],
+        .website = parts[4],
+    };
+    // An entry that cannot be requested is not a source. Name and website may
+    // be empty (they default below); the request fields may not.
+    if (out.api_host.empty() || out.api_path.empty() || out.repo.empty()) {
+        return std::nullopt;
+    }
+    if (out.name.empty()) {
+        out.name = out.repo;
+    }
+    return out;
+}
+
+std::optional<Release> GetLatestReleaseFrom(const UpdateSource& source) {
+    if (source.api_host.empty() || source.api_path.empty() || source.repo.empty()) {
+        return std::nullopt;
+    }
+    const auto url = fmt::format("https://{}", source.api_host);
+    const auto body = MakeRequest(url, source.api_path);
+    if (!body) {
+        LOG_WARNING(Common, "Failed to get latest release from {}", source.name);
+        return std::nullopt;
+    }
+    return Release::FromJson(std::string_view{body.value()}, url, source.repo, source.website);
+}
+
+std::vector<UpdateSource> ParseExtraSources(const std::string& text) {
+    std::vector<UpdateSource> out;
+    std::string rest = text;
+    while (!rest.empty()) {
+        auto pos = rest.find_first_of("\r\n");
+        std::string line = (pos == std::string::npos) ? rest : rest.substr(0, pos);
+        rest = (pos == std::string::npos) ? std::string{} : rest.substr(pos + 1);
+        // Trim surrounding whitespace; a line that is empty afterwards is a
+        // separator, not an error.
+        const auto not_space = [](char c) { return c != ' ' && c != '\t'; };
+        line.erase(line.begin(), std::find_if(line.begin(), line.end(), not_space));
+        line.erase(std::find_if(line.rbegin(), line.rend(), not_space).base(), line.end());
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (auto parsed = UpdateSource::Deserialize(line)) {
+            out.emplace_back(std::move(parsed.value()));
+        } else {
+            LOG_WARNING(Common, "Ignoring malformed update source entry");
+        }
+    }
+    return out;
+}
+
+std::vector<UpdateSource> ResolveUpdateSources() {
+    UpdateSource primary = UpdateSource::Default();
+    const std::string override_repo = Settings::values.update_repo_override.GetValue();
+    const std::string override_host = Settings::values.update_api_host.GetValue();
+    const std::string override_path = Settings::values.update_api_path.GetValue();
+    const std::string override_site = Settings::values.update_website.GetValue();
+    // Per-field merge: setting just the repo keeps the GitHub API host/path,
+    // which is the common fork case. Anything left empty falls back to the
+    // compiled-in default for that field.
+    if (!override_repo.empty()) {
+        primary.repo = override_repo;
+        primary.name = "Custom";
+    }
+    if (!override_host.empty()) {
+        primary.api_host = override_host;
+    }
+    if (!override_path.empty()) {
+        primary.api_path = override_path;
+    }
+    if (!override_site.empty()) {
+        primary.website = override_site;
+    }
+
+    std::vector<UpdateSource> out;
+    const auto key_of = [](const UpdateSource& s) {
+        return s.api_host + '\x1F' + s.api_path + '\x1F' + s.repo;
+    };
+    std::vector<std::string> seen;
+    const auto push_unique = [&](UpdateSource s) {
+        if (s.api_host.empty() || s.api_path.empty() || s.repo.empty()) {
+            return;
+        }
+        const auto key = key_of(s);
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+            return;
+        }
+        seen.emplace_back(key);
+        out.emplace_back(std::move(s));
+    };
+    push_unique(std::move(primary));
+    for (auto& extra :
+         ParseExtraSources(Settings::values.update_extra_sources.GetValue())) {
+        push_unique(std::move(extra));
+    }
+    return out;
 }
 
 } // namespace Common::Net

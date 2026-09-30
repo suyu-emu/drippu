@@ -430,7 +430,7 @@ struct GuestMemCounters {
     std::atomic<u64>* data() { return slots; }
 
     void AddAtomicsFrom(const GuestMemCounters& src) {
-        for (std::size_t i = 0; i < kRecompGuestMemCounterCount; ++i) {
+        for (std::size_t i = 0; i < suyu::recomp::kRecompGuestMemCounterCount; ++i) {
             slots[i].fetch_add(src.slots[i].load(std::memory_order_relaxed),
                                std::memory_order_relaxed);
         }

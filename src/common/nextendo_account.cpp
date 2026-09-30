@@ -28,7 +28,7 @@ std::string g_token;
 u64 g_generation = 0;
 
 std::filesystem::path FilePath() {
-    return FS::GetSuyuPath(SuyuPath::ConfigDir) / "nextendo_account.txt";
+    return Common::FS::GetSuyuPath(Common::FS::SuyuPath::ConfigDir) / "nextendo_account.txt";
 }
 
 // Same order acc.cpp's GetEffectivePid() uses, so a test instance presents one identity to

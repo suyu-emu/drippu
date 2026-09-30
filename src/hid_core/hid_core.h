@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "common/common_funcs.h"
@@ -73,6 +74,18 @@ public:
     /// Removes all callbacks from input common
     void UnloadInputDevices();
 
+    /// Blocks the guest from seeing new NPad button/stick state (used while a
+    /// suyu-side overlay like the Nextendo Account dialog is reading the same
+    /// physical controller during gameplay, so it doesn't also drive the game
+    /// underneath it) without touching input consumers that read the
+    /// controller directly, like ControllerNavigation or hotkeys.
+    void SetGuestInputSuspended(bool suspended) {
+        guest_input_suspended.store(suspended, std::memory_order_relaxed);
+    }
+    bool IsGuestInputSuspended() const {
+        return guest_input_suspended.load(std::memory_order_relaxed);
+    }
+
     /// Number of emulated controllers
     static constexpr std::size_t available_controllers{10};
 
@@ -91,6 +104,7 @@ public:
     Kernel::KernelCore& kernel;
     NpadStyleTag supported_style_tag{NpadStyleSet::All};
     NpadIdType last_active_controller{NpadIdType::Handheld};
+    std::atomic<bool> guest_input_suspended{false};
 };
 
 } // namespace Core::HID

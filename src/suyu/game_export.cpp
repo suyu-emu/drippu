@@ -1857,7 +1857,7 @@ void GameExportDialog::MaybeAddToSteam(const QString& game_name, const QString& 
         } else {
             auto* async_steam = new SteamIntegration(this);
             connect(async_steam, &SteamIntegration::ArtworkFetched, this,
-                    [async_steam, game_name, status_label](const QString&, const QString& path) {
+                    [async_steam, game_name, this](const QString&, const QString& path) {
                         async_steam->SetShortcutArtwork(game_name, path);
                         if (status_label != nullptr) {
                             status_label->setText(

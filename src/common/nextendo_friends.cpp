@@ -39,7 +39,7 @@ namespace {
 // without restarting the game. Name goes last on each line because it is the only field that
 // could contain a comma.
 void WriteFriendBridgeLocked(const std::vector<Entry>& entries) {
-    const auto path = FS::GetSuyuPath(SuyuPath::SDMCDir) / "config" / "nextendo" /
+    const auto path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::SDMCDir) / "config" / "nextendo" /
                       "friends.txt";
     if (!NextendoAccount::IsLinked()) {
         void(FS::RemoveFile(path)); // signed out -- do not leave a stale list behind

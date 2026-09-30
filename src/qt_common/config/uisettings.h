@@ -159,10 +159,6 @@ struct Values {
     // Discord RPC
     Setting<bool> enable_discord_presence{linkage, false, "enable_discord_presence", Category::Ui};
 
-    // Accent colour used for Nextendo UI accents (chat room, friend delegates, profile chip).
-    // Stored as "#RRGGBB" so QColor can parse it directly; defaults to suyu's orange.
-    Setting<std::string> accent_color{linkage, "#FF953C", "accent_color", Category::Ui};
-
     // logging
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};
 

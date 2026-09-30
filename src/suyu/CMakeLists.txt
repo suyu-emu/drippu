@@ -317,6 +317,18 @@ if (SUYU_CRASH_DUMPS)
     target_compile_definitions(suyu PRIVATE SUYU_CRASH_DUMPS)
 endif()
 
+# Self-update dialog (Help > Check for Updates + startup check). Tied to the
+# update checker: without ENABLE_UPDATE_CHECKER there is nothing to check
+# against, so the dialog - which calls UpdateChecker - is excluded as well.
+if (ENABLE_UPDATE_CHECKER)
+    target_sources(suyu PRIVATE
+        update_dialog.cpp
+        update_dialog.h
+    )
+
+    target_compile_definitions(suyu PRIVATE ENABLE_UPDATE_CHECKER)
+endif()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     target_compile_definitions(suyu PRIVATE
         $<$<VERSION_LESS:$<CXX_COMPILER_VERSION>,15>:CANNOT_EXPLICITLY_INSTANTIATE>

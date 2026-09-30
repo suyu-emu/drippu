@@ -200,6 +200,10 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "suyu/external_decryption_tool.h"
 #include "suyu/mods_browser_dialog.h"
 #include "suyu/steam_integration.h"
+#ifdef ENABLE_UPDATE_CHECKER
+#include "frontend_common/update_checker.h"
+#include "suyu/update_dialog.h"
+#endif
 #include "suyu/user_manual_widget.h"
 #include "suyu/util/clickable_label.h"
 #include "suyu/vk_device_info.h"
@@ -769,6 +773,12 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
     if (game_path.isEmpty() && !qEnvironmentVariableIsEmpty("SUYU_RECOMP_DIR")) {
         QTimer::singleShot(0, this, [this]() { OnLoadRecompiledImage(); });
     }
+
+#ifdef ENABLE_UPDATE_CHECKER
+    // Deferred past first paint; the check itself runs off-thread and the
+    // dialog only opens when something newer answered.
+    QTimer::singleShot(5000, this, [this]() { RunStartupUpdateCheck(); });
+#endif
 }
 
 GMainWindow::~GMainWindow() {
@@ -1861,6 +1871,11 @@ void GMainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Configure_External_Decryption,
                  &GMainWindow::OnConfigureExternalDecryption);
     connect_menu(ui->action_About, &GMainWindow::OnAbout);
+#ifdef ENABLE_UPDATE_CHECKER
+    connect_menu(ui->action_Check_For_Updates, &GMainWindow::OnCheckForUpdates);
+#else
+    ui->action_Check_For_Updates->setVisible(false);
+#endif
     connect_menu(ui->action_Open_User_Manual, &GMainWindow::OnOpenUserManual);
 }
 
@@ -6204,6 +6219,32 @@ void GMainWindow::OnAbout() {
     aboutDialog.exec();
 }
 
+#ifdef ENABLE_UPDATE_CHECKER
+void GMainWindow::OnCheckForUpdates() {
+    UpdateDialog dialog(this, [this] { config->SaveAllValues(); });
+    dialog.CheckNow();
+    dialog.exec();
+}
+
+void GMainWindow::RunStartupUpdateCheck() {
+    if (!Settings::values.update_check_startup.GetValue()) {
+        return;
+    }
+    // Off the UI thread; only intrude when something newer actually answered.
+    // The dialog re-checks on open, so an update found here costs one extra
+    // fetch - worth it to stay silent when up to date.
+    auto* watcher = new QFutureWatcher<std::optional<UpdateChecker::SourcedRelease>>(this);
+    connect(watcher, &QFutureWatcher<std::optional<UpdateChecker::SourcedRelease>>::finished,
+            this, [this, watcher] {
+                watcher->deleteLater();
+                if (watcher->result().has_value()) {
+                    OnCheckForUpdates();
+                }
+            });
+    watcher->setFuture(QtConcurrent::run(&UpdateChecker::GetBestUpdate));
+}
+#endif
+
 // Count library entries that point at a file that is actually there. The model
 // also carries group rows and "owned://" placeholders, neither of which is
 // something the user can boot, so a plain rowCount() would report a library
@@ -8165,6 +8206,10 @@ void GMainWindow::UpdateThemePalette() {
     }
 #endif
     qApp->setPalette(themePalette);
+    // Publish the resolved state for UI that cannot call CheckDarkMode()
+    // itself (Nextendo dialogs). One extra evaluation per theme application;
+    // theme changes are rare and this path already evaluates it several times.
+    UISettings::g_is_dark_theme.store(CheckDarkMode(), std::memory_order_relaxed);
     AdjustLinkColor();
 }
 

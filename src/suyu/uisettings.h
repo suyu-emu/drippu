@@ -36,6 +36,14 @@ extern template class Setting<unsigned long long>;
 
 namespace UISettings {
 
+// Whether the currently applied theme is dark, as resolved by the main window
+// (adaptive themes included). Consumers that cannot reach GMainWindow - the
+// Nextendo dialogs among them - read this instead of re-deriving it, so every
+// part of the UI agrees on one answer. Published by GMainWindow whenever it
+// (re)applies the theme; defaults to false until the first publish.
+extern std::atomic_bool g_is_dark_theme;
+bool IsDarkTheme();
+
 struct ContextualShortcut {
     std::string keyseq;
     std::string controller_keyseq;
@@ -145,6 +153,19 @@ struct Values {
 
     // Discord RPC
     Setting<bool> enable_discord_presence{linkage, true, "enable_discord_presence", Category::Ui};
+
+    // Accent colour used for Nextendo UI accents (chat room, friend delegates,
+    // profile chip, population dialog). Stored as "#RRGGBB" so QColor parses it
+    // directly; defaults to suyu's orange.
+    Setting<std::string> accent_color{linkage, "#FF953C", "accent_color", Category::Ui};
+
+    // Nextendo toast notifications.
+    Setting<bool> nextendo_notifications_enabled{linkage, true,
+                                                 "nextendo/notificationsEnabled", Category::Ui};
+    // 0 = top-right, 1 = top-left, 2 = bottom-right, 3 = bottom-left.
+    // See NextendoToast::Corner.
+    Setting<int> nextendo_notification_corner{linkage, 0, "nextendo/notificationCorner",
+                                              Category::Ui};
 
     // logging
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};

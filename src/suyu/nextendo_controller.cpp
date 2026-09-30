@@ -371,7 +371,7 @@ void NextendoController::WriteProfileAvatar(const Common::UUID& uuid, const std:
     }
 
     const auto image_path = QString::fromStdString(Common::FS::PathToUTF8String(
-        FS::GetSuyuPath(SuyuPath::NANDDir) /
+        Common::FS::GetSuyuPath(Common::FS::SuyuPath::NANDDir) /
         fmt::format("system/save/8000000000000010/su/avators/{}.jpg", uuid.FormattedString())));
 
     QDir{}.mkpath(QFileInfo(image_path).absolutePath());

@@ -17,16 +17,16 @@
 
 #include "common/logging.h"
 
-std::optional<Common::Net::Release> UpdateChecker::GetUpdate() {
-    const auto latest = Common::Net::GetLatestRelease();
-    if (!latest) return std::nullopt;
+namespace {
 
-    LOG_INFO(Frontend, "Received update {}", latest->title);
-
+// The tag identifying "what we already run", in the same terms a release tag
+// uses. Split out so the multi-source selection below compares every source by
+// the same rule the single-source check always used.
+std::optional<std::string> CurrentReleaseTag(const std::string& release_tag) {
 #ifdef NIGHTLY_BUILD
     std::vector<std::string> result;
 
-    boost::split(result, latest->tag, boost::is_any_of("."));
+    boost::split(result, release_tag, boost::is_any_of("."));
     if (result.size() != 2)
         return std::nullopt;
 
@@ -38,12 +38,56 @@ std::optional<Common::Net::Release> UpdateChecker::GetUpdate() {
 
     const std::string build = result[0];
 #else
-    const std::string tag = latest->tag;
+    const std::string tag = release_tag;
     const std::string build = Common::g_build_version;
 #endif
+    if (tag != build) {
+        return tag;
+    }
+    return std::nullopt;
+}
 
-    if (tag != build)
-        return latest;
+} // namespace
 
+bool UpdateChecker::IsDifferentFromBuild(const std::string& release_tag) {
+    return CurrentReleaseTag(release_tag).has_value();
+}
+
+std::vector<UpdateChecker::SourcedRelease> UpdateChecker::GetLatestPerSource() {
+    std::vector<SourcedRelease> out;
+    for (const auto& source : Common::Net::ResolveUpdateSources()) {
+        auto latest = Common::Net::GetLatestReleaseFrom(source);
+        if (!latest) {
+            continue;
+        }
+        LOG_INFO(Frontend, "Received update {} from {}", latest->title, source.name);
+        out.push_back(SourcedRelease{
+            .release = std::move(latest.value()),
+            .source_name = source.name,
+        });
+    }
+    return out;
+}
+
+std::optional<UpdateChecker::SourcedRelease> UpdateChecker::GetBestUpdate() {
+    std::optional<SourcedRelease> best;
+    for (auto& candidate : GetLatestPerSource()) {
+        if (!CurrentReleaseTag(candidate.release.tag)) {
+            continue;
+        }
+        if (!best || candidate.release.published > best->release.published) {
+            best = std::move(candidate);
+        }
+    }
+    return best;
+}
+
+std::optional<Common::Net::Release> UpdateChecker::GetUpdate() {
+    // Same rule as before, now over every configured source with one fetch per
+    // source: the primary source is first in the resolved list and keeps its
+    // historical priority on ties (strict greater-than below).
+    if (auto best = GetBestUpdate()) {
+        return std::move(best->release);
+    }
     return std::nullopt;
 }
