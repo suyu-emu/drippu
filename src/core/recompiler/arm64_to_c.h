@@ -122,6 +122,84 @@ inline bool DirectBranchTarget(u32 i, u64 pc, u64& out) {
 //
 // Deliberately loose: any ADRP+ADD landing in .text becomes a root. A pair that
 // was really computing a data address only costs one extra block boundary.
+/// True when `insn` is a guest load or store, i.e. an instruction that reaches
+/// the recomp memory fast path at run time.
+///
+/// This exists to bound GPU coupling offline. The run-time
+/// `guest_memory.gpu_tracked` counter answers exactly how much traffic is
+/// GPU-tracked, but only for a title that has been run, and an export is built
+/// without running anything. Counting the instructions that *could* be
+/// GPU-tracked gives the export a denominator: a module with 400k memory-access
+/// sites can at most have 400k GPU-tracked accesses, and one with 200 is not
+/// worth a GPU-side fast path regardless of what the runtime later reports.
+///
+/// Deliberately conservative in what it claims and generous in what it counts:
+/// it over-counts relative to the accesses that are actually GPU-tracked at run
+/// time, so the result is an upper bound and not an estimate of the real figure.
+/// It is a syntactic test with no knowledge of the page table, so it cannot
+/// distinguish a rasterizer-cached page from ordinary memory - that distinction
+/// only exists once a process is running.
+///
+/// SCOPE, and it is narrower than the name suggests. Only the integer and
+/// pointer families are recognised:
+///
+///   LDR/STR (unsigned immediate), LDUR/STUR, LDP/STP (all four forms), and
+///   LDR (literal).
+///
+/// The Advanced SIMD load/store encodings are deliberately NOT matched. They
+/// span several unrelated encoding groups - structure multiple/single, the pair
+/// form, and the single-element form - which do not share a mask, and a mask
+/// loose enough to catch all of them also catches the SIMD ALU and accumulate
+/// groups (ADDV, FMLA, MOVI, DUP, BIC, SMOV and others all sit in the same bits).
+/// A wrong mask here would corrupt the very number this exists to report, and
+/// there is no partial credit: silently including arithmetic as memory traffic
+/// makes a title look GPU-bound when it is not.
+///
+/// So the figure under-reports on SIMD-heavy code, and the bound should be read
+/// as "at least this many", not "at most". Games move the bulk of their vertex
+/// and pixel data through the integer/pointer paths, which is why the bound is
+/// still useful, but closing the gap means a real decode of the Advanced SIMD
+/// load/store groups with tests per group - not a wider mask. Do not widen these
+/// without adding those tests; see src/tests/recompiler for the pattern.
+inline bool IsGuestMemoryAccess(u32 insn) {
+    // Every group below is checked with bit 26 (V) required to be 0. V is the
+    // scalar/SIMD selector in all of them, so leaving it out admits the
+    // Advanced SIMD form of the same encoding - LDR Q0,[X1] is bit-identical to
+    // LDR X0,[X1] apart from V, and so are the pair and literal forms. This is
+    // the single easiest way to get a wrong answer here, hence the one
+    // comparison shared by all four rather than four chances to forget it.
+    constexpr u32 kGprOnly = 0x04000000;
+    if ((insn & kGprOnly) != 0) {
+        // SIMD load/store is out of scope by design; see the note above.
+        return false;
+    }
+    // LDR/STR (immediate, unsigned offset): size 111 V 01 opc.
+    if ((insn & 0x3B000000) == 0x39000000) {
+        return true;
+    }
+    // LDUR/STUR (unscaled, imm9): 1x 111 0 00 0 imm9 opc.
+    if ((insn & 0x3B200C00) == 0x38000000) {
+        return true;
+    }
+    // LDP/STP (signed offset): opc 101 V 0 index LL imm7 Rt2 Rn Rt.
+    if ((insn & 0x3A000000) == 0x28000000) {
+        return true;
+    }
+    // LDR (literal): opc 011 V 00 imm19 Rt.
+    if ((insn & 0x3B000000) == 0x18000000) {
+        return true;
+    }
+    return false;
+}
+
+/// True when `insn` is an SVC. The guest reaches the GPU through the nvdrv
+/// SVC surface, so this is the other statically visible coupling point: a
+/// module issuing GPU service calls shows up here, and one that never does is
+/// not GPU-bound no matter what its memory traffic looks like.
+inline bool IsSupervisorCall(u32 insn) {
+    return (insn & 0xFFE0001F) == 0xD4000001;
+}
+
 inline void CollectAdrpAddTargets(const u8* text, size_t n_bytes, u64 base,
                                   std::vector<u64>& out) {
     const u32 n = static_cast<u32>(n_bytes / 4);
@@ -3267,6 +3345,23 @@ struct RecompileStats {
     /// says which instruction to implement next.
     std::map<u32, UnhandledSite> unhandled_by_signature;
 
+    /// Static upper bound on guest memory accesses this module can perform, and
+    /// the SVC count alongside it. See IsGuestMemoryAccess for what this is and
+    /// is not: it bounds GPU-coupled traffic without running anything, so an
+    /// export can report a figure the runtime's guest_memory.gpu_tracked counter
+    /// can later be checked against.
+    ///
+    /// Not a measurement of GPU coupling. Whether any of these sites actually
+    /// land on a rasterizer-cached page is a property of the live page table and
+    /// cannot be known from the instruction stream.
+    size_t memory_access_sites = 0;
+    size_t svc_sites = 0;
+
+    /// Fraction of walked instructions that reach the guest memory path.
+    double MemoryAccessFraction() const {
+        return emitted ? double(memory_access_sites) / double(emitted) : 0.0;
+    }
+
     /// Fraction of walked instructions the decoder could not translate.
     double UnhandledFraction() const {
         return emitted ? double(unhandled) / double(emitted) : 0.0;
@@ -3441,6 +3536,16 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
             open = Translate(insn, insn_pc, body, &unhandled);
             rcu += body;
             ++stats.emitted;
+            // Counted over walked instructions only, so the totals stay
+            // comparable with `emitted` and with the unhandled histogram beside
+            // them: an instruction the decoder could not decode is not
+            // something the generated code will ever access.
+            if (IsGuestMemoryAccess(insn)) {
+                ++stats.memory_access_sites;
+            }
+            if (IsSupervisorCall(insn)) {
+                ++stats.svc_sites;
+            }
             if (unhandled) {
                 ++stats.unhandled;
                 ++stats.unhandled_by_group[(insn >> 25) & 0xF];
@@ -3914,6 +4019,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         cov << "  \"unhandled_fraction\": " << std::fixed << std::setprecision(6)
             << stats.UnhandledFraction() << ",\n";
         cov.unsetf(std::ios::floatfield);
+
+        // GPU coupling, statically bounded. This is a ceiling, not a
+        // measurement: memory_access_sites is every instruction that could touch
+        // a rasterizer-cached page, and the run-time guest_memory.gpu_tracked
+        // counter in recomp_execution.json is the real figure to compare it
+        // against. Recorded here because an export is built without running the
+        // title, so this is the only number available at export time.
+        cov << "  \"memory_access_sites\": " << stats.memory_access_sites << ",\n";
+        cov << "  \"svc_sites\": " << stats.svc_sites << ",\n";
+        cov << "  \"memory_access_fraction\": " << std::fixed << std::setprecision(6)
+            << stats.MemoryAccessFraction() << ",\n";
+        cov.unsetf(std::ios::floatfield);
+        cov << "  \"gpu_coupling\": \"static_upper_bound_only\",\n";
 
         cov << "  \"unhandled_by_group\": {";
         bool first_group = true;
