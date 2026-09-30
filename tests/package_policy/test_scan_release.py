@@ -281,6 +281,79 @@ class OtherKindTests(ScanCase):
         keyed = tar_bytes({'suyu-v1.2.3-source/docs/notes.txt': KEY_TEXT}, dirs=())
         self.assertIn('key-text', self.rules_of(self.scan('k.tar.gz', keyed, 'source')))
 
+    def test_license_texts_and_notices_are_allowed_in_every_package_kind(self):
+        extra = {'LICENSE.txt': b'x', 'LICENSES/MIT.txt': b'MIT', 'THIRD-PARTY-NOTICES.txt': b'notices'}
+        self.assertClean(self.scan('l.tar.gz', tar_bytes({'./suyu': b'ELF', './suyu-cmd': b'ELF', **{'./' + k: v for k, v in extra.items()}}), 'linux'))
+        self.assertClean(self.scan('w.zip', zip_bytes(windows_members(**extra)), 'windows'))
+        self.assertClean(self.scan('m.zip', zip_bytes({'suyu.app/Contents/Info.plist': b'x', **extra}), 'macos'))
+        for kind, core in (('libretro-linux', 'suyu_libretro.so'), ('libretro-windows', 'suyu_libretro.dll'),
+                           ('libretro-macos', 'suyu_libretro.dylib'), ('libretro-android', 'suyu_libretro_android.so')):
+            self.assertClean(self.scan(kind + '.zip', zip_bytes({core: b'bin', **extra}), kind))
+        result = self.scan('bad.zip', zip_bytes({'suyu_libretro.so': b'bin', 'LICENSES/sub/MIT.txt': b'x',
+                                                 'LICENSES/run.exe': b'x'}), 'libretro-linux')
+        self.assertEqual(self.rules_of(result, 'LICENSES/sub/MIT.txt'), {'unexpected'})
+        self.assertEqual(self.rules_of(result, 'LICENSES/run.exe'), {'unexpected'})
+
+    def test_dependency_sources_layout_and_nested_archives(self):
+        top = 'suyu-v1.2.3-dependency-sources/'
+        upstream = tar_bytes({'zlib-1.3/zlib.h': b'/* header */', 'zlib-1.3/doc/notes.txt': b'notes'}, dirs=())
+        members = {top + 'MANIFEST.json': b'{}', top + 'README.txt': b'readme', top + 'madler-zlib-v1.3.tar.gz': upstream,
+                   top + 'boost.tar.xz': self.xz_tar({'boost/a.hpp': b'x'})}
+        self.assertClean(self.scan('suyu-v1.2.3-dependency-sources.tar', self.plain_tar(members), 'dependency-sources'))
+        bad = dict(members)
+        bad[top + 'extra.bin'] = b'x'
+        bad[top + 'sub/inner.tar.gz'] = upstream
+        bad['other/file.tar.gz'] = upstream
+        result = self.scan('bad.tar', self.plain_tar(bad), 'dependency-sources')
+        self.assertEqual(self.rules_of(result, top + 'extra.bin'), {'unexpected'})
+        self.assertEqual(self.rules_of(result, top + 'sub/inner.tar.gz'), {'unexpected'})
+        self.assertIn('unexpected', self.rules_of(result, 'other/file.tar.gz'))
+
+    def test_dependency_sources_nested_content_is_still_scanned(self):
+        top = 'suyu-v1.2.3-dependency-sources/'
+        dirty = tar_bytes({'lib-1/docs/notes.txt': KEY_TEXT, 'lib-1/data.zst': b'zstd', 'lib-1/link': b''}, dirs=(),
+                          links=[('lib-1/sym', tarfile.SYMTYPE, 'data.zst')])
+        xz = self.xz_tar({'boost/notes.txt': KEY_TEXT})
+        result = self.scan('d.tar', self.plain_tar({top + 'lib.tar.gz': dirty, top + 'boost.tar.xz': xz}), 'dependency-sources')
+        self.assertEqual(self.rules_of(result, top + 'lib.tar.gz!lib-1/docs/notes.txt'), {'key-text'})
+        self.assertEqual(self.rules_of(result, top + 'lib.tar.gz!lib-1/data.zst'), {'nested-archive'})
+        self.assertEqual(self.rules_of(result, top + 'lib.tar.gz!lib-1/sym'), {'link'})
+        self.assertEqual(self.rules_of(result, top + 'boost.tar.xz!boost/notes.txt'), {'key-text'})
+
+    def test_dependency_sources_exceptions_are_exact_and_scoped(self):
+        entries = [e for e in POLICY['approved_exceptions'] if 'dependency-sources' in e['kinds']]
+        self.assertTrue(entries)
+        for entry in entries:
+            self.assertEqual(entry['kinds'], ['dependency-sources'])
+            self.assertTrue(entry['path_regex'].startswith('suyu-[^/]+-dependency-sources/'))
+            self.assertIn('!', entry['path_regex'])  # always inside one named upstream archive
+            # key-name only for the documentation file checked in the shipped-exceptions test.
+            self.assertLessEqual(set(entry['rules']), {'user-data', 'link', 'nested-archive', 'key-name'})
+        top = 'suyu-v1.2.3-dependency-sources/'
+        other = tar_bytes({'zstd-1/tests/golden-decompression/other.zst': b'zstd'}, dirs=())
+        result = self.scan('e.tar', self.plain_tar({top + 'facebook-zstd-b8d6101fba.tar.gz': other}), 'dependency-sources')
+        self.assertEqual(self.rules_of(result), {'nested-archive'})
+
+    @staticmethod
+    def plain_tar(members):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w') as archive:
+            for name, data in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        return buffer.getvalue()
+
+    @staticmethod
+    def xz_tar(members):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w:xz') as archive:
+            for name, data in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        return buffer.getvalue()
+
     def test_large_files_are_only_partially_read(self):
         big = b'A' * (3 << 20) + KEY_TEXT  # key text beyond the scan limit of a large file is not read
         result = self.scan('big.zip', zip_bytes(windows_members(**{'plugins/big.dat': big})), 'windows')
@@ -301,7 +374,13 @@ class OtherKindTests(ScanCase):
         for entry in POLICY['approved_exceptions']:
             self.assertTrue(entry['reason'] and entry['provenance'], entry)
             self.assertNotIn('.*', entry['path_regex'])
-            self.assertFalse(set(entry['rules']) & {'key-name', 'key-text', 'firmware', 'game-container', 'signature'})
+            self.assertFalse(set(entry['rules']) & {'key-text', 'firmware', 'game-container', 'signature'})
+            # A name-only key match may be waived for one documentation file per exact
+            # path, never for key-shaped contents, and never outside the dependency sources.
+            if 'key-name' in entry['rules']:
+                self.assertEqual(entry['rules'], ['key-name'])
+                self.assertEqual(entry['kinds'], ['dependency-sources'])
+                self.assertTrue(entry['path_regex'].endswith('/doc/HOWTO/keys\.txt'), entry)
 
     def test_unreadable_archive_is_a_finding(self):
         result = self.scan('broken.zip', b'not a zip at all', 'windows')

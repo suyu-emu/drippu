@@ -26,7 +26,7 @@ import zipfile
 
 POLICY_PATH = Path(__file__).with_name('policy.json')
 KINDS = ('windows', 'linux', 'macos', 'android-apk', 'libretro-linux', 'libretro-windows',
-         'libretro-macos', 'libretro-android', 'source')
+         'libretro-macos', 'libretro-android', 'source', 'dependency-sources')
 HEAD_BYTES = 16384 + 8
 WHOLE_FILE_LIMIT = 1 << 20
 NESTED_MAX_BYTES = 256 << 20
@@ -34,7 +34,7 @@ NESTED_MAX_DEPTH = 2
 MANIFEST_MAX_BYTES = 8 << 20
 SPOOL_BYTES = 32 << 20
 ZIP_EXTENSIONS = ('.zip', '.apk', '.jar')
-TAR_EXTENSIONS = ('.tar.gz', '.tgz', '.tar')
+TAR_EXTENSIONS = ('.tar.gz', '.tgz', '.tar.xz', '.txz', '.tar')
 OPAQUE_EXTENSIONS = ('.7z', '.rar', '.xz', '.zst', '.cab', '.msi', '.lz4', '.bz2', '.gz', '.iso')
 KIT_PREFIX = 'export-build-kit/'
 SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
@@ -276,7 +276,7 @@ class Scanner:
 
     # ---- layout ----------------------------------------------------------
     def check_layout(self, path, label):
-        if self.kind == 'source':
+        if self.kind in ('source', 'dependency-sources'):
             top_dir = path.split('/')[0]
             if self.source_top is None:
                 self.source_top = top_dir

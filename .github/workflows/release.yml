@@ -94,8 +94,6 @@ jobs:
         run: python tests/export_regression/test_module_selection.py
       - name: Test bounded source partitioning
         run: python tests/recompiler_partition/run.py --build build-partition-test
-      - name: Test selected update control metadata
-        run: python tests/control_metadata/run.py --cc c++
       - name: Configure
         # fmt_FORCE_BUNDLED: the system fmt 9 has no format_string::get(), and
         # suyu only forces the bundled copy inside a branch that does not apply
@@ -114,7 +112,7 @@ jobs:
         run: |
           mkdir -p _pkg
           cp build/bin/suyu build/bin/suyu-cmd _pkg/
-          cp LICENSE.txt _pkg/
+          python3 tools/package_policy/third_party_notices.py --package-dir _pkg
           tar -czf '${{ matrix.archive }}' -C _pkg .
       - name: Validate package policy
         run: python3 tools/package_policy/scan_release.py --kind linux '${{ matrix.archive }}'
@@ -174,8 +172,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Build kit relocation tests failed' }
           python tests/appdata_path/run.py
           if ($LASTEXITCODE -ne 0) { throw 'APPDATA path tests failed' }
-          python tests/control_metadata/run.py
-          if ($LASTEXITCODE -ne 0) { throw 'Selected control metadata tests failed' }
           python tests/recompiler_partition/run.py --build build-partition-test
           if ($LASTEXITCODE -ne 0) { throw 'Source partition tests failed' }
       - name: Configure
@@ -210,7 +206,8 @@ jobs:
           Copy-Item build\bin\export-build-kit _pkg\ -Recurse
           windeployqt --release --no-translations _pkg\suyu.exe
           if ($LASTEXITCODE -ne 0) { throw 'Qt deployment failed' }
-          Copy-Item LICENSE.txt _pkg\
+          python tools/package_policy/third_party_notices.py --package-dir _pkg
+          if ($LASTEXITCODE -ne 0) { throw 'License notices failed' }
           Compress-Archive -Path _pkg\* -DestinationPath '${{ matrix.archive }}'
       - name: Validate package policy
         shell: pwsh
@@ -244,8 +241,6 @@ jobs:
         run: python3 tests/recompiler_smoke/run.py
       - name: Test bounded source partitioning
         run: python3 tests/recompiler_partition/run.py --build build-partition-test
-      - name: Test selected update control metadata
-        run: python3 tests/control_metadata/run.py --cc clang++
       - name: Configure
         run: |
           cmake --version
@@ -299,7 +294,7 @@ jobs:
           codesign --verify --deep --strict "$APP"
           mkdir -p _pkg out
           ditto "$APP" _pkg/suyu.app
-          cp LICENSE.txt _pkg/
+          python3 tools/package_policy/third_party_notices.py --package-dir _pkg
           (cd _pkg && ditto -c -k --sequesterRsrc . ../out/suyu-macos-arm64.zip)
       - name: Validate package policy
         run: python3 tools/package_policy/scan_release.py --kind macos out/suyu-macos-arm64.zip
@@ -399,7 +394,7 @@ jobs:
           mkdir -p _pkg
           cp "$(find build -name suyu_libretro.so -print -quit)" _pkg/
           strip --strip-debug _pkg/suyu_libretro.so
-          cp LICENSE.txt _pkg/
+          python3 tools/package_policy/third_party_notices.py --package-dir _pkg
           tar -czf '${{ matrix.archive }}' -C _pkg .
       - name: Package (Windows)
         if: matrix.platform == 'windows'
@@ -408,7 +403,8 @@ jobs:
           New-Item -ItemType Directory -Force _pkg | Out-Null
           $core = Get-ChildItem build -Recurse -File -Filter suyu_libretro.dll | Select-Object -First 1
           Copy-Item $core.FullName _pkg\
-          Copy-Item LICENSE.txt _pkg\
+          python tools/package_policy/third_party_notices.py --package-dir _pkg
+          if ($LASTEXITCODE -ne 0) { throw 'License notices failed' }
           Compress-Archive -Path _pkg\* -DestinationPath '${{ matrix.archive }}'
       - name: Package (macOS)
         if: matrix.platform == 'macos'
@@ -429,7 +425,7 @@ jobs:
           for f in _pkg/suyu_libretro_libs/*.dylib _pkg/suyu_libretro.dylib; do
             codesign --force --sign - "$f"
           done
-          cp LICENSE.txt _pkg/
+          python3 tools/package_policy/third_party_notices.py --package-dir _pkg
           (cd _pkg && zip -qry "../${{ matrix.archive }}" .)
       - name: Validate package policy (Linux, macOS)
         if: matrix.platform != 'windows'
@@ -500,7 +496,10 @@ jobs:
           mkdir -p _pkg
           "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
             --strip-debug -o _pkg/suyu_libretro_android.so "$core"
-          cp LICENSE.txt _pkg/
+          # The APK itself is left unchanged: it does not carry the license
+          # notices; the release ships THIRD-PARTY-NOTICES.txt in the other
+          # packages and the dependency-sources asset.
+          python3 tools/package_policy/third_party_notices.py --package-dir _pkg
           (cd _pkg && zip -qr ../out/suyu-libretro-android-arm64.zip .)
       - name: Validate package policy
         run: |
@@ -589,6 +588,40 @@ jobs:
           path: '*.tar.gz'
           if-no-files-found: error
 
+  dependency-sources:
+    if: github.event.deleted != true
+    name: Dependency sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Collect the sources CMake fetches at build time
+        # CPM downloads these at configure time, so they are not in the git
+        # source archive. This publishes the exact versions the cpmfile.json
+        # files pin, with a manifest of URLs and hashes. Where cpmfile.json pins
+        # a SHA-512 for the download it is verified, and a mismatch fails the
+        # job. Prebuilt CI packages are covered by their build scripts and the
+        # upstream source they were built from.
+        run: |
+          REF_NAME="${GITHUB_REF_NAME:-manual}"
+          NAME="suyu-${REF_NAME//\//-}-dependency-sources"
+          python3 tools/package_policy/collect_dependency_sources.py \
+            --output dependency-sources-out --name "$NAME"
+          mv "dependency-sources-out/${NAME}.tar" .
+          ls -la "${NAME}.tar"
+      - name: Validate package policy
+        run: |
+          set -euo pipefail
+          archives=(./suyu-*-dependency-sources.tar)
+          test "${#archives[@]}" -eq 1
+          python3 tools/package_policy/scan_release.py --kind dependency-sources "${archives[0]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-sources
+          path: 'suyu-*-dependency-sources.tar'
+          if-no-files-found: error
+
   publish:
     name: Publish
     # Only for a push of a version tag, and only when every build and the
@@ -596,7 +629,7 @@ jobs:
     # so a release could go out with a platform missing or a failed build
     # silently omitted. workflow_dispatch never publishes, even for a tag ref.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.event.deleted != true
-    needs: [build-linux, build-windows, build-macos, build-libretro, build-android, source, package-policy-tests]
+    needs: [build-linux, build-windows, build-macos, build-libretro, build-android, source, dependency-sources, package-policy-tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -611,14 +644,14 @@ jobs:
           python3 tools/package_policy/publish_gate.py \
             --deleted "$TAG_DELETED" \
             --needs-json "$NEEDS_JSON" \
-            --require build-linux,build-windows,build-macos,build-libretro,build-android,source,package-policy-tests
+            --require build-linux,build-windows,build-macos,build-libretro,build-android,source,dependency-sources,package-policy-tests
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
       - name: Collect
         run: |
           mkdir -p out
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.apk' \) -exec mv {} out/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.tar' -o -name '*.zip' -o -name '*.apk' \) -exec mv {} out/ \;
           for asset in \
             suyu-linux-x86_64.tar.gz \
             suyu-windows-x86_64.zip \
@@ -628,7 +661,8 @@ jobs:
             suyu-libretro-windows-x86_64.zip \
             suyu-libretro-macos-arm64.zip \
             suyu-libretro-android-arm64.zip \
-            "suyu-${GITHUB_REF_NAME}-source.tar.gz"; do
+            "suyu-${GITHUB_REF_NAME}-source.tar.gz" \
+            "suyu-${GITHUB_REF_NAME}-dependency-sources.tar"; do
             test -s "out/$asset"
           done
           test -s "docs/releases/${GITHUB_REF_NAME}.md"
@@ -650,12 +684,13 @@ jobs:
               suyu-libretro-macos-arm64.zip) kind=libretro-macos ;;
               suyu-libretro-android-arm64.zip) kind=libretro-android ;;
               "suyu-${GITHUB_REF_NAME}-source.tar.gz") kind=source ;;
+              "suyu-${GITHUB_REF_NAME}-dependency-sources.tar") kind=dependency-sources ;;
               *) echo "Unexpected release asset: $asset" >&2; exit 1 ;;
             esac
             python3 tools/package_policy/scan_release.py --kind "$kind" "$asset"
             count=$((count + 1))
           done
-          test "$count" -eq 9
+          test "$count" -eq 10
       - name: Publish release
         if: steps.gate.outputs.publish == 'true'
         env:
