@@ -56,12 +56,15 @@ struct Value {
     bool boolean = false;
     std::string text; // string contents, or the number's literal
     std::vector<Value> array;
-    std::vector<std::pair<std::string, Value>> object;
+    // Keys and values side by side: a std::pair holding Value cannot be formed while
+    // Value is still incomplete, which clang with libstdc++ rejects.
+    std::vector<std::string> keys;
+    std::vector<Value> values;
 
     const Value* Get(std::string_view key) const {
-        for (const auto& [k, v] : object) {
-            if (k == key) {
-                return &v;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == key) {
+                return &values[i];
             }
         }
         return nullptr;
@@ -204,7 +207,8 @@ private:
                 if (!Parse(item, depth + 1)) {
                     return false;
                 }
-                v.object.emplace_back(std::move(key), std::move(item));
+                v.keys.push_back(std::move(key));
+                v.values.push_back(std::move(item));
                 Skip();
                 if (pos < s.size() && s[pos] == ',') {
                     ++pos;
@@ -689,7 +693,7 @@ bool IsCanonicalBuildId(std::string_view id) {
 bool KeysAre(const Value& object, std::initializer_list<std::string_view> allowed,
              std::string& error, std::string_view where) {
     std::vector<std::string_view> seen;
-    for (const auto& [key, value] : object.object) {
+    for (const std::string& key : object.keys) {
         if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
             error = "unsupported field '" + SanitizeName(key) + "' in " + std::string{where};
             return false;
