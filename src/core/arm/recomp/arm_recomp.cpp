@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/logging/log.h"
+#include "common/page_table.h"
 #include "common/string_util.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
@@ -107,6 +108,19 @@ struct RecompHostMem {
     u64 page_bits;
     u64 pointer_mask;
     u64 address_space_max;
+    // Page attribute tag layout and values, read out of Common::PageType rather
+    // than restated, so the generated C side cannot drift from this one. That
+    // matters more than it looks: the inline fast path only fires on an exact
+    // page_type_memory match, so a stale tag would inline stores to pages the
+    // rasterizer has cached, which is a silent GPU read of stale memory.
+    u64 page_type_mask;
+    u64 page_type_memory;
+    u64 page_type_debug;
+    u64 page_type_rasterizer_cached;
+    // Guest-memory access counters (see RecompGuestMemCounter in the emitter).
+    // Bumped with relaxed atomics from guest threads, so these are atomic here
+    // too and are read only when the metrics snapshot is taken.
+    std::atomic<u64>* counters;
 };
 
 // This struct is duplicated by hand in the emitter (arm64_to_c.h, RuntimeH's
@@ -126,7 +140,12 @@ static_assert(offsetof(RecompHostMem, page_entry_stride) == 80);
 static_assert(offsetof(RecompHostMem, page_bits) == 88);
 static_assert(offsetof(RecompHostMem, pointer_mask) == 96);
 static_assert(offsetof(RecompHostMem, address_space_max) == 104);
-static_assert(sizeof(RecompHostMem) == 112);
+static_assert(offsetof(RecompHostMem, page_type_mask) == 112);
+static_assert(offsetof(RecompHostMem, page_type_memory) == 120);
+static_assert(offsetof(RecompHostMem, page_type_debug) == 128);
+static_assert(offsetof(RecompHostMem, page_type_rasterizer_cached) == 136);
+static_assert(offsetof(RecompHostMem, counters) == 144);
+static_assert(sizeof(RecompHostMem) == 152);
 
 // Nothing links these two builds together, so the shared layout is pinned on
 // both sides: the generated runtime asserts the same four offsets against its
@@ -386,6 +405,56 @@ struct RecompCounters {
 
 RecompCounters g_counters;
 RecompCounters g_lifetime;
+
+/// Guest memory accesses resolved by the generated code's page-table fast path,
+/// in GuestMemCounter order.
+///
+/// Recorded because the ROADMAP's GPU track needs the split before anything is
+/// lifted. GuestMemCounter::GpuTracked is traffic already forced out to the
+/// emulator for rasterizer invalidation, and so is the traffic a GPU-side fast
+/// path would have to reproduce to be worth building.
+///
+/// One contiguous run rather than four named members, because the generated C
+/// reaches them through a bare `uint64_t*`. A struct gives no guarantee its
+/// members are adjacent, so handing one over would interleave the C side's
+/// writes with padding.
+struct GuestMemCounters {
+    std::atomic<u64> slots[suyu::recomp::kRecompGuestMemCounterCount]{
+        std::atomic<u64>{0}, std::atomic<u64>{0}, std::atomic<u64>{0}, std::atomic<u64>{0}};
+
+    static_assert(sizeof(slots) / sizeof(slots[0]) ==
+                  static_cast<std::size_t>(suyu::recomp::kRecompGuestMemCounterCount));
+    static_assert(std::atomic<u64>::is_always_lock_free,
+                  "guest-memory counters are bumped without a lock from guest threads");
+
+    std::atomic<u64>* data() { return slots; }
+
+    void AddAtomicsFrom(const GuestMemCounters& src) {
+        for (std::size_t i = 0; i < kRecompGuestMemCounterCount; ++i) {
+            slots[i].fetch_add(src.slots[i].load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        }
+    }
+    void ZeroAtomics() {
+        for (auto& s : slots) {
+            s.store(0, std::memory_order_relaxed);
+        }
+    }
+    u64 Sum(const GuestMemCounters& other, std::size_t i) const {
+        return other.slots[i].load(std::memory_order_relaxed) +
+               slots[i].load(std::memory_order_relaxed);
+    }
+};
+
+constexpr std::size_t kGuestMemHits =
+    static_cast<std::size_t>(suyu::recomp::GuestMemCounter::FastPathHits);
+constexpr std::size_t kGuestMemGpuTracked =
+    static_cast<std::size_t>(suyu::recomp::GuestMemCounter::GpuTracked);
+constexpr std::size_t kGuestMemDebug = static_cast<std::size_t>(suyu::recomp::GuestMemCounter::Debug);
+constexpr std::size_t kGuestMemOther = static_cast<std::size_t>(suyu::recomp::GuestMemCounter::Other);
+
+GuestMemCounters g_guest_mem;
+GuestMemCounters g_guest_mem_lifetime;
 std::atomic<bool> g_coverage_reported{false};
 // A hot title can execute tens of millions of blocks per second. Formatting
 // both coverage reports at every 256K boundary spent substantial time doing
@@ -395,6 +464,7 @@ std::atomic<std::chrono::steady_clock::rep> g_last_coverage_snapshot_tick{0};
 
 void FoldCurrentIntoLifetime() {
     g_lifetime.AddAtomicsFrom(g_counters);
+    g_guest_mem_lifetime.AddAtomicsFrom(g_guest_mem);
     std::scoped_lock lk{g_lifetime.hist_lock, g_counters.hist_lock};
     for (const auto& [insn, count] : g_counters.unhandled_insn) {
         g_lifetime.unhandled_insn[insn] += count;
@@ -417,6 +487,7 @@ void FoldCurrentIntoLifetime() {
 void ResetCurrentCounters() {
     FoldCurrentIntoLifetime();
     g_counters.ZeroAtomics();
+    g_guest_mem.ZeroAtomics();
 }
 
 struct ScopedNs {
@@ -729,6 +800,10 @@ RecompExecutionMetrics GetRecompExecutionMetrics() {
         SumCounter(g_lifetime.permanent_aot_reject, g_counters.permanent_aot_reject);
     m.jit_halt_cache_invalidation =
         SumCounter(g_lifetime.jit_halt_cache_invalidation, g_counters.jit_halt_cache_invalidation);
+    m.guest_mem_fast_path_hits = g_guest_mem.Sum(g_guest_mem_lifetime, kGuestMemHits);
+    m.guest_mem_gpu_tracked = g_guest_mem.Sum(g_guest_mem_lifetime, kGuestMemGpuTracked);
+    m.guest_mem_debug = g_guest_mem.Sum(g_guest_mem_lifetime, kGuestMemDebug);
+    m.guest_mem_other = g_guest_mem.Sum(g_guest_mem_lifetime, kGuestMemOther);
     return m;
 }
 
@@ -800,6 +875,11 @@ std::string FormatRecompExecutionJson() {
           {"jit_halt_cache_invalidation", m.jit_halt_cache_invalidation}}},
         {"svc_calls", m.svc_calls},
         {"unresolved_import_traps", m.unresolved_import_traps},
+        {"guest_memory",
+         {{"fast_path_hits", m.guest_mem_fast_path_hits},
+          {"gpu_tracked", m.guest_mem_gpu_tracked},
+          {"debug", m.guest_mem_debug},
+          {"other", m.guest_mem_other}}},
         {"unhandled_opcodes", JsonTopU32(unhandled, "insn", 64)},
         {"svc_numbers", {{"top", svc_arr}, {"distinct", svcs.size()}}},
         {"miss_pcs", {{"top", miss_arr}, {"distinct", misses.size()}}},
@@ -860,6 +940,7 @@ struct ArmRecomp::Impl {
         // Filled in by RefreshPageTable once a process exists; until then the
         // fields stay null and every access takes the callback path.
         bridge.page_entries = nullptr;
+        bridge.counters = g_guest_mem.data();
         ctx.host_mem = &bridge;
     }
 
@@ -957,6 +1038,16 @@ struct ArmRecomp::Impl {
         bridge.page_bits = view.page_bits;
         bridge.pointer_mask = view.pointer_mask;
         bridge.address_space_max = view.address_space_max;
+        // Derived from PageInfo itself rather than written as literals, for the
+        // reason given on the struct: the C fast path gates on an exact
+        // page_type_memory match, so a tag that drifted from the enum would
+        // stop invalidating rasterizer-cached pages.
+        bridge.page_type_mask =
+            static_cast<u64>((uintptr_t{1} << Common::PageTable::ATTRIBUTE_BITS) - 1);
+        bridge.page_type_memory = static_cast<u64>(Common::PageType::Memory);
+        bridge.page_type_debug = static_cast<u64>(Common::PageType::DebugMemory);
+        bridge.page_type_rasterizer_cached =
+            static_cast<u64>(Common::PageType::RasterizerCachedMemory);
     }
 
     /// The same source DynarmicCallbacks64::GetCNTPCT uses, so a guest thread

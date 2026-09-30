@@ -11,11 +11,43 @@
 
 namespace suyu::recomp {
 
-inline constexpr uint32_t kRecompImageAbiVersion = 1;
+// v2 appended the page-type tags and the guest-memory counter array to
+// RecompHostMem, which generated code reads by offset. An image built against
+// v1 has a shorter struct, so loading one into a v2 emulator would let the fast
+// path read page_type_mask from whatever follows its own struct. Bumping the
+// version makes CheckImage reject it instead; the cost is that v1 exports have
+// to be re-emitted, which is the intended behaviour for a layout change.
+inline constexpr uint32_t kRecompImageAbiVersion = 2;
 inline constexpr uint32_t kRecompRegsPrefixSize = 872;
 inline constexpr uint32_t kRecompMaxModules = 16;
 inline constexpr uint32_t kRecompBuildIdSize = 32;
 inline constexpr uint32_t kRecompModuleNameSize = 32;
+
+/// Guest memory accesses that the recompiler's generated code resolved through
+/// its page-table fast path, split by why they did or did not stay inline.
+///
+/// The generated runtime carries its own copy of this enumeration as plain C
+/// (RecompGuestMemCounter, in core/recompiler/arm64_to_c.h) because it shares
+/// no headers with the emulator. Both sides therefore pin the count against 4
+/// with a compile-time check: adding a slot on one side only then fails to build
+/// rather than writing past the other's array.
+///
+/// GuestMemGpuTracked is the one the GPU track cares about. Those are accesses
+/// to a page the rasterizer has cached, which the generated fast path must not
+/// serve inline - doing so skips the invalidation the emulator's own fast path
+/// performs and leaves the GPU reading stale memory.
+enum class GuestMemCounter : uint32_t {
+    FastPathHits = 0, ///< served inline from a plain mapped page
+    GpuTracked,       ///< rasterizer-cached page, fell out to the callback
+    Debug,            ///< debugger-attached page, fell out to the callback
+    Other,            ///< unmapped, unresolvable, or spanning pages
+    Count
+};
+
+inline constexpr uint32_t kRecompGuestMemCounterCount =
+    static_cast<uint32_t>(GuestMemCounter::Count);
+static_assert(kRecompGuestMemCounterCount == 4,
+              "the generated C copy of RecompGuestMemCounter pins 4 as well");
 
 inline constexpr const char* kRecompLoadOrder[] = {
     "rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3",
