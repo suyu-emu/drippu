@@ -84,10 +84,10 @@ VirtualDir BISFactory::OpenPartition(BisPartitionId id) const {
 
 VirtualFile BISFactory::OpenPartitionStorage(BisPartitionId id,
                                              VirtualFilesystem file_system) const {
-    auto& keys = Core::Crypto::KeyManager::Instance();
+    // Reads the partitions with the BIS keys the user installed. Nothing here derives
+    // keys from the console data (BOOT0, fuses, package2); keys come only from key files.
     Core::Crypto::PartitionDataManager pdm{file_system->OpenDirectory(
         Common::FS::GetSuyuPathString(Common::FS::SuyuPath::NANDDir), OpenMode::Read)};
-    keys.PopulateFromPartitionData(pdm);
 
     switch (id) {
     case BisPartitionId::CalibrationBinary:

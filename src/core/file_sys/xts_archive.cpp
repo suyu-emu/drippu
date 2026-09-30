@@ -98,7 +98,7 @@ Loader::ResultStatus NAX::Parse(std::string_view path) {
         return Loader::ResultStatus::ErrorIncorrectNAXFileSize;
     }
 
-    keys.DeriveSDSeedLazy();
+    // sd_seed must come from the user's key files; it is not extracted from NAND saves.
     std::array<Core::Crypto::Key256, 2> sd_keys{};
     const auto sd_keys_res = Core::Crypto::DeriveSDKeys(sd_keys, keys);
     if (sd_keys_res != Loader::ResultStatus::Success) {
