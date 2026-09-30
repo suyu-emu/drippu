@@ -548,15 +548,8 @@ jobs:
           tar --append --file="${NAME}.tar" -C "$meta" --transform "s,^,${NAME}/," \
             $(cd "$meta" && ls)
           rm -rf "$meta"
-          # externals/nx-optimizer is not part of any build (nothing in the
-          # CMake or Gradle files references it), so it is not corresponding
-          # source for these binaries. Its tree carries prebuilt game mod
-          # executables (NSO/NPDM), which the project does not distribute.
-          # Whether the submodule stays in the repository is an owner decision.
-          excluded_submodules=' externals/nx-optimizer '
           while IFS= read -r path; do
             test -n "$path" || continue
-            case "$excluded_submodules" in *" $path "*) continue ;; esac
             subarchive="$(mktemp --suffix=.tar)"
             git -C "$path" archive --format=tar --prefix="${NAME}/${path}/" HEAD \
               > "$subarchive"
