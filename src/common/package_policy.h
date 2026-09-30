@@ -11,7 +11,7 @@
 //    tools/package_policy/policy.json (tests/package_policy/test_policy_sync.py
 //    keeps the tables below and that file in step).
 //  - LOCAL_GAME_EXPORT: a package the exporter builds on the user's machine from
-//    a game the user selected. It holds extracted and translated game material,
+//    a game the user selected. It holds translated code and reads the game file,
 //    so it is never an official artifact, but it must never hold keys, firmware
 //    or files nobody selected. Checked here.
 //  - SHARED_COVERAGE: see core/arm/recomp/recomp_gaps.h.

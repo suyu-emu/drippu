@@ -524,10 +524,10 @@ void GameExportDialog::SetupUi() {
     layout->addWidget(include_custom_config_checkbox);
 
     auto* content_label = new QLabel(
-        tr("A local export contains game material extracted from the selected file, and AOT "
-           "exports (Source too) contain code translated from it. Keys and system firmware are "
-           "never copied. Do not upload exports or their logs to suyu's release or support "
-           "channels."),
+        tr("An export does not contain the game. Each launch reads the game file you selected "
+           "and decrypts it with your own installed keys; AOT exports (Source too) contain code "
+           "translated from it. Keys and system firmware are never copied. Do not upload "
+           "exports or their logs to suyu's release or support channels."),
         this);
     content_label->setWordWrap(true);
     layout->addWidget(content_label);
@@ -666,7 +666,7 @@ void GameExportDialog::SetupUi() {
                    "export."));
         } else {
             note_label->setText(
-                tr("Packages the game with Dynarmic as a JIT baseline for direct comparison. "
+                tr("Runs the game with the Dynarmic JIT as a baseline for direct comparison. "
                    "No AOT source is generated."));
         }
     };
@@ -4648,8 +4648,8 @@ bool GameExportDialog::PackageNativeExport(const QString& rom_path, const QStrin
             << "\n";
         out << (uses_aot ? "Recompiled from file: " : "JIT baseline exported from file: ")
             << QFileInfo(rom_path).fileName() << "\n";
-        out << "This local export contains game material extracted from that file"
-            << (uses_aot ? ", and code translated from it" : "") << ".\n"
+        out << "This local export does not contain that file; it reads it at launch"
+            << (uses_aot ? " and contains code translated from it" : "") << ".\n"
             << "It is not an official suyu release and is not cleared for redistribution.\n";
         ref.close();
     };
@@ -5400,7 +5400,7 @@ static bool WriteExportManifest(const QString& package_root, const QString& expo
         {QStringLiteral("suyu_build"), QString::fromUtf8(Common::g_build_fullname)},
     };
     manifest[QStringLiteral("notice")] = QStringLiteral(
-        "Local export of game material from a user-selected file. Not an official suyu "
+        "Local export that runs a user-selected game file. Not an official suyu "
         "release and not cleared for redistribution. Package-policy validation describes what "
         "the package contains; it does not establish ownership or permission.");
     QSaveFile file(package_root + QLatin1Char('/') + Latin1(PackagePolicy::kExportManifestName));
