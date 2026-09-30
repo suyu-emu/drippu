@@ -2061,44 +2061,6 @@ void GMainWindow::AllowOSSleep() {
 
 bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletParameters params,
                           u64 title_id, bool allow_auto_recomp, bool require_auto_recomp) {
-    if (Loader::AppLoader_NRO::IdentifyType(
-            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
-        if (!CheckFirmwarePresence()) {
-            const auto response = QMessageBox::question(
-                this, tr("Firmware Not Found"),
-                tr("Nintendo Switch firmware was not detected for this launch.\n\n"
-                   "If you already installed firmware, this may be a detection mismatch.\n"
-                   "Choose Continue to attempt launch anyway, or Cancel to stop."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
-                return false;
-            }
-        }
-
-        if (!ContentManager::AreKeysPresent()) {
-            QMessageBox box(QMessageBox::Warning, tr("Decryption Keys Missing"),
-                            tr("suyu has no decryption keys installed.\n\n"
-                               "Games need the keys dumped from your own Switch. suyu does not "
-                               "provide, generate or download them.\n\n"
-                               "Install your keys now? Choose Continue only for content that "
-                               "needs no keys, such as homebrew."),
-                            QMessageBox::NoButton, this);
-            QPushButton* install =
-                box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
-            QPushButton* proceed = box.addButton(tr("Continue"), QMessageBox::DestructiveRole);
-            box.addButton(QMessageBox::Cancel);
-            box.setDefaultButton(install);
-            box.exec();
-            if (box.clickedButton() == install) {
-                QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
-                return false;
-            }
-            if (box.clickedButton() != proceed) {
-                return false;
-            }
-        }
-    }
-
     // Shutdown previous session if the emu thread is still active...
     if (emu_thread != nullptr) {
         ShutdownGame();
@@ -2356,6 +2318,45 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
                            StartGameType type, bool require_auto_recomp,
                            InputCommon::TasInput::TasBootMode tas_boot_mode) try {
     LOG_INFO(Frontend, "suyu starting...");
+
+    // Check for keys and firmware before the loader opens the file, so a
+    // missing key is reported to the player before any decryption is attempted.
+    if (Loader::AppLoader_NRO::IdentifyType(
+            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
+        if (!ContentManager::AreKeysPresent()) {
+            QMessageBox box(QMessageBox::Warning, tr("Decryption Keys Missing"),
+                            tr("suyu has no decryption keys installed.\n\n"
+                               "Games need the keys dumped from your own Switch. suyu does not "
+                               "provide, generate or download them.\n\n"
+                               "Install your keys now? Choose Continue only for content that "
+                               "needs no keys, such as homebrew."),
+                            QMessageBox::NoButton, this);
+            QPushButton* install =
+                box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
+            QPushButton* proceed = box.addButton(tr("Continue"), QMessageBox::DestructiveRole);
+            box.addButton(QMessageBox::Cancel);
+            box.setDefaultButton(install);
+            box.exec();
+            if (box.clickedButton() == install) {
+                QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
+                return;
+            }
+            if (box.clickedButton() != proceed) {
+                return;
+            }
+        }
+        if (!CheckFirmwarePresence()) {
+            const auto response = QMessageBox::question(
+                this, tr("Firmware Not Found"),
+                tr("Nintendo Switch firmware was not detected for this launch.\n\n"
+                   "If you already installed firmware, this may be a detection mismatch.\n"
+                   "Choose Continue to attempt launch anyway, or Cancel to stop."),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (response != QMessageBox::Yes) {
+                return;
+            }
+        }
+    }
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
