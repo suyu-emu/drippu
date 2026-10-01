@@ -11,7 +11,8 @@
     "^(prod|title|console|dev)[._-]?keys(\\.(txt|ini|bak|old|dat))?$",
     "^.*\\.keys$",
     "^keys\\.(txt|ini|dat)$",
-    "^(fuses?|tsec(_keys?)?|secure_boot|sbk)\\.(bin|txt|keys)$"
+    "^(fuses?|tsec(_keys?)?|secure_boot|sbk)\\.(bin|txt|keys)$",
+    "^.*\\.tik$"
   ],
   "firmware_nand_name_patterns": [
     "^boot[01](\\.bin)?$",
@@ -25,7 +26,8 @@
   "firmware_nand_path_patterns": [
     "(^|/)system/contents/registered(/|$)",
     "(^|/)nand/system(/|$)",
-    "(^|/)system/save/80000000000000(43|e1|e2|51|52|53)(/|$)"
+    "(^|/)system/save/80000000000000(43|e1|e2|51|52|53)(/|$)",
+    "(^|/)system/tickets(/|$)"
   ],
   "game_container_extensions": [
     ".nsp",

@@ -43,6 +43,8 @@ constexpr std::array kKeyFileNamePatterns{
     R"(^.*\.keys$)",
     R"(^keys\.(txt|ini|dat)$)",
     R"(^(fuses?|tsec(_keys?)?|secure_boot|sbk)\.(bin|txt|keys)$)",
+    // Tickets carry title keys (encrypted, but still key material).
+    R"(^.*\.tik$)",
 };
 
 constexpr std::array kFirmwareNandNamePatterns{
@@ -59,6 +61,8 @@ constexpr std::array kFirmwareNandPathPatterns{
     R"((^|/)system/contents/registered(/|$))",
     R"((^|/)nand/system(/|$))",
     R"((^|/)system/save/80000000000000(43|e1|e2|51|52|53)(/|$))",
+    // The ticket store suyu keeps for installed NSP content (Core::Crypto::TicketStoreDir).
+    R"((^|/)system/tickets(/|$))",
 };
 
 constexpr std::array kGameContainerExtensions{".nsp", ".xci", ".nsz", ".xcz", ".nca",
