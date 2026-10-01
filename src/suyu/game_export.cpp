@@ -199,6 +199,11 @@ static constexpr const char* kExportRuntimeDlls[] = {
     "libcrypto.dll",       "libssl.dll",
 };
 
+// Export Format combo item data. These keep their meaning (and the automation's
+// format_index) whatever the combo's display order.
+static constexpr int kFormatSource = 0;
+static constexpr int kFormatBuild = 1;
+
 // What every local export says about itself, in its README and the exporter's warning.
 static constexpr char kExportContentNotice[] =
     "This is a local game export, made on this computer from a game file you selected.\n"
@@ -549,21 +554,24 @@ void GameExportDialog::SetupUi() {
     // Ultimate's main module alone is ~3 GB across 139 translation units - and
     // compiling that is hours of C-compiler work. Other targets can only produce
     // Source. Build compiles all the way to a binary and fails loudly if it
-    // cannot, instead of silently degrading.
+    // cannot, instead of silently degrading. Source is listed second and named as a
+    // developer option: picked first, it left users with a folder of C and nothing to run.
     auto* format_row = new QHBoxLayout();
     format_row->addWidget(new QLabel(tr("Export Format:"), this));
     output_format_combo = new QComboBox(this);
     output_format_combo->addItem(
-        tr("Source — generate C project only (fast, compile it yourself)"));
+        tr("Build — compile to a standalone executable (slow, needs CMake + a C compiler)"),
+        kFormatBuild);
     output_format_combo->addItem(
-        tr("Build — compile to a standalone executable (slow, needs CMake + a C compiler)"));
+        tr("Source (developers) — C project only, not playable (compile it yourself)"),
+        kFormatSource);
     output_format_combo->setToolTip(
         tr("Source writes the recompiled C plus a CMakeLists.txt and a build script, and stops "
            "there. Build additionally runs CMake to completion, producing the standalone "
            "'recompiled' executable and the shared library suyu loads to run the game on its own "
            "recompiler. Build can take hours on large titles; the window stays responsive while "
            "it works."));
-    output_format_combo->setCurrentIndex(1);
+    output_format_combo->setCurrentIndex(output_format_combo->findData(kFormatBuild));
     format_row->addWidget(output_format_combo, 1);
     layout->addLayout(format_row);
 
@@ -686,7 +694,7 @@ void GameExportDialog::SetupUi() {
         // report success as though a standalone program had been made.
         output_format_combo->setEnabled(uses_aot && is_windows);
         if (!is_windows) {
-            output_format_combo->setCurrentIndex(0);
+            output_format_combo->setCurrentIndex(output_format_combo->findData(kFormatSource));
             output_format_combo->setToolTip(
                 tr("Build is available for Windows exports only. Linux and macOS exports "
                    "currently contain source artifacts and no bundled runtime."));
@@ -736,7 +744,7 @@ void GameExportDialog::SetupUi() {
             update_options);
     connect(platform_combo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
         if (platform_combo->currentData().toInt() == static_cast<int>(TargetPlatform::Windows)) {
-            output_format_combo->setCurrentIndex(1);
+            output_format_combo->setCurrentIndex(output_format_combo->findData(kFormatBuild));
         }
     });
     connect(platform_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
@@ -1149,9 +1157,12 @@ void GameExportDialog::TriggerExportForTesting(const QString& rom_path, const QS
             backend_combo->setCurrentIndex(item);
         }
     }
-    if (format_index >= 0 && output_format_combo &&
-        format_index < output_format_combo->count()) {
-        output_format_combo->setCurrentIndex(format_index);
+    // format_index likewise keeps its documented meaning (0 = Source, 1 = Build).
+    if (format_index >= 0 && output_format_combo) {
+        const int item = output_format_combo->findData(format_index);
+        if (item >= 0) {
+            output_format_combo->setCurrentIndex(item);
+        }
     }
     SetRomPath(rom_path);
     test_app_version = app_version;
@@ -3154,7 +3165,7 @@ void GameExportDialog::ReportStage(ExportStage stage, double fraction, const QSt
 bool GameExportDialog::WantsCompiledOutput() const {
     return output_format_combo && platform_combo &&
            platform_combo->currentData().toInt() == static_cast<int>(TargetPlatform::Windows) &&
-           output_format_combo->currentIndex() == 1;
+           output_format_combo->currentData().toInt() == kFormatBuild;
 }
 
 // ---------------------------------------------------------------------------

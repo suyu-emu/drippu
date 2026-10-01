@@ -98,12 +98,13 @@ run a game.
   package's `README_NATIVE_EXPORT.txt` say which compiler it used. To choose a
   particular `clang-cl.exe`, set `SUYU_CLANG_CL` to its path; to use Microsoft's
   compiler anyway, set `SUYU_RECOMP_COMPILER=msvc`.
-- **Source** writes the generated C project, its `CMakeLists.txt` and a build script,
-  and stops there. It does not include a compiled program. This is the only format for
-  Linux and macOS. The generated C is translated from the game's code, so a Source
-  export is game-derived, but it carries none of the game's own files (no modules, data
-  segments, ExeFS or RomFS). It builds only libraries that suyu loads alongside your game
-  file; there is no standalone program to build from it.
+- **Source (developers)** writes the generated C project, its `CMakeLists.txt` and a
+  build script, and stops there. It does not include a compiled program, so the result
+  is not playable; it is for compiling elsewhere or inspecting the generated code. This
+  is the only format for Linux and macOS. The generated C is translated from the game's
+  code, so a Source export is game-derived, but it carries none of the game's own files
+  (no modules, data segments, ExeFS or RomFS). It builds only libraries that suyu loads
+  alongside your game file; there is no standalone program to build from it.
 
 While exporting, the progress bar follows the real work. The status line shows what
 is happening, for example "Compiling 312/940 files (main)". During some setup steps
