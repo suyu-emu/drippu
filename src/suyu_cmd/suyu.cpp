@@ -1821,7 +1821,7 @@ int main(int argc, char** argv) {
                             "in suyu (Tools > Install Decryption Keys), then start the game "
                             "again. Copying prod.keys into that folder works just as well.",
                             Common::FS::PathToUTF8String(keys_dir)),
-                keys_dir, false, suyu_exe, "-install-keys", "Install keys in suyu");
+                keys_dir, false, suyu_exe, "-install-keys", "Install keys");
             return 2;
         }
         // Same rule as the filesystem fallback: this package's own NAND wins,
@@ -1843,7 +1843,7 @@ int main(int argc, char** argv) {
                             "that folder, then start the game again.",
                             Common::FS::PathToUTF8String(package_nand_firmware)),
                 package_nand_firmware, false, suyu_exe, "-install-firmware",
-                "Install firmware in suyu");
+                "Install firmware");
             return 2;
         }
         if (!HasEntries(export_user_root / "nand" / registered) &&
@@ -1855,7 +1855,7 @@ int main(int argc, char** argv) {
                 "continue anyway, but Mii screens and some menus may fail.",
                 Common::FS::PathToUTF8String(firmware_dir));
             if (!ReportExportProblem("Missing firmware", message, firmware_dir, true, suyu_exe,
-                                     "-install-firmware", "Install firmware in suyu")) {
+                                     "-install-firmware", "Install firmware")) {
                 return 2;
             }
         }
@@ -2116,6 +2116,9 @@ int main(int argc, char** argv) {
             // here; an export names the keys folder instead of carrying on.
             using Loader::ResultStatus;
             switch (static_cast<ResultStatus>(error_id)) {
+            // A wrong header key decrypts the NCA header to garbage, which the
+            // loader reports as a bad header rather than as a key error.
+            case ResultStatus::ErrorBadNCAHeader:
             case ResultStatus::ErrorMissingProductionKeyFile:
             case ResultStatus::ErrorMissingHeaderKey:
             case ResultStatus::ErrorIncorrectHeaderKey:
@@ -2135,7 +2138,7 @@ int main(int argc, char** argv) {
                                     "title.keys into that folder works just as well.",
                                     Common::FS::PathToUTF8String(keys_dir),
                                     static_cast<ResultStatus>(error_id)),
-                        keys_dir, false, suyu_exe, "-install-keys", "Install keys in suyu");
+                        keys_dir, false, suyu_exe, "-install-keys", "Install keys");
                     return 2;
                 }
                 break;
