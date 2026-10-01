@@ -287,6 +287,14 @@ public:
 
     bool AddTicket(const Ticket& ticket);
 
+    /// Adds the tickets kept in a NAND's ticket store (see TicketStoreDir) to the ones in
+    /// memory, so content installed from NSPs in earlier sessions can be decrypted. Each
+    /// directory is read once per process. Returns how many tickets were added.
+    std::size_t LoadInstalledTickets(const std::filesystem::path& nand_dir);
+    /// Tickets added by LoadInstalledTickets, and how many of them gave a title key.
+    std::size_t GetInstalledTicketCount() const;
+    std::size_t GetInstalledTitleKeyCount() const;
+
     void ReloadKeys();
     bool AreKeysLoaded() const;
 
@@ -300,6 +308,9 @@ private:
     std::map<u128, Ticket> common_tickets;
     std::map<u128, Ticket> personal_tickets;
     bool ticket_databases_loaded = false;
+    std::vector<std::filesystem::path> loaded_ticket_stores;
+    std::size_t installed_ticket_count = 0;
+    std::size_t installed_title_key_count = 0;
 
     RSAKeyPair<2048> eticket_rsa_keypair{};
 
@@ -315,5 +326,15 @@ Key128 GenerateKeyEncryptionKey(Key128 source, Key128 master, Key128 kek_seed, K
 Loader::ResultStatus DeriveSDKeys(std::array<Key256, 2>& sd_keys, KeyManager& keys);
 
 std::vector<Ticket> GetTicketblob(const Common::FS::IOFile& ticket_save);
+
+/// Where a NAND directory keeps the tickets of content installed from NSPs:
+/// <nand>/system/tickets/<rights id>.tik.
+std::filesystem::path TicketStoreDir(const std::filesystem::path& nand_dir);
+
+/// Copies a ticket file from an NSP being installed, byte for byte, into the ticket store of
+/// `nand_dir`. Only files that parse as a ticket with a rights ID are kept; an identical copy
+/// is left alone. Returns true when the store holds the ticket afterwards.
+bool StoreInstalledTicket(const std::filesystem::path& nand_dir,
+                          const FileSys::VirtualFile& ticket_file);
 
 } // namespace Core::Crypto

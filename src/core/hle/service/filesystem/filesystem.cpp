@@ -12,6 +12,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/crypto/key_manager.h"
 #include "core/file_sys/bis_factory.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/control_metadata.h"
@@ -775,6 +776,13 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
                                        bis_factory->GetSystemNANDContents());
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::UserNAND,
                                        bis_factory->GetUserNANDContents());
+
+        // Tickets of content installed from NSPs, kept by ContentManager::InstallNSP, so
+        // that content can be decrypted again. An exported game reads them, read-only, from
+        // the installed NAND it borrows content from, never from its own package.
+        Core::Crypto::KeyManager::Instance().LoadInstalledTickets(
+            system_content_fallback.empty() ? Common::FS::GetSuyuPath(SuyuPath::NANDDir)
+                                            : system_content_fallback);
     }
 
     if (sdmc_factory == nullptr) {
