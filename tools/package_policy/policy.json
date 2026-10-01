@@ -147,7 +147,10 @@
       "assets/.+",
       "kotlin/.+",
       "[^/]+\\.properties",
-      "DebugProbesKt\\.bin"
+      "DebugProbesKt\\.bin",
+      "kotlin-tooling-metadata\\.json",
+      "okhttp3/internal/publicsuffix/(NOTICE|publicsuffixes\\.gz)",
+      "org/commonmark/internal/util/entities\\.properties"
     ],
     "libretro-linux": [
       "suyu_libretro\\.so",
@@ -302,6 +305,17 @@
       ],
       "reason": "OpenSSL's documentation page on generating keys; it matches the keys.txt name rule only. The key-text and signature rules still apply to it and found nothing.",
       "provenance": "openssl/openssl at openssl-3.6.2 and at 11b7b6ea3b (upstream of crueter-ci/OpenSSL), doc/HOWTO/keys.txt"
+    },
+    {
+      "kinds": [
+        "android-apk"
+      ],
+      "path_regex": "okhttp3/internal/publicsuffix/publicsuffixes\\.gz",
+      "rules": [
+        "nested-archive"
+      ],
+      "reason": "OkHttp's gzip-compressed Public Suffix List, read by OkHttp at runtime to validate cookie and host domains; plain text data, not a package.",
+      "provenance": "OkHttp (com.squareup.okhttp3:okhttp), bundled by the Android app's Gradle dependencies"
     }
   ],
   "exefs": {

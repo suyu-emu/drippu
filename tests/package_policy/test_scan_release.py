@@ -272,6 +272,24 @@ class OtherKindTests(ScanCase):
         self.assertClean(self.scan('suyu.apk', apk, 'android-apk'))
         bad = zip_bytes({'AndroidManifest.xml': b'x', 'lib/x86_64/libsuyu.so': b'ELF'})
         self.assertIn('unexpected', self.rules_of(self.scan('bad.apk', bad, 'android-apk')))
+
+    def test_apk_resource_names_and_bundled_library_data(self):
+        import gzip
+        base = [('AndroidManifest.xml', b'x'), ('classes.dex', b'dex')]
+        # The resource shrinker emits names that differ only in case.
+        shrunk = base + [('res/0C.xml', b'x'), ('res/0c.xml', b'y'),
+                         ('kotlin-tooling-metadata.json', b'{}'),
+                         ('okhttp3/internal/publicsuffix/NOTICE', b'x'),
+                         ('okhttp3/internal/publicsuffix/publicsuffixes.gz', gzip.compress(b'com\n')),
+                         ('org/commonmark/internal/util/entities.properties', b'x')]
+        self.assertClean(self.scan('shrunk.apk', zip_bytes(shrunk), 'android-apk'))
+        exact = base + [('res/0c.xml', b'x'), ('res/0c.xml', b'y')]
+        self.assertIn('path-unsafe', self.rules_of(self.scan('dup.apk', zip_bytes(exact), 'android-apk')))
+        # Archives that get unpacked still reject names that collide ignoring case.
+        cased = zip_bytes([('suyu.exe', b'MZ'), ('LICENSE.txt', b'x'), ('license.txt', b'y')])
+        self.assertIn('path-unsafe', self.rules_of(self.scan('cased.zip', cased, 'windows')))
+
+    def test_libretro_and_source_layouts(self):
         self.assertClean(self.scan('l.tar.gz', tar_bytes({'./suyu_libretro.so': b'ELF', './LICENSE.txt': b'x'}), 'libretro-linux'))
         self.assertClean(self.scan('w.zip', zip_bytes({'suyu_libretro.dll': b'MZ', 'LICENSE.txt': b'x'}), 'libretro-windows'))
         self.assertClean(self.scan('m.zip', zip_bytes({'suyu_libretro.dylib': b'M', 'LICENSE.txt': b'x',

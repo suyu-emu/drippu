@@ -199,7 +199,10 @@ class Scanner:
             for problem in problems:
                 self.add('path-unsafe', prefix + entry.raw, problem)
             if path:
-                key = path.lower()
+                # An APK is installed, never unpacked onto a case-insensitive file
+                # system, and Android's resource shrinker emits names that differ
+                # only in case (res/0C.xml, res/0c.xml). Only exact repeats count.
+                key = path if (top and self.kind == 'android-apk') else path.lower()
                 if key in seen and not (is_dir and seen[key]):
                     self.add('path-unsafe', label, 'duplicate member name')
                 seen[key] = is_dir and seen.get(key, True)
