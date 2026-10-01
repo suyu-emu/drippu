@@ -1737,7 +1737,10 @@ bool GameExportDialog::SealGameFiles(const std::vector<SealSource>& sources,
                         tr("Copying the game file, sealed: %1 of %2")
                             .arg(QLocale().formattedDataSize(static_cast<qint64>(done)),
                                  QLocale().formattedDataSize(static_cast<qint64>(total))));
-            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+            // User input is let through here so the Cancel button works. The
+            // progress dialog is window-modal, so the export dialog and the
+            // main window behind it still receive no clicks or keys.
+            QApplication::processEvents();
             if (progress.wasCanceled()) {
                 *cancelled = true;
                 return false;
