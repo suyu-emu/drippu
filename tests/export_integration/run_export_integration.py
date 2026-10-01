@@ -43,6 +43,10 @@ PLACEHOLDER_KEYS = ('# synthetic test placeholder; not a real key\n' +
 # to. Assembled the same way; they come from no console.
 SEED_A = '5eed' * 8
 SEED_B = 'b0b0' * 8
+# Synthetic DLC title IDs: two add-ons of the fixture game (0x0100000000E57A00) and one of
+# another made-up game. None belongs to a real title.
+DLC_TITLES = (0x0100000000E57001, 0x0100000000E57002)
+OTHER_GAME_DLC = 0x0100000000F01001
 
 
 def keys_with_seed(seed):
@@ -305,11 +309,16 @@ class Run:
                     and manifest['contains']['system_firmware'] is False
                     and manifest.get('requires_at_launch') == ['user_keys_for_this_console'],
                     json.dumps(manifest.get('requires_at_launch')))
+        self.record('portable: manifest counts the DLC', manifest['contains'].get('dlc_count') == 2,
+                    str(manifest['contains'].get('dlc_count')))
         names = set(snapshot(package))
         seal = json.loads((package / 'game' / 'seal.json').read_text())
         game_files = sorted(n for n in names if n.startswith('game/'))
-        self.record('portable: sealed layout', game_files == ['game/base.sealed', 'game/seal.json']
-                    and [f['name'] for f in seal['files']] == ['base.sealed'],
+        dlc_names = ['dlc-%d.sealed' % i for i in range(len(self.dlc))]
+        self.record('portable: sealed layout',
+                    game_files == sorted(['game/base.sealed', 'game/seal.json'] +
+                                         ['game/' + n for n in dlc_names])
+                    and [f['name'] for f in seal['files']] == ['base.sealed'] + dlc_names,
                     ', '.join(game_files))
         sealed = (package / 'game' / 'base.sealed').read_bytes()
         original = nsp.read_bytes()
@@ -329,8 +338,31 @@ class Run:
         except ImportError:
             self.record('portable: unsealing gives the game file byte for byte', False,
                         'the cryptography package is needed for this check')
+        # DLC: each installed NCA of the game's DLC, sealed with its own nonce, byte for byte;
+        # the other game's DLC is left out.
+        dlc_entries = seal['files'][1:]
+        self.record('portable: DLC entries in seal.json',
+                    [e.get('role') for e in dlc_entries] == ['dlc'] * len(self.dlc)
+                    and [int(e['title_id'], 16) for e in dlc_entries] == self.dlc_titles
+                    and [e.get('record_type') for e in dlc_entries] == [t for t, _, _ in self.dlc]
+                    and [int(e['size']) for e in dlc_entries] == [len(d) for _, _, d in self.dlc]
+                    and len({e['nonce'] for e in seal['files']}) == len(seal['files']),
+                    json.dumps(dlc_entries))
+        self.record('portable: other games\' DLC left out',
+                    '%016X' % OTHER_GAME_DLC not in json.dumps(seal))
+        try:
+            same = all(unseal((package / 'game' / e['name']).read_bytes(), key,
+                              bytes.fromhex(e['nonce'])) == data
+                       for e, (_, _, data) in zip(dlc_entries, self.dlc))
+            self.record('portable: unsealing gives each DLC file byte for byte', same)
+        except ImportError:
+            self.record('portable: unsealing gives each DLC file byte for byte', False,
+                        'the cryptography package is needed for this check')
+        self.record('portable: DLC files are sealed, not plain',
+                    all((package / 'game' / n).read_bytes()[:13] != b'synthetic dlc'
+                        for n in dlc_names))
         stored = ''.join((package / n).read_bytes().decode('latin-1').lower()
-                         for n in names if n != 'game/base.sealed')
+                         for n in names if not n.endswith('.sealed'))
         self.record('portable: no seed or seal key stored',
                     SEED_A not in stored and key.hex() not in stored)
         bad = [n for n in names if n.lower().endswith(('.keys', '.nsp', '.xci', '.nca'))
@@ -346,6 +378,10 @@ class Run:
         code, output, log = self.launch(package, exe, keys_text=keys_with_seed(SEED_A))
         self.record('portable launcher: runs with this console\'s keys', marker in log,
                     'exit=%s' % code)
+        self.record('portable launcher: registers the sealed DLC',
+                    'Registered 0 sealed update entries and %d sealed DLC entries' % len(self.dlc)
+                    in log, 'exit=%s' % code)
+        self.dlc_launch_checks(package, exe, marker)
         # Moved elsewhere, it still runs: it needs no game file outside itself.
         moved = self.work / 'moved' / 'Relocated portable'
         moved.parent.mkdir(exist_ok=True)
@@ -409,6 +445,55 @@ class Run:
                     marker in log and 'Missing keys' not in log, 'exit=%s' % code)
         keys_file.write_text(PLACEHOLDER_KEYS)
 
+    def dlc_launch_checks(self, package, exe, marker):
+        """A missing DLC file leaves that DLC out; a seal.json that misdescribes DLC is refused."""
+        game = package / 'game'
+        seal_path = game / 'seal.json'
+        original_seal = seal_path.read_text()
+        held = game / 'dlc-1.held'
+        (game / 'dlc-1.sealed').rename(held)
+        code, output, log = self.launch(package, exe, keys_text=keys_with_seed(SEED_A))
+        self.record('portable launcher: runs without a missing DLC file',
+                    marker in log and 'continuing without DLC' in log
+                    and 'Registered 0 sealed update entries and %d sealed DLC entries'
+                    % (len(self.dlc) - 1) in log, 'exit=%s' % code)
+        held.rename(game / 'dlc-1.sealed')
+
+        def tampered(change):
+            seal = json.loads(original_seal)
+            change(seal)
+            seal_path.write_text(json.dumps(seal, indent=4))
+            try:
+                return self.launch(package, exe, keys_text=keys_with_seed(SEED_A))
+            finally:
+                seal_path.write_text(original_seal)
+
+        def dlc_entry(change):
+            return lambda seal: change(seal['files'][1])
+
+        cases = [
+            ('DLC of another game',
+             dlc_entry(lambda e: e.update(title_id='%016X' % OTHER_GAME_DLC)),
+             'DLC for another game'),
+            ('DLC whose title ID is the game itself',
+             dlc_entry(lambda e: e.update(title_id='%016X' % self.fixture_info['title_id'])),
+             'DLC for another game'),
+            ('DLC without a content type', dlc_entry(lambda e: e.pop('record_type')),
+             'no content type'),
+            ('DLC with a content type out of range',
+             dlc_entry(lambda e: e.update(record_type=7)), 'no content type'),
+            ('a DLC file listed as an update', dlc_entry(lambda e: e.update(role='update')),
+             'malformed entry'),
+            ('the same DLC content listed twice',
+             lambda seal: seal['files'].append(dict(seal['files'][1], name='dlc-9.sealed')),
+             'same DLC content twice'),
+        ]
+        for name, change, expected in cases:
+            code, output, log = tampered(change)
+            self.record('portable launcher: refuses ' + name,
+                        code == 2 and expected in log + output and marker not in log,
+                        'exit=%s' % code)
+
     def zip_of(self, package):
         target = self.work / 'zips' / (package.name + '.zip')
         target.parent.mkdir(exist_ok=True)
@@ -430,6 +515,16 @@ class Run:
         keys_dir.mkdir(parents=True)
         # suyu reads its keys once, at start; console A's sd_seed lets it make portable exports.
         (keys_dir / 'prod.keys').write_text(keys_with_seed(SEED_A))
+        # Synthetic DLC installed in this suyu's NAND before it starts: two DLC titles of the
+        # fixture game (one larger than a 4 MiB copy chunk) and one of another game, which
+        # exports must leave out. Made-up bytes; see make_fixture.install_dlc.
+        registered = self.work / 'appdata' / 'suyu' / 'nand' / 'user' / 'Contents' / 'registered'
+        base = self.fixture_info['title_id']
+        self.dlc = (make_fixture.install_dlc(registered, DLC_TITLES[0], [(2, (5 << 20) + 123)]) +
+                    make_fixture.install_dlc(registered, DLC_TITLES[1], [(2, 4096), (3, 777)]))
+        self.dlc_titles = [DLC_TITLES[0], DLC_TITLES[1], DLC_TITLES[1]]
+        make_fixture.install_dlc(registered, OTHER_GAME_DLC, [(2, 2048)])
+        assert all((t & ~0x1FFF) == (base & ~0x1FFF) for t in DLC_TITLES)
         registry_before = registry_dump()
         self.start_suyu()
         try:

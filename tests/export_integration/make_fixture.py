@@ -222,6 +222,40 @@ def write_nsp(path) -> dict:
     return {"title_id": TITLE_ID, "marker": MARKER, "size": p.stat().st_size}
 
 
+AOC_TYPE = 0x82  # TitleType::AOC
+
+
+def install_dlc(registered_dir, title_id, contents) -> list:
+    """A synthetic DLC title the way suyu's NAND lists installed content: a plain CNMT in
+    registered/yuzu_meta naming one <nca id>.nca file per content record.
+
+    `contents` is a list of (record_type, size). The files hold made-up bytes, not NCAs; no
+    keys decrypt them and suyu skips them when it looks for content metadata. They let the
+    exporter find, copy and seal DLC without any Nintendo data. Returns
+    [(record_type, path, data)]."""
+    registered = Path(registered_dir)
+    meta_dir = registered / "yuzu_meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    records = b""
+    written = []
+    for index, (record_type, size) in enumerate(contents):
+        nca_id = struct.pack(">QQ", title_id, 0x5D1C0000 + index)
+        pattern = b"synthetic dlc %016x %d " % (title_id, index)
+        data = (pattern * (size // len(pattern) + 1))[:size]
+        path = registered / (nca_id.hex() + ".nca")
+        path.write_bytes(data)
+        written.append((record_type, path, data))
+        records += (b"\x00" * 0x20 + nca_id + size.to_bytes(6, "little") +
+                    bytes([record_type, 0]))
+    # CNMTHeader (0x20), then the optional header (0x10) the content records follow.
+    header = struct.pack("<QIBBHHHB2sBI4x", title_id, 0, AOC_TYPE, 0, 0x10, len(contents),
+                         0, 0, b"\x00\x00", 1, 0)
+    assert len(header) == 0x20
+    optional = struct.pack("<QQ", title_id & ~0x1FFF, 0)
+    (meta_dir / ("%016x.cnmt" % title_id)).write_bytes(header + optional + records)
+    return written
+
+
 def write_fixture(directory) -> dict:
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
