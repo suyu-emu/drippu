@@ -43,6 +43,8 @@ add_library(core STATIC
     crypto/ctr_encryption_layer.h
     crypto/encryption_layer.cpp
     crypto/encryption_layer.h
+    crypto/hmac_sha256.cpp
+    crypto/hmac_sha256.h
     crypto/key_manager.cpp
     crypto/key_manager.h
     crypto/partition_data_manager.cpp
