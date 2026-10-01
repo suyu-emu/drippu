@@ -37,12 +37,21 @@ inline constexpr std::string_view kExportManifestName = "export-package.json";
 inline constexpr std::string_view kExportManifestSchema = "suyu-local-game-export";
 inline constexpr std::size_t kKeyTextScanLimit = 64 * 1024;
 /// "package_type" in the export manifest of a portable export, which carries the user's game
-/// file and installed update NCAs, unchanged and sealed to the exporting console's keys.
+/// file, installed update and DLC NCAs, unchanged and sealed to the exporting console's keys.
 inline constexpr std::string_view kPortablePackageType = "portable";
 /// Where a portable export keeps its sealed files, and their description.
 inline constexpr std::string_view kPortableGameDir = "game";
 inline constexpr std::string_view kPortableSealName = "seal.json";
 inline constexpr std::string_view kPortableBaseName = "base.sealed";
+
+/// True when @p title_id is an add-on content (DLC) title of the game @p program_id: the same
+/// base title, the add-on offset 0x1000 and an add-on index from 1 to 0x7FF.
+constexpr bool IsAddOnContentOf(std::uint64_t title_id, std::uint64_t program_id) {
+    constexpr std::uint64_t kBaseMask = 0xFFFFFFFFFFFFE000;
+    const std::uint64_t low = title_id & ~kBaseMask;
+    return program_id != 0 && (title_id & kBaseMask) == (program_id & kBaseMask) &&
+           low > 0x1000 && low <= 0x17FF;
+}
 
 /// Lower-cases ASCII and drops the trailing dots and spaces Windows ignores.
 std::string NormalizeName(std::string_view name);
@@ -173,7 +182,8 @@ struct LocalExportExpectation {
     bool allow_aot_cache = false;          ///< Source-format exports keep the C project
     std::vector<std::string> runtime_dlls; ///< names allowed beside the launcher
     /// A portable export (Windows layout only): game/ may hold the sealed game file, sealed
-    /// update NCAs (update-<n>.sealed) and seal.json, and the manifest must say so.
+    /// update NCAs (update-<n>.sealed), sealed DLC NCAs (dlc-<n>.sealed) and seal.json, and
+    /// the manifest must say so.
     bool portable = false;
 };
 

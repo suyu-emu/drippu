@@ -386,6 +386,8 @@ void TestPortable(const fs::path& root) {
     const std::string sealed(0x1000, 'Z');
     Write(pkg / "game" / "base.sealed", sealed);
     Write(pkg / "game" / "update-0.sealed", sealed);
+    Write(pkg / "game" / "dlc-0.sealed", sealed);
+    Write(pkg / "game" / "dlc-1.sealed", sealed);
     Write(pkg / "game" / "seal.json", "{\"format\": \"suyu-portable-seal-1\"}\n");
 
     // Without a portable expectation and manifest, sealed files are not part of an export.
@@ -407,6 +409,10 @@ void TestPortable(const fs::path& root) {
 
     // A container that is not sealed is still refused, whatever its name.
     Write(pkg / "game" / "update-1.sealed", "PFS0" + std::string(60, '\0'));
+    Write(pkg / "game" / "dlc-2.sealed", "PFS0" + std::string(60, '\0'));
+    Write(pkg / "game" / "dlc-3.sealed", KeyText());
+    Write(pkg / "game" / "dlc-x.sealed", sealed);
+    Write(pkg / "game" / "dlc-12345.sealed", sealed);
     Write(pkg / "game" / "game.nsp", "x");
     Write(pkg / "game" / "notes.txt", "x");
     Write(pkg / "game" / "prod.keys", KeyText());
@@ -418,9 +424,14 @@ void TestPortable(const fs::path& root) {
         CHECK(HasRule(findings, "game/notes.txt", "unexpected"));
         CHECK(HasRule(findings, "game/prod.keys", "unexpected"));
         CHECK(HasRule(findings, "game/update-2.sealed", "key-text"));
+        CHECK(HasRule(findings, "game/dlc-2.sealed", "signature"));
+        CHECK(HasRule(findings, "game/dlc-3.sealed", "key-text"));
+        CHECK(HasRule(findings, "game/dlc-x.sealed", "unexpected"));
+        CHECK(HasRule(findings, "game/dlc-12345.sealed", "unexpected"));
     }
     for (const char* name : {"update-1.sealed", "game.nsp", "notes.txt", "prod.keys",
-                             "update-2.sealed"}) {
+                             "update-2.sealed", "dlc-2.sealed", "dlc-3.sealed", "dlc-x.sealed",
+                             "dlc-12345.sealed"}) {
         fs::remove(pkg / "game" / name);
     }
     // Keys are refused anywhere else in a portable export too.
@@ -433,6 +444,16 @@ void TestPortable(const fs::path& root) {
     fs::remove(pkg / "game" / "seal.json");
     CHECK(HasRule(ValidateLocalExport(pkg, expect), "game", "portable-incomplete"));
     CHECK(RemoveStaging(*staging, &error));
+
+    // DLC title IDs: the game's base title, the add-on offset, an index from 1 to 0x7FF.
+    CHECK(IsAddOnContentOf(0x0100000000011001, 0x0100000000010000));
+    CHECK(IsAddOnContentOf(0x01000000000117FF, 0x0100000000010000));
+    CHECK(!IsAddOnContentOf(0x0100000000011000, 0x0100000000010000));
+    CHECK(!IsAddOnContentOf(0x0100000000011800, 0x0100000000010000));
+    CHECK(!IsAddOnContentOf(0x0100000000010800, 0x0100000000010000));
+    CHECK(!IsAddOnContentOf(0x0100000000010000, 0x0100000000010000));
+    CHECK(!IsAddOnContentOf(0x0100000000033001, 0x0100000000010000));
+    CHECK(!IsAddOnContentOf(0x0100000000011001, 0));
 }
 
 void TestPromotion(const fs::path& root) {

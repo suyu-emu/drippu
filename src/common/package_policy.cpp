@@ -1078,6 +1078,7 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
     }
     const std::string game_dir = NormalizeName(kPortableGameDir);
     const std::regex sealed_update{R"(update-[0-9]{1,2}\.sealed)"};
+    const std::regex sealed_dlc{R"(dlc-[0-9]{1,4}\.sealed)"};
     bool has_base = false;
     bool has_seal = false;
     const std::string title_lower = ToLower(expect.title_id_hex);
@@ -1174,7 +1175,7 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
                 has_base = true;
                 return true;
             }
-            return std::regex_match(name, sealed_update);
+            return std::regex_match(name, sealed_update) || std::regex_match(name, sealed_dlc);
         }
         if (parts.size() == 2 && parts[0] == "licenses") {
             return name == "license.txt" || name == "third-party-notices.txt" ||
