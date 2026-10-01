@@ -9,6 +9,7 @@ The title/program ID 0x0100000000E57A00 is SYNTHETIC and belongs to no real titl
 
 Usage: python make_fixture.py OUTDIR
 """
+import hashlib
 import struct
 import sys
 from pathlib import Path
@@ -254,6 +255,68 @@ def install_dlc(registered_dir, title_id, contents) -> list:
     optional = struct.pack("<QQ", title_id & ~0x1FFF, 0)
     (meta_dir / ("%016x.cnmt" % title_id)).write_bytes(header + optional + records)
     return written
+
+
+def make_ticket(rights_id: bytes, title_key: bytes, sig_type=0x10004) -> bytes:
+    """A common ticket (RSA-2048 layout, 0x400 bytes) for `rights_id`. The signature is zeros
+    and the title key is made up: it unlocks nothing and comes from no console or shop.
+    suyu checks a ticket's layout, not Nintendo's signature."""
+    assert len(rights_id) == 16 and len(title_key) == 16
+    data = bytearray(0x2C0)
+    issuer = b"Root-CA00000003-XS00000020"
+    data[0:len(issuer)] = issuer
+    data[0x40:0x50] = title_key        # title_key_block; a common ticket keeps the key here
+    data[0x141] = 0                    # TitleKeyType::Common
+    data[0x160:0x170] = rights_id
+    return struct.pack("<I", sig_type) + bytes(0x100) + bytes(0x3C) + bytes(data)
+
+
+def make_meta_nca(title_id: int, title_type: int, application_id: int) -> bytes:
+    """A metadata NCA with a plaintext header, which suyu reads when the header does not
+    decrypt with header_key: section 0 is an unencrypted PFS0 holding a CNMT with no content
+    records. Opening it needs only some key_area_key_application_00 to be loaded."""
+    header = struct.pack("<QIBBHHHB2sBI4x", title_id, 0, title_type, 0, 0x10, 0, 0, 0,
+                         b"\x00\x00", 1, 0)
+    cnmt = header + struct.pack("<QQ", application_id, 0)
+    names = {0x80: "Application", 0x81: "Patch", 0x82: "AddOnContent"}
+    pfs = make_pfs0([("%s_%016x.cnmt" % (names[title_type], title_id), cnmt)])
+    assert len(pfs) <= 0x1000  # one hash block covers it
+    hash_table = hashlib.sha256(pfs).digest()
+    body = hash_table + bytes(0x200 - len(hash_table)) + pfs
+    body += bytes(-len(body) % 0x200)
+    section_start = 0xC00
+    total = section_start + len(body)
+
+    fs_header = bytearray(0x200)
+    # version 2, PartitionFs, HierarchicalSha256, no encryption
+    struct.pack_into("<HBBB", fs_header, 0, 2, 1, 2, 1)
+    struct.pack_into("<32sii", fs_header, 0x8, hashlib.sha256(hash_table).digest(), 0x1000, 2)
+    struct.pack_into("<qqqq", fs_header, 0x30, 0, len(hash_table), 0x200, len(pfs))
+
+    nca = bytearray(0x400)
+    nca[0x200:0x204] = b"NCA3"
+    nca[0x204] = 0          # distribution: download
+    nca[0x205] = 1          # content type: meta
+    nca[0x206] = 0          # key generation
+    nca[0x207] = 0          # key area index: application
+    struct.pack_into("<QQII", nca, 0x208, total, title_id, 0, 0x000C1100)
+    struct.pack_into("<II", nca, 0x240, section_start // 0x200, total // 0x200)
+    nca[0x280:0x2A0] = hashlib.sha256(bytes(fs_header)).digest()
+    return bytes(nca) + bytes(fs_header) + bytes(0x600) + body
+
+
+def write_titlekey_dlc_nsp(path, title_id, application_id, title_key) -> dict:
+    """An installable NSP laid out like eShop DLC: its metadata NCA, a ticket for its rights
+    ID, and a second .tik that is not a ticket. Everything is synthetic."""
+    rights_id = struct.pack(">Q", title_id) + bytes(7) + b"\x0a"
+    ticket = make_ticket(rights_id, title_key)
+    meta = make_meta_nca(title_id, AOC_TYPE, application_id)
+    meta_id = hashlib.sha256(meta).hexdigest()[:32]
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(make_pfs0([(meta_id + ".cnmt.nca", meta), (rights_id.hex() + ".tik", ticket),
+                             ("not-a-ticket.tik", b"\xff" * 16)]))
+    return {"rights_id": rights_id.hex(), "ticket": ticket, "meta_id": meta_id}
 
 
 def write_fixture(directory) -> dict:

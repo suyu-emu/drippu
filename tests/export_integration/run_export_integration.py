@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -47,6 +48,13 @@ SEED_B = 'b0b0' * 8
 # another made-up game. None belongs to a real title.
 DLC_TITLES = (0x0100000000E57001, 0x0100000000E57002)
 OTHER_GAME_DLC = 0x0100000000F01001
+# Synthetic titlekey-encrypted DLC of a third made-up game (0x0100000000F02000), installed
+# from an NSP with a ticket, and the made-up title key its ticket carries.
+TICKET_DLC = 0x0100000000F02001
+TICKET_TITLE_KEY = bytes(range(0x40, 0x50))
+# suyu opens an NCA only with some application key-area key loaded, even one with a plaintext
+# header and no encrypted section. A made-up value, assembled like the others.
+KEY_AREA_PLACEHOLDER = 'key_area_key_application' + '_00' + ' = ' + '7a' * 16 + '\n'
 
 
 def keys_with_seed(seed):
@@ -242,7 +250,7 @@ class Run:
                     any(n.startswith('aot_cache/') for n in names) == expect_aot_cache)
         if expect_launcher:
             self.record(name + ': launcher', any(n.endswith('.exe') and '/' not in n for n in names))
-        bad = [n for n in names if n.lower().endswith(('.keys', '.nsp', '.xci', '.nca'))
+        bad = [n for n in names if n.lower().endswith(('.keys', '.tik', '.nsp', '.xci', '.nca'))
                and n != 'exefs/control.nca']
         self.record(name + ': no keys or containers', not bad, ', '.join(bad))
         source_note = (package / 'game_source.txt')
@@ -365,7 +373,7 @@ class Run:
                          for n in names if not n.endswith('.sealed'))
         self.record('portable: no seed or seal key stored',
                     SEED_A not in stored and key.hex() not in stored)
-        bad = [n for n in names if n.lower().endswith(('.keys', '.nsp', '.xci', '.nca'))
+        bad = [n for n in names if n.lower().endswith(('.keys', '.tik', '.nsp', '.xci', '.nca'))
                or n.lower().startswith(('user/nand/system', 'user/keys'))]
         self.record('portable: no keys, firmware or plain containers', not bad, ', '.join(bad))
         self.record('portable: records no game file path',
@@ -514,7 +522,7 @@ class Run:
         keys_dir = self.work / 'appdata' / 'suyu' / 'keys'
         keys_dir.mkdir(parents=True)
         # suyu reads its keys once, at start; console A's sd_seed lets it make portable exports.
-        (keys_dir / 'prod.keys').write_text(keys_with_seed(SEED_A))
+        (keys_dir / 'prod.keys').write_text(keys_with_seed(SEED_A) + KEY_AREA_PLACEHOLDER)
         # Synthetic DLC installed in this suyu's NAND before it starts: two DLC titles of the
         # fixture game (one larger than a 4 MiB copy chunk) and one of another game, which
         # exports must leave out. Made-up bytes; see make_fixture.install_dlc.
@@ -545,10 +553,76 @@ class Run:
         print('%d passed, %d failed' % (len(self.results) - len(failed), len(failed)))
         return 1 if failed else 0
 
+    def stop_suyu(self):
+        try:
+            self.process.terminate()
+            self.process.wait(30)
+        except Exception:
+            self.process.kill()
+            self.process.wait(30)
+
+    def ticket_scenarios(self):
+        """Installing an NSP keeps its ticket in the NAND; a restarted suyu loads it again."""
+        nsp = self.work / 'games' / 'SynthTicketDlc.nsp'
+        info = make_fixture.write_titlekey_dlc_nsp(nsp, TICKET_DLC, TICKET_DLC & ~0x1FFF,
+                                                   TICKET_TITLE_KEY)
+        self.ticket_info = info
+        nand = self.work / 'appdata' / 'suyu' / 'nand'
+        store = nand / 'system' / 'tickets'
+        keys_dir = self.work / 'appdata' / 'suyu' / 'keys'
+        before = self.mcp.call('get_keys_status')
+        result = self.mcp.call('install_content_from_path', {'path': str(nsp)}, timeout=120)
+        stored = sorted(p.name for p in store.iterdir()) if store.exists() else []
+        expected = info['rights_id'] + '.tik'
+        self.record('install: NSP with a ticket installs', result.get('result') == 'success',
+                    json.dumps(result))
+        self.record('install: only the valid ticket is kept, as shipped',
+                    stored == [expected] and (store / expected).read_bytes() == info['ticket'],
+                    ', '.join(stored))
+        self.record('install: no key files created',
+                    sorted(p.name for p in keys_dir.iterdir()) == ['prod.keys'])
+        self.record('install: nothing loaded from the store before a restart',
+                    before.get('installed_tickets') == 0, json.dumps(before))
+        stamp = (store / expected).stat().st_mtime_ns if stored else None
+        time.sleep(1.5)
+        again = self.mcp.call('install_content_from_path', {'path': str(nsp)}, timeout=120)
+        self.record('install again: identical ticket left alone',
+                    again.get('result') == 'overwrite' and stored and
+                    (store / expected).stat().st_mtime_ns == stamp, json.dumps(again))
+        self.stop_suyu()
+        self.start_suyu()
+        status = self.mcp.call('get_keys_status')
+        log = ''.join(p.read_text(errors='replace')
+                      for p in (self.work / 'appdata' / 'suyu' / 'log').glob('*.txt'))
+        self.record('restart: installed ticket loaded with its title key',
+                    status.get('installed_tickets') == 1 and
+                    status.get('installed_ticket_title_keys') == 1 and
+                    'Loaded 1 installed tickets (1 with a title key)' in log, json.dumps(status))
+
+    def launcher_ticket_check(self, package, exe):
+        """The launcher reads tickets from the installed NAND, never from its own package."""
+        decoy = package / 'user' / 'nand' / 'system' / 'tickets'
+        decoy.mkdir(parents=True, exist_ok=True)
+        decoy_rights = struct.pack('>Q', TICKET_DLC + 1) + bytes(7) + b'\x0a'
+        (decoy / (decoy_rights.hex() + '.tik')).write_bytes(
+            make_fixture.make_ticket(decoy_rights, TICKET_TITLE_KEY))
+        code, output, log = self.launch(package, exe, keys=True)
+        installed = str(self.work / 'appdata' / 'suyu' / 'nand' / 'system' / 'tickets')
+        loaded = [line for line in log.splitlines() if 'installed tickets' in line]
+        lines = [line.replace('/', os.sep).lower() for line in loaded]
+        self.record('launcher: loads tickets from the installed NAND only',
+                    len(loaded) == 1 and 'Loaded 1 installed tickets (1 with a title key)'
+                    in loaded[0] and installed.lower() in lines[0] and
+                    str(package).lower() not in lines[0],
+                    loaded[0] if loaded else 'exit=%s' % code)
+        shutil.rmtree(package / 'user' / 'nand' / 'system')
+
     def scenarios(self):
         a = self.args
         jit_name = 'SynthFixture - Dynarmic JIT'
         jit = self.out / jit_name
+
+        self.ticket_scenarios()
 
         # JIT baseline package.
         status = self.export('dynarmic', 'build')
@@ -565,6 +639,7 @@ class Run:
         code, output, log = self.launch(jit, exe, keys=True)
         marker = self.fixture_info['marker']
         self.record('launcher: synthetic program runs (JIT)', marker in log, 'exit=%s' % code)
+        self.launcher_ticket_check(jit, exe)
 
         # Relocation after promotion: move the whole package and run it again.
         moved = self.work / 'moved' / 'Relocated JIT'
