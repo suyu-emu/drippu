@@ -5,6 +5,7 @@
 
 #include <array>
 #include <optional>
+#include <vector>
 #include <QCheckBox>
 #include <QDialog>
 #include <QComboBox>
@@ -18,6 +19,7 @@
 #include <QVector>
 
 #include "common/package_policy.h"
+#include "core/file_sys/vfs/vfs_types.h"
 #include "suyu/wikipedia_cover.h"
 
 namespace Core {
@@ -86,6 +88,8 @@ public:
         /// Throws at this step ("precompile", "package", "validate") so tests can prove a
         /// failed export leaves no package and the previous one untouched.
         QString fail_at;
+        /// Package type: -1 leaves the dialog's choice, 0 = uses the game file, 1 = portable.
+        int package = -1;
     };
     void SetTestExportOptions(const TestExportOptions& options);
     /// True when the last test export stopped because its destination already existed.
@@ -188,6 +192,25 @@ private:
                                    quint32* title_version = nullptr) const;
     /// Refresh the Update row after the ROM changes or an update is installed.
     void RefreshUpdateStatus();
+    /// Refresh the Keys, Firmware and Game file rows and what the package type combo offers.
+    void RefreshPackageStatus();
+    /// Whether a portable package can be made for the current selection; when it cannot,
+    /// @p reason says why.
+    bool PortableAvailable(QString* reason) const;
+    /// The game file and installed update NCAs a portable export carries, with their size.
+    struct SealSource {
+        QString name;        ///< file name inside game/
+        QString role;        ///< "base" or "update"
+        quint64 title_id{};
+        int record_type{-1}; ///< ContentRecordType of an update NCA
+        FileSys::VirtualFile file;
+    };
+    std::vector<SealSource> PortableSources(QString* error) const;
+    /// Copies @p sources into <package_root>/game, sealed, and writes seal.json. Returns false
+    /// with @p error set on failure, or with @p cancelled set when the user stopped it.
+    bool SealGameFiles(const std::vector<SealSource>& sources, const QString& package_root,
+                       const std::string& export_id, quint64 program_id, QString* error,
+                       bool* cancelled);
     /// Ask for an update NSP, check it belongs to the selected game, and install it.
     /// Returns true when an update was installed.
     bool PromptAndInstallUpdate();
@@ -273,6 +296,14 @@ private:
     /// Moves the bar to @p fraction of @p stage - never backwards - and, when given, shows
     /// @p status.
     void ReportStage(ExportStage stage, double fraction, const QString& status = {});
+    QLabel* keys_status_label{};
+    QLabel* firmware_status_label{};
+    QLabel* game_file_status_label{};
+    /// "Uses your game file" (reference) or "Portable" (sealed game file in the package).
+    QComboBox* package_type_combo{};
+    QLabel* package_note_label{};
+    /// The general note on what an export contains, which depends on the package type.
+    QLabel* content_label{};
     QLabel* update_status_label{};
     QLabel* update_source_label{};
     QPushButton* install_update_button{};

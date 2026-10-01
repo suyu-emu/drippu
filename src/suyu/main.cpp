@@ -6147,6 +6147,13 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         options.include_shader = tri_state("include_shader");
                         options.include_config = tri_state("include_config");
                         options.fail_at = params[QStringLiteral("fail_at")].toString().trimmed();
+                        // "reference" (uses the game file) or "portable" (sealed game file in
+                        // the package); anything else leaves the dialog's choice.
+                        const QString package =
+                            params[QStringLiteral("package")].toString().trimmed().toLower();
+                        options.package = package == QStringLiteral("portable")    ? 1
+                                          : package == QStringLiteral("reference") ? 0
+                                                                                   : -1;
                         dialog->SetTestExportOptions(options);
                         QTimer::singleShot(0, dialog, [dialog, rom_path, output_dir, format_index,
                                                        backend_index, full_scan, app_version,

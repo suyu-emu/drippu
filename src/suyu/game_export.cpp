@@ -24,6 +24,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QListWidget>
+#include <QLocale>
 #include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -38,6 +39,7 @@
 #include <QSizePolicy>
 #include <QStandardPaths>
 #include <QStandardItemModel>
+#include <QStorageInfo>
 #include <QTextStream>
 #include <QThread>
 #include <QTimer>
@@ -82,6 +84,8 @@
 #include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/recomp/recomp_image_features.h"
 #include "core/core.h"
+#include "core/crypto/key_manager.h"
+#include "core/crypto/portable_seal.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/program_metadata.h"
@@ -315,6 +319,33 @@ void GameExportDialog::SetupUi() {
     rom_row->addWidget(rom_browse_btn);
     layout->addLayout(rom_row);
 
+    // What an export runs with: the keys and firmware installed in suyu, and the selected game
+    // file. Keys and firmware are never copied into a package.
+    const auto add_status_row = [this, layout](const QString& caption) {
+        auto* row = new QHBoxLayout();
+        row->addWidget(new QLabel(caption, this));
+        auto* value = new QLabel(this);
+        value->setWordWrap(true);
+        value->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        row->addWidget(value, 1);
+        layout->addLayout(row);
+        return value;
+    };
+    keys_status_label = add_status_row(tr("Keys:"));
+    firmware_status_label = add_status_row(tr("Firmware:"));
+    game_file_status_label = add_status_row(tr("Game file:"));
+    // Read once: firmware is not installed from this dialog.
+    QString firmware_text = tr("Not installed (optional; Mii screens and some menus need it)");
+    if (FirmwareManager::CheckFirmwarePresence(system_)) {
+        const auto [firmware, result] = FirmwareManager::GetFirmwareVersion(system_);
+        firmware_text = result.IsSuccess() ? tr("Installed, version %1.%2.%3")
+                                                 .arg(firmware.major)
+                                                 .arg(firmware.minor)
+                                                 .arg(firmware.micro)
+                                           : tr("Installed");
+    }
+    firmware_status_label->setText(firmware_text);
+
     // Update row: exports use the game's installed update, so say which one, and let a fresh
     // suyu install add it here instead of sending the user to File > Install first.
     auto* update_row = new QHBoxLayout();
@@ -412,6 +443,36 @@ void GameExportDialog::SetupUi() {
     backend_combo->setCurrentIndex(0);
     backend_row->addWidget(backend_combo);
     layout->addLayout(backend_row);
+
+    // Package type. The default records the game file and reads it at each launch. Portable
+    // copies the game file and its installed update into the package unchanged and seals them
+    // to this console's keys; the package then runs only with that console's keys.
+    auto* package_row = new QHBoxLayout();
+    package_row->addWidget(new QLabel(tr("Package type:"), this));
+    package_type_combo = new QComboBox(this);
+    package_type_combo->addItem(tr("Uses your game file (default)"), QStringLiteral("reference"));
+    package_type_combo->addItem(tr("Portable — includes your game file, sealed to this console"),
+                                QStringLiteral("portable"));
+    package_row->addWidget(package_type_combo, 1);
+    layout->addLayout(package_row);
+    package_note_label = new QLabel(this);
+    package_note_label->setWordWrap(true);
+    package_note_label->setStyleSheet(QStringLiteral("color: #888;"));
+    layout->addWidget(package_note_label);
+    {
+        const QSettings settings(QStringLiteral("suyu"), QStringLiteral("suyu"));
+        if (settings.value(QStringLiteral("recompile/package_type")).toString() ==
+            QStringLiteral("portable")) {
+            package_type_combo->setCurrentIndex(1);
+        }
+    }
+    // Remembered only when the user picks one; automation sets its own per export.
+    connect(package_type_combo, &QComboBox::activated, this, [this](int) {
+        QSettings settings(QStringLiteral("suyu"), QStringLiteral("suyu"));
+        settings.setValue(QStringLiteral("recompile/package_type"),
+                          package_type_combo->currentData().toString());
+        RefreshPackageStatus();
+    });
 
     // AOT options
     aot_full_scan_checkbox = new QCheckBox(
@@ -523,12 +584,7 @@ void GameExportDialog::SetupUi() {
            "not copied: paths, devices, accounts and debugging options stay behind."));
     layout->addWidget(include_custom_config_checkbox);
 
-    auto* content_label = new QLabel(
-        tr("An export does not contain the game. Each launch reads the game file you selected "
-           "and decrypts it with your own installed keys; AOT exports (Source too) contain code "
-           "translated from it. Keys and system firmware are never copied. Do not upload "
-           "exports or their logs to suyu's release or support channels."),
-        this);
+    content_label = new QLabel(this);
     content_label->setWordWrap(true);
     layout->addWidget(content_label);
 
@@ -669,6 +725,7 @@ void GameExportDialog::SetupUi() {
                 tr("Runs the game with the Dynarmic JIT as a baseline for direct comparison. "
                    "No AOT source is generated."));
         }
+        RefreshPackageStatus();
     };
     connect(backend_combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
             update_options);
@@ -1420,6 +1477,316 @@ void GameExportDialog::RefreshUpdateStatus() {
         break;
     }
     RefreshCoverageStatus();
+    RefreshPackageStatus();
+}
+
+// The keys installed in suyu: whether prod.keys is there, and whether they include an sd_seed,
+// which seals a portable export to this console.
+static bool InstalledProdKeysPresent() {
+    const auto keys_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
+    std::error_code ec;
+    return std::filesystem::is_regular_file(keys_dir / "prod.keys", ec) ||
+           std::filesystem::is_regular_file(keys_dir / "prod.keys_autogenerated", ec);
+}
+
+static bool InstalledKeysHaveSdSeed() {
+    return Core::Crypto::KeyManager::Instance().HasKey(Core::Crypto::S128KeyType::SDSeed);
+}
+
+bool GameExportDialog::PortableAvailable(QString* reason) const {
+    const auto unavailable = [reason](const QString& why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+    const QString rom_path = rom_path_edit ? rom_path_edit->text() : QString{};
+    const QFileInfo rom_info(rom_path);
+    if (rom_path.isEmpty() || !rom_info.isFile()) {
+        return unavailable(tr("select an .nsp or .xci game file first."));
+    }
+    if (!rom_path.endsWith(QStringLiteral(".nsp"), Qt::CaseInsensitive) &&
+        !rom_path.endsWith(QStringLiteral(".xci"), Qt::CaseInsensitive)) {
+        return unavailable(tr("it needs an .nsp or .xci game file."));
+    }
+    if (platform_combo &&
+        platform_combo->currentData().toInt() != static_cast<int>(TargetPlatform::Windows)) {
+        return unavailable(tr("it is available for Windows exports only."));
+    }
+    if (backend_combo &&
+        backend_combo->currentData().toInt() != static_cast<int>(RecompileBackend::Dynarmic) &&
+        !WantsCompiledOutput()) {
+        return unavailable(tr("a Source export has no launcher to run it."));
+    }
+    if (!InstalledProdKeysPresent()) {
+        return unavailable(tr("no keys are installed in suyu."));
+    }
+    if (!InstalledKeysHaveSdSeed()) {
+        return unavailable(tr("the installed keys have no sd_seed, which the seal is made from."));
+    }
+    return true;
+}
+
+std::vector<GameExportDialog::SealSource> GameExportDialog::PortableSources(QString* error) const {
+    std::vector<SealSource> sources;
+    const QString rom_path = rom_path_edit->text();
+    static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    const u64 program_id = SelectedProgramId();
+    auto base = vfs->OpenFile(rom_path.toStdString(), FileSys::OpenMode::Read);
+    if (!base || program_id == 0) {
+        *error = tr("the game file could not be opened");
+        return {};
+    }
+    sources.push_back({QString::fromLatin1(PackagePolicy::kPortableBaseName.data(),
+                                           static_cast<qsizetype>(
+                                               PackagePolicy::kPortableBaseName.size())),
+                       QStringLiteral("base"), program_id, -1, std::move(base)});
+    // The installed update the export uses, as suyu installed it: its NCAs from the NAND, still
+    // in their original encryption. An update packed in the game file travels inside it.
+    const FileSys::PatchManager pm{program_id, system_.GetFileSystemController(),
+                                   system_.GetContentProvider()};
+    if (!pm.GetUpdateSelection().installed_exefs) {
+        return sources;
+    }
+    const auto update = pm.GetExeFSUpdate();
+    using Slot = FileSys::ContentProviderUnionSlot;
+    if (!update || !update->slot || (*update->slot != Slot::UserNAND &&
+                                     *update->slot != Slot::SysNAND)) {
+        return sources;
+    }
+    const auto* provider = system_.GetContentProviderUnion().GetSlotProvider(*update->slot);
+    if (provider == nullptr) {
+        return sources;
+    }
+    const u64 update_id = FileSys::GetUpdateTitleID(program_id);
+    int index = 0;
+    for (const auto type :
+         {FileSys::ContentRecordType::Meta, FileSys::ContentRecordType::Program,
+          FileSys::ContentRecordType::Data, FileSys::ContentRecordType::Control,
+          FileSys::ContentRecordType::HtmlDocument, FileSys::ContentRecordType::LegalInformation}) {
+        if (auto file = provider->GetEntryRaw(update_id, type)) {
+            sources.push_back({QStringLiteral("update-%1.sealed").arg(index++),
+                               QStringLiteral("update"), update_id, static_cast<int>(type),
+                               std::move(file)});
+        } else if (type == FileSys::ContentRecordType::Program) {
+            *error = tr("the installed update's program could not be opened");
+            return {};
+        }
+    }
+    return sources;
+}
+
+void GameExportDialog::RefreshPackageStatus() {
+    if (!package_type_combo || !keys_status_label || !game_file_status_label) {
+        return;
+    }
+    const bool has_keys = InstalledProdKeysPresent();
+    const bool has_seed = has_keys && InstalledKeysHaveSdSeed();
+    keys_status_label->setText(
+        !has_keys  ? tr("Not installed (Tools > Install Decryption Keys)")
+        : has_seed ? tr("Installed, including this console's sd_seed")
+                   : tr("Installed, without an sd_seed (needed only for Portable)"));
+
+    const QString rom_path = rom_path_edit->text();
+    const QFileInfo rom_info(rom_path);
+    if (rom_path.isEmpty()) {
+        game_file_status_label->setText(tr("No game selected"));
+    } else if (rom_info.isDir()) {
+        game_file_status_label->setText(tr("Extracted folder: %1").arg(rom_info.fileName()));
+    } else if (rom_info.isFile()) {
+        game_file_status_label->setText(
+            QStringLiteral("%1 (%2)").arg(rom_info.fileName(),
+                                          QLocale().formattedDataSize(rom_info.size())));
+    } else {
+        game_file_status_label->setText(tr("Not found: %1").arg(rom_path));
+    }
+
+    QString reason;
+    const bool available = PortableAvailable(&reason);
+    if (auto* model = qobject_cast<QStandardItemModel*>(package_type_combo->model())) {
+        model->item(1)->setEnabled(available);
+    }
+    if (!available && package_type_combo->currentIndex() == 1) {
+        package_type_combo->setCurrentIndex(0);
+    }
+    const bool portable = package_type_combo->currentIndex() == 1;
+    if (content_label) {
+        content_label->setText(
+            portable ? tr("This export contains your game file and its installed update, sealed "
+                          "to this console's keys. Keys and system firmware are never copied. "
+                          "Do not upload exports or their logs to suyu's release or support "
+                          "channels.")
+                     : tr("An export does not contain the game. Each launch reads the game file "
+                          "you selected and decrypts it with your own installed keys; AOT "
+                          "exports (Source too) contain code translated from it. Keys and "
+                          "system firmware are never copied. Do not upload exports or their "
+                          "logs to suyu's release or support channels."));
+    }
+    if (!portable) {
+        package_note_label->setText(
+            available ? tr("The export reads your game file from where it is now each time it "
+                           "starts.")
+                      : tr("The export reads your game file from where it is now each time it "
+                           "starts. Portable is not available: %1")
+                            .arg(reason));
+        return;
+    }
+    QString error;
+    const auto sources = PortableSources(&error);
+    quint64 extra = 0;
+    for (const auto& source : sources) {
+        extra += source.file->GetSize();
+    }
+    const bool with_update = sources.size() > 1;
+    package_note_label->setText(
+        tr("The game file%1 is copied as it is, in its original encryption, and sealed to this "
+           "console's keys. On first launch the export asks for your keys and remembers them on "
+           "that PC. Keys and firmware are never copied into the export and must come from a "
+           "Switch you own. Adds about %2 to the export.")
+            .arg(with_update ? tr(" and its installed update") : QString{},
+                 QLocale().formattedDataSize(static_cast<qint64>(extra))) +
+        (error.isEmpty() ? QString{} : QStringLiteral(" ") + tr("Note: %1.").arg(error)));
+}
+
+bool GameExportDialog::SealGameFiles(const std::vector<SealSource>& sources,
+                                     const QString& package_root, const std::string& export_id,
+                                     quint64 program_id, QString* error, bool* cancelled) {
+    namespace Seal = Core::Crypto::PortableSeal;
+    *cancelled = false;
+    auto& keys = Core::Crypto::KeyManager::Instance();
+    if (!keys.HasKey(Core::Crypto::S128KeyType::SDSeed)) {
+        *error = tr("the installed keys have no sd_seed");
+        return false;
+    }
+    const auto seal_key =
+        Seal::DeriveKey(keys.GetKey(Core::Crypto::S128KeyType::SDSeed), export_id);
+    const auto check = seal_key ? Seal::ComputeCheck(*seal_key) : std::nullopt;
+    if (!check) {
+        *error = tr("the seal key could not be computed");
+        return false;
+    }
+    const QString game_dir =
+        package_root + QLatin1Char('/') +
+        QString::fromLatin1(PackagePolicy::kPortableGameDir.data(),
+                            static_cast<qsizetype>(PackagePolicy::kPortableGameDir.size()));
+    if (!QDir().mkpath(game_dir)) {
+        *error = tr("cannot create the game folder in the package");
+        return false;
+    }
+    quint64 total = 0;
+    for (const auto& source : sources) {
+        total += source.file->GetSize();
+    }
+    // The copy is as large as the game; say so up front rather than fail part way.
+    const QStorageInfo storage(game_dir);
+    constexpr quint64 kMargin = 64ull << 20;
+    if (storage.isValid() && storage.bytesAvailable() >= 0 &&
+        static_cast<quint64>(storage.bytesAvailable()) < total + kMargin) {
+        *error = tr("not enough free space in the output folder: the game file needs %1, %2 is "
+                    "free")
+                     .arg(QLocale().formattedDataSize(static_cast<qint64>(total)),
+                          QLocale().formattedDataSize(storage.bytesAvailable()));
+        return false;
+    }
+
+    QProgressDialog progress(tr("Copying the game file into the export..."), tr("Cancel"), 0,
+                             1000, this);
+    progress.setWindowTitle(tr("Portable Export"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(1000);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+
+    constexpr std::size_t kChunk = 4u << 20;
+    std::vector<u8> buffer(kChunk);
+    quint64 done = 0;
+    QJsonArray files;
+    for (const auto& source : sources) {
+        const auto nonce = Seal::RandomNonce();
+        if (!nonce) {
+            *error = tr("no random nonce could be generated");
+            return false;
+        }
+        QFile out(game_dir + QLatin1Char('/') + source.name);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+            *error = tr("cannot create %1 in the package").arg(source.name);
+            return false;
+        }
+        Seal::Sealer sealer(*seal_key, *nonce);
+        const u64 size = source.file->GetSize();
+        u64 offset = 0;
+        while (offset < size) {
+            const std::size_t length =
+                static_cast<std::size_t>(std::min<u64>(kChunk, size - offset));
+            const std::size_t got = source.file->Read(buffer.data(), length, offset);
+            if (got != length) {
+                *error = tr("the game file could not be read at offset %1").arg(offset);
+                return false;
+            }
+            sealer.Apply(buffer.data(), got, offset);
+            if (out.write(reinterpret_cast<const char*>(buffer.data()),
+                          static_cast<qint64>(got)) != static_cast<qint64>(got)) {
+                *error = tr("writing %1 failed: %2").arg(source.name, out.errorString());
+                return false;
+            }
+            offset += got;
+            done += got;
+            const double fraction = total == 0 ? 1.0 : static_cast<double>(done) / total;
+            progress.setValue(static_cast<int>(fraction * 1000));
+            ReportStage(ExportStage::Package, 0.1 + 0.75 * fraction,
+                        tr("Copying the game file, sealed: %1 of %2")
+                            .arg(QLocale().formattedDataSize(static_cast<qint64>(done)),
+                                 QLocale().formattedDataSize(static_cast<qint64>(total))));
+            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+            if (progress.wasCanceled()) {
+                *cancelled = true;
+                return false;
+            }
+        }
+        if (!out.flush()) {
+            *error = tr("writing %1 failed: %2").arg(source.name, out.errorString());
+            return false;
+        }
+        out.close();
+        QJsonObject entry{
+            {QStringLiteral("name"), source.name},
+            {QStringLiteral("role"), source.role},
+            {QStringLiteral("title_id"),
+             QStringLiteral("%1").arg(source.title_id, 16, 16, QLatin1Char('0')).toUpper()},
+            {QStringLiteral("size"), QString::number(size)},
+            {QStringLiteral("nonce"),
+             QString::fromStdString(Seal::ToHex(nonce->data(), nonce->size()))},
+        };
+        if (source.record_type >= 0) {
+            entry[QStringLiteral("record_type")] = source.record_type;
+        }
+        files.append(entry);
+    }
+    // What the launcher needs to open the sealed files. It holds neither the seal key nor
+    // the sd_seed; the check value only tells the right console's keys apart from others.
+    QJsonObject seal{
+        {QStringLiteral("format"), QString::fromLatin1(Seal::kSealFormat.data(),
+                                                       static_cast<qsizetype>(
+                                                           Seal::kSealFormat.size()))},
+        {QStringLiteral("cipher"), QStringLiteral("AES-128-CTR")},
+        {QStringLiteral("export_id"), QString::fromStdString(export_id)},
+        {QStringLiteral("title_id"),
+         QStringLiteral("%1").arg(program_id, 16, 16, QLatin1Char('0')).toUpper()},
+        {QStringLiteral("check"),
+         QString::fromStdString(Seal::ToHex(check->data(), check->size()))},
+        {QStringLiteral("files"), files},
+    };
+    QSaveFile seal_file(game_dir + QLatin1Char('/') +
+                        QString::fromLatin1(PackagePolicy::kPortableSealName.data(),
+                                            static_cast<qsizetype>(
+                                                PackagePolicy::kPortableSealName.size())));
+    if (!seal_file.open(QIODevice::WriteOnly) ||
+        seal_file.write(QJsonDocument(seal).toJson(QJsonDocument::Indented)) <= 0 ||
+        !seal_file.commit()) {
+        *error = tr("cannot write seal.json");
+        return false;
+    }
+    return true;
 }
 
 void GameExportDialog::OnInstallUpdate() {
@@ -5369,7 +5736,8 @@ static QString Latin1(std::string_view text) {
 // it holds without saying where its owner keeps their games.
 static bool WriteExportManifest(const QString& package_root, const QString& export_id,
                                 u64 program_id, GameExportDialog::RecompileBackend backend,
-                                bool compiled, bool saves, bool shader_cache, bool settings) {
+                                bool compiled, bool saves, bool shader_cache, bool settings,
+                                bool portable) {
     const bool uses_aot = backend != GameExportDialog::RecompileBackend::Dynarmic;
     QJsonObject manifest;
     manifest[QStringLiteral("schema")] = Latin1(PackagePolicy::kExportManifestSchema);
@@ -5386,16 +5754,21 @@ static bool WriteExportManifest(const QString& package_root, const QString& expo
     manifest[QStringLiteral("format")] = !uses_aot  ? QStringLiteral("jit")
                                          : compiled ? QStringLiteral("build")
                                                     : QStringLiteral("source");
+    manifest[QStringLiteral("package_type")] =
+        portable ? Latin1(PackagePolicy::kPortablePackageType) : QStringLiteral("reference");
     manifest[QStringLiteral("contains")] = QJsonObject{
         {QStringLiteral("extracted_exefs"), false},
         {QStringLiteral("decrypted_romfs"), false},
         {QStringLiteral("translated_game_code"), uses_aot},
+        {QStringLiteral("original_game_file_sealed"), portable},
         {QStringLiteral("nintendo_keys"), false},
         {QStringLiteral("system_firmware"), false},
     };
-    // What it needs each time it runs, supplied by the user.
+    // What it needs each time it runs, supplied by the user. A portable export carries the
+    // game file, sealed, and runs only with keys from the console it was made with.
     manifest[QStringLiteral("requires_at_launch")] =
-        QJsonArray{QStringLiteral("user_game_file"), QStringLiteral("user_keys")};
+        portable ? QJsonArray{QStringLiteral("user_keys_for_this_console")}
+                 : QJsonArray{QStringLiteral("user_game_file"), QStringLiteral("user_keys")};
     manifest[QStringLiteral("optional_data")] = QJsonObject{
         {QStringLiteral("saves"), saves},
         {QStringLiteral("shader_cache"), shader_cache},
@@ -5608,6 +5981,10 @@ void GameExportDialog::OnExport() {
     const bool include_save_data = include_save_data_checkbox->isChecked();
     const bool include_shader_cache = include_shader_cache_checkbox->isChecked();
     const bool include_custom_config = include_custom_config_checkbox->isChecked();
+    // Automation chooses the package type per export; otherwise the dialog's choice applies.
+    const bool portable = test_driven_export && test_options_.package >= 0
+                              ? test_options_.package == 1
+                              : package_type_combo->currentIndex() == 1;
     // Read once: a Build can run for hours with the dialog responsive, and the ROM field or
     // these options may change meanwhile.
     const u64 export_program_id = SelectedProgramId();
@@ -5802,6 +6179,21 @@ void GameExportDialog::OnExport() {
     const QString work_dir = FromFsPath(staging->work);
 
     try {
+    // A portable export copies the game file and its installed update; check that it can
+    // before any of the long work starts.
+    std::vector<SealSource> seal_sources;
+    if (portable) {
+        QString reason;
+        if (!PortableAvailable(&reason)) {
+            finish_failed(tr("Export stopped: Portable is not available: %1").arg(reason));
+            return;
+        }
+        seal_sources = PortableSources(&reason);
+        if (seal_sources.empty()) {
+            finish_failed(tr("Export stopped: %1").arg(reason));
+            return;
+        }
+    }
     const QString exefs_work = work_dir + QStringLiteral("/exefs");
     // The AOT cache is generated straight into the staged package rather than
     // beside it: it is by far the largest thing an export produces - about 6 GB
@@ -5871,6 +6263,18 @@ void GameExportDialog::OnExport() {
         return;
     }
     injected("package");
+    if (portable) {
+        // The launcher opens the sealed copy in the package, not a game file at a recorded path.
+        QFile::remove(staging_root + QStringLiteral("/user/config/game-source.ini"));
+        QString seal_error;
+        bool cancelled = false;
+        if (!SealGameFiles(seal_sources, staging_root, staging->id, export_program_id,
+                           &seal_error, &cancelled)) {
+            finish_failed(cancelled ? tr("Export cancelled.")
+                                    : tr("Export failed: %1").arg(seal_error));
+            return;
+        }
+    }
     ReportStage(ExportStage::Package, 0.9);
 
     // Step 5: Optional, title-scoped support data. Only what was selected for this
@@ -5998,7 +6402,7 @@ void GameExportDialog::OnExport() {
     if (!WriteLicenseNotices(staging_root, uses_aot) ||
         !WriteExportManifest(staging_root, export_id, export_program_id, backend,
                              uses_aot && WantsCompiledOutput(), include_save_data,
-                             include_shader_cache, include_custom_config)) {
+                             include_shader_cache, include_custom_config, portable)) {
         throw std::runtime_error("Could not write the package notices");
     }
 
@@ -6017,6 +6421,7 @@ void GameExportDialog::OnExport() {
     for (const char* dll : kExportRuntimeDlls) {
         expect.runtime_dlls.emplace_back(dll);
     }
+    expect.portable = portable;
     const auto findings = PackagePolicy::ValidateLocalExport(staging->root, expect);
     if (!findings.empty()) {
         for (const auto& finding : findings) {
@@ -6083,9 +6488,13 @@ void GameExportDialog::OnExport() {
     }
     fallback_note += backup_note + steam_note;
     const QString local_note =
-        tr("\n\nThis is a local export. It contains no game files or keys: it starts your "
-           "game file with the keys installed in suyu. Do not upload it to suyu's release or "
-           "support channels.");
+        portable
+            ? tr("\n\nThis is a portable local export. It contains your game file, sealed to "
+                 "this console's keys, and no keys or firmware. On first launch it asks for "
+                 "your keys. Do not upload it to suyu's release or support channels.")
+            : tr("\n\nThis is a local export. It contains no game files or keys: it starts "
+                 "your game file with the keys installed in suyu. Do not upload it to suyu's "
+                 "release or support channels.");
 
     if (!uses_aot) {
         QMessageBox::information(
