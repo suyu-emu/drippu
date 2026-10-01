@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -958,7 +959,6 @@ namespace PortableSeal = Core::Crypto::PortableSeal;
 
 struct PortableSealedFile {
     std::filesystem::path path;
-    bool update = false;
     u64 title_id = 0;
     FileSys::ContentRecordType record_type = FileSys::ContentRecordType::Program;
     u64 size = 0;
@@ -970,6 +970,7 @@ struct PortableSealInfo {
     PortableSeal::CheckValue check{};
     PortableSealedFile base;
     std::vector<PortableSealedFile> updates;
+    std::vector<PortableSealedFile> dlc;
 };
 
 static std::string ReadSmallTextFile(const std::filesystem::path& path) {
@@ -1026,8 +1027,9 @@ static std::optional<PortableSealInfo> ReadPortableSeal(const std::filesystem::p
     if (files == seal.end() || !files->is_array()) {
         return fail("game/seal.json lists no files");
     }
-    static const std::regex kName{R"((base|update-[0-9]{1,2})\.sealed)"};
+    static const std::regex kName{R"((base|update-[0-9]{1,2}|dlc-[0-9]{1,4})\.sealed)"};
     bool has_base = false;
+    std::set<std::pair<u64, FileSys::ContentRecordType>> dlc_records;
     for (const auto& entry : *files) {
         if (!entry.is_object()) {
             return fail("game/seal.json has a malformed file entry");
@@ -1037,8 +1039,11 @@ static std::optional<PortableSealInfo> ReadPortableSeal(const std::filesystem::p
         const std::string role = text(entry, "role");
         const std::string title = text(entry, "title_id");
         const std::string size = text(entry, "size");
-        if (!std::regex_match(name, kName) || (role != "base" && role != "update") ||
-            (role == "base") != (name == PP::kPortableBaseName) || title.size() != 16 ||
+        // The role follows from the name: base.sealed, update-<n>.sealed or dlc-<n>.sealed.
+        const std::string_view name_role = name == PP::kPortableBaseName ? "base"
+                                           : name.starts_with("update-") ? "update"
+                                                                         : "dlc";
+        if (!std::regex_match(name, kName) || role != name_role || title.size() != 16 ||
             size.empty() || size.size() > 20 ||
             !std::all_of(size.begin(), size.end(), [](char c) { return c >= '0' && c <= '9'; }) ||
             !PortableSeal::FromHex(text(entry, "nonce"), file.nonce.data(), file.nonce.size())) {
@@ -1058,15 +1063,22 @@ static std::optional<PortableSealInfo> ReadPortableSeal(const std::filesystem::p
             return fail("game/seal.json has a malformed size for " + name);
         }
         file.path = game_dir / name;
-        file.update = role == "update";
-        if (file.update) {
+        if (role != "base") {
             const auto type = entry.find("record_type");
-            if (type == entry.end() || !type->is_number_integer() || type->get<int>() < 0 ||
-                type->get<int>() >= static_cast<int>(FileSys::ContentRecordType::Count)) {
+            if (type == entry.end() || !type->is_number_integer() ||
+                type->get<std::int64_t>() < 0 ||
+                type->get<std::int64_t>() >=
+                    static_cast<std::int64_t>(FileSys::ContentRecordType::Count)) {
                 return fail("game/seal.json has no content type for " + name);
             }
             file.record_type = static_cast<FileSys::ContentRecordType>(type->get<int>());
-            info.updates.push_back(std::move(file));
+            if (role == "update") {
+                info.updates.push_back(std::move(file));
+            } else if (!dlc_records.emplace(file.title_id, file.record_type).second) {
+                return fail("game/seal.json lists the same DLC content twice");
+            } else {
+                info.dlc.push_back(std::move(file));
+            }
         } else {
             if (has_base) {
                 return fail("game/seal.json lists two game files");
@@ -1077,6 +1089,13 @@ static std::optional<PortableSealInfo> ReadPortableSeal(const std::filesystem::p
     }
     if (!has_base) {
         return fail("game/seal.json lists no game file");
+    }
+    // DLC is accepted only for the sealed game itself.
+    for (const auto& dlc : info.dlc) {
+        if (!PP::IsAddOnContentOf(dlc.title_id, info.base.title_id)) {
+            return fail("game/seal.json lists DLC for another game: " +
+                        Common::FS::PathToUTF8String(dlc.path.filename()));
+        }
     }
     return info;
 }
@@ -2432,11 +2451,26 @@ int main(int argc, char** argv) {
                                 export_user_root.parent_path() / "game", false, {}, "", "");
             return 2;
         }
-        if (!portable_seal->updates.empty()) {
+        // DLC is optional: a sealed DLC file that cannot be opened leaves that DLC out, and
+        // the game runs without it. A wrong key never gets here; it is refused above.
+        std::size_t dlc_entries = 0;
+        for (const auto& dlc : portable_seal->dlc) {
+            auto file = open_sealed(dlc);
+            if (!file) {
+                LOG_WARNING(Frontend, "Sealed DLC file {} is missing or has the wrong size; "
+                                      "continuing without DLC {:016X}",
+                            Common::FS::PathToUTF8String(dlc.path.filename()), dlc.title_id);
+                continue;
+            }
+            explicit_provider.AddEntry(FileSys::TitleType::AOC, dlc.record_type, dlc.title_id,
+                                       std::move(file));
+            ++dlc_entries;
+        }
+        if (!portable_seal->updates.empty() || dlc_entries != 0) {
             system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
                                            &explicit_provider);
-            LOG_INFO(Frontend, "Registered {} sealed update entries",
-                     portable_seal->updates.size());
+            LOG_INFO(Frontend, "Registered {} sealed update entries and {} sealed DLC entries",
+                     portable_seal->updates.size(), dlc_entries);
         }
     }
     if (!explicit_content_base) {
