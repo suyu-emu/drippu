@@ -2683,8 +2683,8 @@ void NextendoAccountDialog::RefreshPlayers() {
         }
         QMetaObject::invokeMethod(
             guard.data(),
-            [this, guard, lobby = std::move(lobby), recent = std::move(recent),
-             avatars = std::move(avatars)]() mutable {
+            [this, guard, lobby_data = std::move(lobby), recent_data = std::move(recent),
+             avatars_data = std::move(avatars)]() mutable {
                 if (!guard) {
                     return;
                 }
@@ -2693,9 +2693,9 @@ void NextendoAccountDialog::RefreshPlayers() {
                 lobby_model->clear();
                 recent_players_model->clear();
 
-                lobby_state_label->setText(lobby.in_lobby ? LobbyStateLine(lobby)
+                lobby_state_label->setText(lobby_data.in_lobby ? LobbyStateLine(lobby_data)
                                                           : tr("Not in a lobby."));
-                for (const auto& player : lobby.players) {
+                for (const auto& player : lobby_data.players) {
                     if (player.known) {
                         known_player_pids.insert(player.pid);
                     }
@@ -2703,10 +2703,10 @@ void NextendoAccountDialog::RefreshPlayers() {
                         player.pid, PlayerDisplayName(player),
                         QString::fromStdString(player.friend_code), player.is_me ? 0 : 2,
                         controller ? controller->ResolveGameName(player.title_id) : QString{},
-                        QString::fromStdString(avatars[player.pid]), false, tr("Add"),
+                        QString::fromStdString(avatars_data[player.pid]), false, tr("Add"),
                         player.is_me));
                 }
-                for (const auto& player : recent) {
+                for (const auto& player : recent_data) {
                     if (player.known) {
                         known_player_pids.insert(player.pid);
                     }
@@ -2714,7 +2714,7 @@ void NextendoAccountDialog::RefreshPlayers() {
                         player.pid, PlayerDisplayName(player),
                         QString::fromStdString(player.friend_code), 0,
                         controller ? controller->ResolveGameName(player.title_id) : QString{},
-                        QString::fromStdString(avatars[player.pid]), false, tr("Add")));
+                        QString::fromStdString(avatars_data[player.pid]), false, tr("Add")));
                 }
 
                 lobby_stack->setCurrentIndex(lobby_model->rowCount() > 0 ? 0 : 1);

@@ -421,9 +421,8 @@ void NextendoController::PollFriends() {
                 }
                 Common::NextendoFriends::Set(std::move(cache));
                 // [Nextendo] The guest's own INotificationService only ever signals once, at
-                // construction -- before this first real poll has a chance to land. Without this,
-                // a Friends viewer already on-screen never learns that real data showed up.
-                Service::Friend::NotifyFriendsListUpdated();
+                // construction -- before this first real poll has a chance to land.
+                // TODO: Signal friends list update when Service::Friend exposes the API.
 
                 const bool suppress_toasts = first_poll;
                 first_poll = false;

@@ -16,6 +16,10 @@ add_library(web_service STATIC
     web_result.h
     nextendo_api.cpp
     nextendo_api.h
+    population_scraper_client.cpp
+    population_scraper_client.h
+    mk8d_country_flags.cpp
+    mk8d_country_flags.h
 )
 
 create_target_directory_groups(web_service)
