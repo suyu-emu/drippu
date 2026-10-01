@@ -64,7 +64,7 @@ def main() -> int:
     args = parser.parse_args()
     result = json.loads(args.result.read_text(encoding="utf-8"))
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
-    if result.get("kind") != "recomp_benchmark" or result.get("schema_version") != 1:
+    if result.get("kind") != "recomp_benchmark" or result.get("schema_version") != 2:
         fail("unexpected result kind/schema")
     thresholds = baseline["thresholds"]
     if args.result.stat().st_size > int(thresholds["max_invalid_json_size_bytes"]):
