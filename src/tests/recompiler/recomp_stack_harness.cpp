@@ -2095,7 +2095,7 @@ void ExportExecutionJson(const fs::path& path) {
     ExpectTrue("JSON icache", json.find("\"icache\"") != std::string::npos);
 
     const auto m = Core::GetRecompExecutionMetrics();
-    ExpectEq("metrics schema", static_cast<u64>(Core::RecompExecutionMetrics::kSchemaVersion), 1);
+    ExpectEq("metrics schema", static_cast<u64>(Core::RecompExecutionMetrics::kSchemaVersion), 2);
     ExpectTrue("AOT block_executions > 0", m.aot_block_executions > 0);
     ExpectTrue("AOT time_ns > 0", m.aot_time_ns > 0);
     ExpectTrue("Dynarmic run+step slices > 0",
