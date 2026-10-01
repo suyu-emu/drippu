@@ -2258,6 +2258,12 @@ static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path,
                                     const std::shared_ptr<FileSys::NSP>& nsp)
         -> FileSys::VirtualFile {
         if (nsp->GetStatus() != Loader::ResultStatus::Success) return nullptr;
+        // An extracted-type NSP holds the ExeFS files and the RomFS directly, as an extracted
+        // folder does, and no update can be paired with it.
+        if (nsp->IsExtractedType()) {
+            const auto romfs = nsp->GetRomFS();
+            return romfs ? validate_base_fallback(nsp->GetExeFS(), romfs, romfs) : nullptr;
+        }
         const auto title_id = nsp->GetProgramTitleID();
         const auto base_nca = nsp->GetNCA(title_id, FileSys::ContentRecordType::Program);
         if (!base_nca || !base_nca->GetRomFS()) {
