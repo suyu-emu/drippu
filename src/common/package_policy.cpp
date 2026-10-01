@@ -1053,10 +1053,33 @@ bool IsGameDataInAotCache(std::string_view relative_lower) {
     return parts.size() == 4 && parts[1] == "exefs" && parts[3] == "main.c";
 }
 
+bool ManifestDeclaresPortable(std::string_view manifest_text) {
+    static const std::regex declared{R"re("package_type"\s*:\s*"portable")re"};
+    return std::regex_search(manifest_text.begin(), manifest_text.end(), declared);
+}
+
 std::vector<Finding> ValidateLocalExport(const fs::path& root,
                                          const LocalExportExpectation& expect) {
     std::vector<Finding> findings;
     std::error_code ec;
+    // Sealed game files belong only to a portable export that says it is one.
+    bool manifest_portable = false;
+    if (const auto manifest =
+            ReadHead(root / fs::path{std::string{kExportManifestName}}, kKeyTextScanLimit)) {
+        manifest_portable = ManifestDeclaresPortable(
+            std::string_view{reinterpret_cast<const char*>(manifest->data()), manifest->size()});
+    }
+    const bool portable =
+        expect.portable && manifest_portable && expect.platform == Platform::Windows;
+    if (expect.portable != manifest_portable) {
+        findings.push_back({std::string{kExportManifestName}, "package-type",
+                            expect.portable ? "the manifest does not declare a portable export"
+                                            : "the manifest declares a portable export"});
+    }
+    const std::string game_dir = NormalizeName(kPortableGameDir);
+    const std::regex sealed_update{R"(update-[0-9]{1,2}\.sealed)"};
+    bool has_base = false;
+    bool has_seal = false;
     const std::string title_lower = ToLower(expect.title_id_hex);
     std::set<std::string> dlls;
     for (const auto& dll : expect.runtime_dlls) {
@@ -1093,6 +1116,9 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
             "user", "user/config", "user/nand", "user/nand/user", "user/nand/user/save",
             "user/cache", "user/cache/shader", "licenses"};
         if (fixed.count(rel)) {
+            return true;
+        }
+        if (portable && rel == game_dir) {
             return true;
         }
         const auto parts = split(rel);
@@ -1138,6 +1164,17 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
                        name == "aot_manifest.json" || name == "discord.ini" || dlls.count(name);
             }
             return false;
+        }
+        if (portable && parts.size() == 2 && parts[0] == game_dir) {
+            if (name == NormalizeName(kPortableSealName)) {
+                has_seal = true;
+                return true;
+            }
+            if (name == NormalizeName(kPortableBaseName)) {
+                has_base = true;
+                return true;
+            }
+            return std::regex_match(name, sealed_update);
         }
         if (parts.size() == 2 && parts[0] == "licenses") {
             return name == "license.txt" || name == "third-party-notices.txt" ||
@@ -1211,6 +1248,10 @@ std::vector<Finding> ValidateLocalExport(const fs::path& root,
     }
     if (ec) {
         findings.push_back({".", "unreadable", "the package could not be listed: " + ec.message()});
+    }
+    if (portable && (!has_base || !has_seal)) {
+        findings.push_back({std::string{kPortableGameDir}, "portable-incomplete",
+                            "a portable export needs its sealed game file and seal.json"});
     }
     return findings;
 }

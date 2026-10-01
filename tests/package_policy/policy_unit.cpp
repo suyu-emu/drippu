@@ -377,6 +377,64 @@ void TestValidation(const fs::path& root) {
     CHECK(RemoveStaging(*source, &error));
 }
 
+void TestPortable(const fs::path& root) {
+    const std::string title = "0100000000010000";
+    std::string error;
+    auto staging = CreateStaging(root / "out-portable", &error);
+    CHECK(staging.has_value());
+    const fs::path pkg = MakePackage(*staging, title);
+    const std::string sealed(0x1000, 'Z');
+    Write(pkg / "game" / "base.sealed", sealed);
+    Write(pkg / "game" / "update-0.sealed", sealed);
+    Write(pkg / "game" / "seal.json", "{\"format\": \"suyu-portable-seal-1\"}\n");
+
+    // Without a portable expectation and manifest, sealed files are not part of an export.
+    {
+        const auto findings = ValidateLocalExport(pkg, Expect(title));
+        CHECK(HasRule(findings, "game", "unexpected"));
+    }
+    auto expect = Expect(title);
+    expect.portable = true;
+    // The exporter's choice alone is not enough: the manifest must declare it too.
+    CHECK(HasRule(ValidateLocalExport(pkg, expect), "export-package.json", "package-type"));
+    Write(pkg / "export-package.json", "{\"schema\": \"" + std::string{kExportManifestSchema} +
+                                           "\",\n  \"package_type\": \"portable\"}\n");
+    CHECK(ManifestDeclaresPortable(Read(pkg / "export-package.json")));
+    CHECK(!ManifestDeclaresPortable("{\"package_type\": \"reference\"}"));
+    CHECK(ValidateLocalExport(pkg, expect).empty());
+    // A manifest that declares a portable export is wrong for any other export.
+    CHECK(HasRule(ValidateLocalExport(pkg, Expect(title)), "export-package.json", "package-type"));
+
+    // A container that is not sealed is still refused, whatever its name.
+    Write(pkg / "game" / "update-1.sealed", "PFS0" + std::string(60, '\0'));
+    Write(pkg / "game" / "game.nsp", "x");
+    Write(pkg / "game" / "notes.txt", "x");
+    Write(pkg / "game" / "prod.keys", KeyText());
+    Write(pkg / "game" / "update-2.sealed", KeyText());
+    {
+        const auto findings = ValidateLocalExport(pkg, expect);
+        CHECK(HasRule(findings, "game/update-1.sealed", "signature"));
+        CHECK(HasRule(findings, "game/game.nsp", "unexpected"));
+        CHECK(HasRule(findings, "game/notes.txt", "unexpected"));
+        CHECK(HasRule(findings, "game/prod.keys", "unexpected"));
+        CHECK(HasRule(findings, "game/update-2.sealed", "key-text"));
+    }
+    for (const char* name : {"update-1.sealed", "game.nsp", "notes.txt", "prod.keys",
+                             "update-2.sealed"}) {
+        fs::remove(pkg / "game" / name);
+    }
+    // Keys are refused anywhere else in a portable export too.
+    Write(pkg / "prod.keys", KeyText());
+    CHECK(HasRule(ValidateLocalExport(pkg, expect), "prod.keys", "unexpected"));
+    fs::remove(pkg / "prod.keys");
+    CHECK(ValidateLocalExport(pkg, expect).empty());
+
+    // Sealed folders only sit at the top of a Windows package, and need both files.
+    fs::remove(pkg / "game" / "seal.json");
+    CHECK(HasRule(ValidateLocalExport(pkg, expect), "game", "portable-incomplete"));
+    CHECK(RemoveStaging(*staging, &error));
+}
+
 void TestPromotion(const fs::path& root) {
     const std::string title = "0100000000010000";
     const fs::path out = root / "out-promote";
@@ -495,6 +553,7 @@ int main(int argc, char** argv) {
     TestLinks(root);
     TestCopy(root);
     TestValidation(root);
+    TestPortable(root);
     TestPromotion(root);
     TestSettings();
     for (const auto& skip : g_skips) {

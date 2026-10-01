@@ -36,6 +36,13 @@ inline constexpr std::string_view kPolicyVersion = "suyu-package-policy-1";
 inline constexpr std::string_view kExportManifestName = "export-package.json";
 inline constexpr std::string_view kExportManifestSchema = "suyu-local-game-export";
 inline constexpr std::size_t kKeyTextScanLimit = 64 * 1024;
+/// "package_type" in the export manifest of a portable export, which carries the user's game
+/// file and installed update NCAs, unchanged and sealed to the exporting console's keys.
+inline constexpr std::string_view kPortablePackageType = "portable";
+/// Where a portable export keeps its sealed files, and their description.
+inline constexpr std::string_view kPortableGameDir = "game";
+inline constexpr std::string_view kPortableSealName = "seal.json";
+inline constexpr std::string_view kPortableBaseName = "base.sealed";
 
 /// Lower-cases ASCII and drops the trailing dots and spaces Windows ignores.
 std::string NormalizeName(std::string_view name);
@@ -165,6 +172,9 @@ struct LocalExportExpectation {
     std::string title_id_hex;              ///< 16 upper-case hex digits
     bool allow_aot_cache = false;          ///< Source-format exports keep the C project
     std::vector<std::string> runtime_dlls; ///< names allowed beside the launcher
+    /// A portable export (Windows layout only): game/ may hold the sealed game file, sealed
+    /// update NCAs (update-<n>.sealed) and seal.json, and the manifest must say so.
+    bool portable = false;
 };
 
 /// True for a path under aot_cache/ that holds the game's own executables or a way to
@@ -172,9 +182,14 @@ struct LocalExportExpectation {
 /// and guest-code dumps. `relative_lower` is lower-case and starts with "aot_cache/".
 bool IsGameDataInAotCache(std::string_view relative_lower);
 
+/// True when the manifest text declares the portable package type.
+bool ManifestDeclaresPortable(std::string_view manifest_text);
+
 /// Walks a complete staging package and reports anything the exporter does
 /// not produce: links, key files or key-shaped text, firmware, stray Nintendo
-/// containers, and files outside the documented layout.
+/// containers, and files outside the documented layout. Sealed game files are
+/// accepted only in a portable export whose manifest declares it; a container
+/// that is not sealed is reported wherever it is.
 std::vector<Finding> ValidateLocalExport(const std::filesystem::path& root,
                                          const LocalExportExpectation& expect);
 
