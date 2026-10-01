@@ -41,6 +41,8 @@ using CheckValue = std::array<u8, 16>;
 std::optional<Key128> DeriveKey(const Key128& sd_seed, std::string_view export_id);
 /// The check value stored beside the sealed files for @p seal_key.
 std::optional<CheckValue> ComputeCheck(const Key128& seal_key);
+/// Compares two check values in constant time.
+bool CheckEquals(const CheckValue& a, const CheckValue& b);
 /// A fresh random nonce for one sealed file.
 std::optional<Nonce> RandomNonce();
 

@@ -180,7 +180,7 @@ void UserManualWidget::LoadDefaultContent() {
         "<h2>Keys and Firmware in Exported Games</h2>"
         "<p>Exports never contain keys or firmware. An exported game reads them from the suyu installed on the same computer: <b>%APPDATA%\\suyu\\keys</b> and <b>%APPDATA%\\suyu\\nand</b> on Windows, or the <b>user</b> folder of a portable suyu. A custom NAND folder is honoured.</p>"
         "<ul>"
-        "<li>If <b>prod.keys</b> is missing, the game shows the exact folder and offers <b>Install keys in suyu</b>, <b>Open folder</b> and <b>Quit</b>. Copying prod.keys into that folder works just as well.</li>"
+        "<li>If <b>prod.keys</b> is missing, the game shows the exact folder and offers <b>Install keys</b>, <b>Open folder</b> and <b>Quit</b>. Copying prod.keys into that folder works just as well.</li>"
         "<li>If firmware is missing, the game warns and offers <b>Continue anyway</b>. Mii screens and some menus may fail without firmware.</li>"
         "</ul>"
         "<h2>Controllers and Input</h2>"

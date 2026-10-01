@@ -15,6 +15,7 @@
 #include <memory>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <stop_token>
 #include <thread>
@@ -1050,7 +1051,12 @@ static std::optional<PortableSealInfo> ReadPortableSeal(const std::filesystem::p
         for (const u8 byte : title_bytes) {
             file.title_id = (file.title_id << 8) | byte;
         }
-        file.size = std::stoull(size);
+        // Twenty digits can still exceed u64; report that as damage, not a crash.
+        try {
+            file.size = std::stoull(size);
+        } catch (const std::out_of_range&) {
+            return fail("game/seal.json has a malformed size for " + name);
+        }
         file.path = game_dir / name;
         file.update = role == "update";
         if (file.update) {
@@ -1103,7 +1109,7 @@ static std::optional<Core::Crypto::Key128> ReadSdSeed(const std::filesystem::pat
 static bool SealMatches(const PortableSealInfo& seal, const Core::Crypto::Key128& sd_seed) {
     const auto key = PortableSeal::DeriveKey(sd_seed, seal.export_id);
     const auto check = key ? PortableSeal::ComputeCheck(*key) : std::nullopt;
-    return check && *check == seal.check;
+    return check && PortableSeal::CheckEquals(*check, seal.check);
 }
 
 /// Asks for prod.keys with the system's file picker. Empty when the user cancels.
@@ -1144,10 +1150,9 @@ static KeySetupChoice AskForKeys(const char* title, const std::string& message,
                                  const std::filesystem::path& suyu_exe) {
     std::vector<SDL_MessageBoxButtonData> buttons;
     buttons.push_back({SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT,
-                       static_cast<int>(KeySetupChoice::Choose), "Choose key files..."});
+                       static_cast<int>(KeySetupChoice::Choose), "Choose keys..."});
     if (!suyu_exe.empty()) {
-        buttons.push_back({0, static_cast<int>(KeySetupChoice::InstallInSuyu),
-                           "Install keys in suyu"});
+        buttons.push_back({0, static_cast<int>(KeySetupChoice::InstallInSuyu), "Install keys"});
     }
     buttons.push_back({SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,
                        static_cast<int>(KeySetupChoice::Quit), "Quit"});
@@ -1244,7 +1249,7 @@ static std::optional<Core::Crypto::Key128> UnlockPortableExport(
         ReportExportProblem(
             "Keys from another console",
             fmt::format("These keys are from a different console than the one this export was "
-                        "made with, so it cannot start. It runs only with the keys of that "
+                        "made with,\nso it cannot start. It runs only with the keys of that "
                         "console.\n\nKeys folder: {}",
                         keys_text),
             keys_dir, false, {}, "", "");
@@ -1256,10 +1261,11 @@ static std::optional<Core::Crypto::Key128> UnlockPortableExport(
         const bool has_prod = std::filesystem::is_regular_file(keys_dir / "prod.keys", ec);
         const char* title = has_prod ? "Keys without sd_seed" : "Missing keys";
         const std::string message = fmt::format(
-            "{}\n\nThis export runs with the keys of the console it was made with. Choose your "
-            "key files (prod.keys, and title.keys if you have it). They are installed for your "
-            "user account in {}, as suyu's Install Decryption Keys does, and used again on later "
-            "launches. They are never copied into this export.",
+            "{}\n\nThis export runs with the keys of the console it was made with.\n"
+            "Choose your key files (prod.keys, and title.keys if you have it).\n\n"
+            "They are installed for your user account in\n{}\n"
+            "as suyu's Install Decryption Keys does, and used again on later launches.\n"
+            "They are never copied into this export.",
             has_prod ? fmt::format("The keys in {} have no sd_seed, which this export needs.",
                                    keys_text)
                      : fmt::format("Missing keys: prod.keys was not found in {}.", keys_text),

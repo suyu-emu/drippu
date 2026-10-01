@@ -5,6 +5,7 @@
 #include <mutex>
 #include <vector>
 
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
 
 #include "core/crypto/ctr_encryption_layer.h"
@@ -69,6 +70,10 @@ std::optional<CheckValue> ComputeCheck(const Key128& seal_key) {
     CheckValue check{};
     std::memcpy(check.data(), hash.data(), check.size());
     return check;
+}
+
+bool CheckEquals(const CheckValue& a, const CheckValue& b) {
+    return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
 std::optional<Nonce> RandomNonce() {
