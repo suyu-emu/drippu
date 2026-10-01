@@ -6381,6 +6381,40 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                 });
 
             mcp_server_->RegisterTool(
+                QStringLiteral("install_content_from_path"),
+                QStringLiteral("Install an NSP (DLC or update) into the NAND the way Install Files does, without dialogs."),
+                QJsonObject{{QStringLiteral("type"), QStringLiteral("object")},
+                            {QStringLiteral("properties"),
+                             QJsonObject{{QStringLiteral("path"),
+                                          QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
+                                                      {QStringLiteral("description"),
+                                                       QStringLiteral("Absolute path to the .nsp file")}}}}},
+                            {QStringLiteral("required"), QJsonArray{QStringLiteral("path")}}},
+                [this](const QJsonObject& params) -> QJsonObject {
+                    const auto path = params[QStringLiteral("path")].toString().toStdString();
+                    if (!QFileInfo(params[QStringLiteral("path")].toString()).isFile()) {
+                        return QJsonObject{{QStringLiteral("result"), QStringLiteral("not_found")}};
+                    }
+                    const auto result = ContentManager::InstallNSP(
+                        *system, *vfs, path, [](size_t, size_t) { return false; });
+                    const char* name = "failure";
+                    switch (result) {
+                    case ContentManager::InstallResult::Success:
+                        name = "success";
+                        break;
+                    case ContentManager::InstallResult::Overwrite:
+                        name = "overwrite";
+                        break;
+                    case ContentManager::InstallResult::BaseInstallAttempted:
+                        name = "base_install_attempted";
+                        break;
+                    case ContentManager::InstallResult::Failure:
+                        break;
+                    }
+                    return QJsonObject{{QStringLiteral("result"), QString::fromLatin1(name)}};
+                });
+
+            mcp_server_->RegisterTool(
                 QStringLiteral("add_game_directory"),
                 QStringLiteral("Add a directory to the game library scan list."),
                 []() -> QJsonObject {

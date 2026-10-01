@@ -16,6 +16,7 @@
 #include <QTcpSocket>
 
 #include "common/fs/path_util.h"
+#include "core/crypto/key_manager.h"
 #include "suyu/mcp_server.h"
 
 namespace {
@@ -300,6 +301,13 @@ void McpServer::RegisterBuiltinTools() {
                 result[QStringLiteral("prod_keys_size")] = prod.exists() ? prod.size() : 0;
                 result[QStringLiteral("title_keys_present")] = title.exists();
                 result[QStringLiteral("title_keys_size")] = title.exists() ? title.size() : 0;
+                // Counts only: tickets read from the NAND ticket store at startup, and how
+                // many of them gave a title key.
+                const auto& key_manager = Core::Crypto::KeyManager::Instance();
+                result[QStringLiteral("installed_tickets")] =
+                    static_cast<qint64>(key_manager.GetInstalledTicketCount());
+                result[QStringLiteral("installed_ticket_title_keys")] =
+                    static_cast<qint64>(key_manager.GetInstalledTitleKeyCount());
                 result[QStringLiteral("external_tool_id")] = ext_tool_id;
                 result[QStringLiteral("external_tool_path")] = ext_tool_path;
                 result[QStringLiteral("external_tool_configured")] = ext_tool_exists;
