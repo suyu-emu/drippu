@@ -193,6 +193,35 @@ def make_romfs() -> bytes:
     return body
 
 
+def make_pfs0(entries) -> bytes:
+    """A PFS0 (the NSP container format) holding the given (name, data) pairs."""
+    names = b""
+    offsets = []
+    for name, _ in entries:
+        offsets.append(len(names))
+        names += name.encode() + b"\x00"
+    names += b"\x00" * (-(0x10 + 0x18 * len(entries) + len(names)) % 0x20)
+    header = b"PFS0" + struct.pack("<III", len(entries), len(names), 0)
+    data = b""
+    table = b""
+    for (name, blob), name_offset in zip(entries, offsets):
+        table += struct.pack("<QQII", len(data), len(blob), name_offset, 0)
+        data += blob
+    return header + table + names + data
+
+
+def write_nsp(path) -> dict:
+    """An extracted-type NSP: a PFS0 with the ExeFS files and the RomFS, no NCAs, no keys.
+
+    suyu loads such a file like an extracted folder, so it boots the same synthetic program
+    while being a single .nsp game file, as a portable export needs."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(make_pfs0([("main", make_nso()), ("main.npdm", make_npdm()),
+                             ("fixture.romfs", make_romfs())]))
+    return {"title_id": TITLE_ID, "marker": MARKER, "size": p.stat().st_size}
+
+
 def write_fixture(directory) -> dict:
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)

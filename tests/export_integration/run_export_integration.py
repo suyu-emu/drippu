@@ -16,6 +16,7 @@ check for the unencrypted synthetic input.
 """
 import argparse
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,27 @@ ROOT = Path(__file__).resolve().parents[2]
 _MADE_UP = '00112233445566778899aabbccddeeff' + 'ffeeddccbbaa99887766554433221100'
 PLACEHOLDER_KEYS = ('# synthetic test placeholder; not a real key\n' +
                     'header_key' + ' = ' + _MADE_UP + '\n')
+# Made-up sd_seed values for two pretend consoles, A and B, which portable exports are sealed
+# to. Assembled the same way; they come from no console.
+SEED_A = '5eed' * 8
+SEED_B = 'b0b0' * 8
+
+
+def keys_with_seed(seed):
+    return PLACEHOLDER_KEYS + 'sd_seed' + ' = ' + seed + '\n'
+
+
+def seal_key(seed, export_id):
+    digest = hmac.new(bytes.fromhex(seed), b'suyu-portable-seal-v1' + export_id.encode(),
+                      hashlib.sha256).digest()
+    return digest[:16]
+
+
+def unseal(data, key, nonce):
+    # AES-128-CTR, counter = nonce (8 bytes) || block index (8 bytes, big-endian), from 0.
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    decryptor = Cipher(algorithms.AES(key), modes.CTR(nonce + bytes(8))).decryptor()
+    return decryptor.update(data) + decryptor.finalize()
 
 
 class Mcp:
@@ -136,7 +158,10 @@ class Run:
         self.open_dialog()
         arguments = {'action': 'aot_test_export', 'rom_path': str(rom or self.fixture),
                      'output_dir': str(output or self.out), 'backend': backend, 'format': fmt,
-                     'include_save': False, 'include_shader': False, 'include_config': False}
+                     'include_save': False, 'include_shader': False, 'include_config': False,
+                     # Named outright: the dialog otherwise uses the choice saved in suyu's
+                     # settings, which belong to the developer's own suyu.
+                     'package': 'reference'}
         arguments.update(options)
         self.mcp.call('trigger_ui_action', arguments)
         deadline = time.time() + timeout
@@ -153,18 +178,19 @@ class Run:
 
     # ---- launcher ----
 
-    def launch(self, package, exe_name, keys=True, timeout=90):
+    def launch(self, package, exe_name, keys=True, timeout=90, keys_text=None, env=None):
         keys_dir = self.work / 'appdata' / 'suyu' / 'keys'
         keys_file = keys_dir / 'prod.keys'
         if keys:
             keys_dir.mkdir(parents=True, exist_ok=True)
-            keys_file.write_text(PLACEHOLDER_KEYS)
+            keys_file.write_text(keys_text or PLACEHOLDER_KEYS)
         elif keys_file.exists():
             keys_file.unlink()
         log_dir = package / 'user' / 'log'
         shutil.rmtree(log_dir, ignore_errors=True)
         try:
-            result = subprocess.run([str(package / exe_name)], env=self.env, cwd=str(package),
+            result = subprocess.run([str(package / exe_name)], env=dict(self.env, **(env or {})),
+                                    cwd=str(package),
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     timeout=timeout, text=True, errors='replace')
             code, output = result.returncode, result.stdout
@@ -188,6 +214,11 @@ class Run:
                     and manifest['contains']['nintendo_keys'] is False
                     and manifest['contains']['system_firmware'] is False,
                     json.dumps(manifest.get('format')))
+        # The default package type, unchanged: it runs the user's game file with their keys.
+        self.record(name + ': default package type', manifest.get('package_type') == 'reference'
+                    and manifest['contains'].get('original_game_file_sealed') is False
+                    and manifest.get('requires_at_launch') == ['user_game_file', 'user_keys']
+                    and not any(n.startswith('game/') for n in names))
         # No game data at all: the package names the user's game file instead.
         self.record(name + ': no game files in the package',
                     not any(n.startswith('exefs/') or n.endswith('romfs.bin') for n in names)
@@ -255,6 +286,129 @@ class Run:
         record.write_text(original)
         keys.write_text(PLACEHOLDER_KEYS)
 
+    def portable_scenarios(self):
+        """Portable package: the synthetic NSP copied in, sealed to console A's sd_seed."""
+        nsp = self.work / 'games' / 'SynthNsp.nsp'
+        nsp_info = make_fixture.write_nsp(nsp)
+        out = self.work / 'out-portable'
+        status = self.export('dynarmic', 'build', rom=nsp, output=out, package='portable')
+        self.record('portable: export succeeds', status.get('success'), status.get('status', ''))
+        if not status.get('success'):
+            return
+        package = Path(status['output_path'])
+        exe = package.name + '.exe'
+        self.record('portable: no staging left behind', not self.staging_leftovers(out))
+        manifest = json.loads((package / 'export-package.json').read_text())
+        self.record('portable: manifest', manifest.get('package_type') == 'portable'
+                    and manifest['contains'].get('original_game_file_sealed') is True
+                    and manifest['contains']['nintendo_keys'] is False
+                    and manifest['contains']['system_firmware'] is False
+                    and manifest.get('requires_at_launch') == ['user_keys_for_this_console'],
+                    json.dumps(manifest.get('requires_at_launch')))
+        names = set(snapshot(package))
+        seal = json.loads((package / 'game' / 'seal.json').read_text())
+        game_files = sorted(n for n in names if n.startswith('game/'))
+        self.record('portable: sealed layout', game_files == ['game/base.sealed', 'game/seal.json']
+                    and [f['name'] for f in seal['files']] == ['base.sealed'],
+                    ', '.join(game_files))
+        sealed = (package / 'game' / 'base.sealed').read_bytes()
+        original = nsp.read_bytes()
+        self.record('portable: sealed size matches the game file',
+                    len(sealed) == nsp_info['size'] == int(seal['files'][0]['size']))
+        self.record('portable: no container signature in the sealed file',
+                    sealed[:4] != b'PFS0' and sealed[0x100:0x104] != b'HEAD' and sealed != original)
+        export_id = manifest['export_id']
+        key = seal_key(SEED_A, export_id)
+        check = hmac.new(key, b'check', hashlib.sha256).digest()[:16].hex()
+        self.record('portable: seal check value', seal.get('check') == check
+                    and seal.get('export_id') == export_id)
+        try:
+            unsealed = unseal(sealed, key, bytes.fromhex(seal['files'][0]['nonce']))
+            self.record('portable: unsealing gives the game file byte for byte',
+                        unsealed == original)
+        except ImportError:
+            self.record('portable: unsealing gives the game file byte for byte', False,
+                        'the cryptography package is needed for this check')
+        stored = ''.join((package / n).read_bytes().decode('latin-1').lower()
+                         for n in names if n != 'game/base.sealed')
+        self.record('portable: no seed or seal key stored',
+                    SEED_A not in stored and key.hex() not in stored)
+        bad = [n for n in names if n.lower().endswith(('.keys', '.nsp', '.xci', '.nca'))
+               or n.lower().startswith(('user/nand/system', 'user/keys'))]
+        self.record('portable: no keys, firmware or plain containers', not bad, ', '.join(bad))
+        self.record('portable: records no game file path',
+                    'user/config/game-source.ini' not in names and
+                    str(self.work) not in json.dumps(manifest) + json.dumps(seal))
+
+        marker = self.fixture_info['marker']
+        keys_file = self.work / 'appdata' / 'suyu' / 'keys' / 'prod.keys'
+        # Console A's keys installed for this user: the package runs.
+        code, output, log = self.launch(package, exe, keys_text=keys_with_seed(SEED_A))
+        self.record('portable launcher: runs with this console\'s keys', marker in log,
+                    'exit=%s' % code)
+        # Moved elsewhere, it still runs: it needs no game file outside itself.
+        moved = self.work / 'moved' / 'Relocated portable'
+        moved.parent.mkdir(exist_ok=True)
+        shutil.move(str(package), str(moved))
+        hidden = nsp.with_suffix('.hidden')
+        nsp.rename(hidden)
+        code, output, log = self.launch(moved, exe, keys_text=keys_with_seed(SEED_A))
+        self.record('portable launcher: runs after moving, without the original game file',
+                    marker in log, 'exit=%s' % code)
+        hidden.rename(nsp)
+        shutil.move(str(moved), str(package))
+        # Another console's keys are refused, and nothing is decrypted.
+        code, output, log = self.launch(package, exe, keys_text=keys_with_seed(SEED_B))
+        self.record('portable launcher: refuses keys from another console',
+                    code == 2 and 'different console' in log and marker not in log,
+                    'exit=%s' % code)
+        # Keys without an sd_seed: a clear refusal.
+        code, output, log = self.launch(package, exe, keys_text=PLACEHOLDER_KEYS)
+        self.record('portable launcher: refuses keys without sd_seed',
+                    code == 2 and 'Keys without sd_seed' in log and marker not in log,
+                    'exit=%s' % code)
+        # Keys put inside the package are never used...
+        for folder in (package, package / 'user' / 'keys'):
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / 'prod.keys').write_text(keys_with_seed(SEED_A))
+        code, output, log = self.launch(package, exe, keys=False)
+        self.record('portable launcher: ignores keys inside the package',
+                    code == 2 and 'Missing keys' in log and marker not in log
+                    and not keys_file.exists(), 'exit=%s' % code)
+        # ...nor installed from there by the first-run setup.
+        code, output, log = self.launch(package, exe, keys=False,
+                                        env={'SUYU_CMD_SETUP_KEYS_FROM': str(package)})
+        self.record('portable setup: refuses key files inside the package',
+                    code == 2 and 'never used' in log and not keys_file.exists(),
+                    'exit=%s' % code)
+        (package / 'prod.keys').unlink()
+        shutil.rmtree(package / 'user' / 'keys')
+        # The first-run setup checks the chosen keys belong to the console the export was made
+        # with, then installs them into the per-user keys folder, never into the package.
+        other = self.work / 'other-console-keys'
+        other.mkdir()
+        (other / 'prod.keys').write_text(keys_with_seed(SEED_B))
+        code, output, log = self.launch(package, exe, keys=False,
+                                        env={'SUYU_CMD_SETUP_KEYS_FROM': str(other / 'prod.keys')})
+        self.record('portable setup: refuses keys from another console',
+                    code == 2 and 'different console' in log and not keys_file.exists(),
+                    'exit=%s' % code)
+        mine = self.work / 'my-console-keys'
+        mine.mkdir()
+        (mine / 'prod.keys').write_text(keys_with_seed(SEED_A))
+        code, output, log = self.launch(package, exe, keys=False,
+                                        env={'SUYU_CMD_SETUP_KEYS_FROM': str(mine / 'prod.keys')})
+        self.record('portable setup: installs the user\'s keys for this user and runs',
+                    marker in log and keys_file.exists()
+                    and keys_file.read_text() == keys_with_seed(SEED_A)
+                    and not any(n.lower().endswith('.keys') for n in snapshot(package)),
+                    'exit=%s' % code)
+        # Later launches use the installed keys without asking again.
+        code, output, log = self.launch(package, exe, keys_text=keys_file.read_text())
+        self.record('portable launcher: later launches use the installed keys',
+                    marker in log and 'Missing keys' not in log, 'exit=%s' % code)
+        keys_file.write_text(PLACEHOLDER_KEYS)
+
     def zip_of(self, package):
         target = self.work / 'zips' / (package.name + '.zip')
         target.parent.mkdir(exist_ok=True)
@@ -274,7 +428,8 @@ class Run:
         # header_key loaded, so the placeholder is installed before it starts.
         keys_dir = self.work / 'appdata' / 'suyu' / 'keys'
         keys_dir.mkdir(parents=True)
-        (keys_dir / 'prod.keys').write_text(PLACEHOLDER_KEYS)
+        # suyu reads its keys once, at start; console A's sd_seed lets it make portable exports.
+        (keys_dir / 'prod.keys').write_text(keys_with_seed(SEED_A))
         registry_before = registry_dump()
         self.start_suyu()
         try:
@@ -411,6 +566,8 @@ class Run:
             self.record('dirty input refused (%s)' % backend, not status.get('success') and not leftovers
                         and 'notes.txt' in status.get('status', '') and 'prod.keys' in status.get('status', ''),
                         status.get('status', ''))
+
+        self.portable_scenarios()
 
         if a.skip_aot:
             return
