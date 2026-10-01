@@ -49,6 +49,8 @@ add_library(core STATIC
     crypto/key_manager.h
     crypto/partition_data_manager.cpp
     crypto/partition_data_manager.h
+    crypto/portable_seal.cpp
+    crypto/portable_seal.h
     crypto/xts_encryption_layer.cpp
     crypto/xts_encryption_layer.h
     debugger/debugger.cpp
