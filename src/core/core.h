@@ -213,6 +213,18 @@ public:
                                           Service::AM::FrontendAppletParameters& params);
 
     /**
+     * Load an executable application from an already opened file, such as a view that
+     * decrypts another file. It is also used as the game card when the current game is
+     * inserted as one.
+     * @param emu_window Reference to the host-system window used for video output.
+     * @param game_file The application's container or executable.
+     * @returns SystemResultStatus code, indicating if the operation succeeded.
+     */
+    [[nodiscard]] SystemResultStatus Load(Frontend::EmuWindow& emu_window,
+                                          FileSys::VirtualFile game_file,
+                                          Service::AM::FrontendAppletParameters& params);
+
+    /**
      * Indicates if the emulated system is powered on (all subsystems initialized and able to run an
      * application).
      * @returns True if the emulated system is powered on, otherwise false.
