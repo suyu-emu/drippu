@@ -197,15 +197,18 @@ private:
     /// Whether a portable package can be made for the current selection; when it cannot,
     /// @p reason says why.
     bool PortableAvailable(QString* reason) const;
-    /// The game file and installed update NCAs a portable export carries, with their size.
+    /// The game file and installed update and DLC NCAs a portable export carries, with their
+    /// size.
     struct SealSource {
         QString name;        ///< file name inside game/
-        QString role;        ///< "base" or "update"
+        QString role;        ///< "base", "update" or "dlc"
         quint64 title_id{};
-        int record_type{-1}; ///< ContentRecordType of an update NCA
+        int record_type{-1}; ///< ContentRecordType of an update or DLC NCA
         FileSys::VirtualFile file;
     };
     std::vector<SealSource> PortableSources(QString* error) const;
+    /// The selected game's DLC installed in suyu's NAND, every NCA of each DLC title.
+    std::vector<SealSource> InstalledDlcSources() const;
     /// Copies @p sources into <package_root>/game, sealed, and writes seal.json. Returns false
     /// with @p error set on failure, or with @p cancelled set when the user stopped it.
     bool SealGameFiles(const std::vector<SealSource>& sources, const QString& package_root,
@@ -306,6 +309,8 @@ private:
     QLabel* content_label{};
     QLabel* update_status_label{};
     QLabel* update_source_label{};
+    /// The selected game's installed DLC, which portable exports carry.
+    QLabel* dlc_status_label{};
     QPushButton* install_update_button{};
     QLabel* coverage_status_label{};
     QPushButton* export_coverage_button{};

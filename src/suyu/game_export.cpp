@@ -49,7 +49,9 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <iterator>
 #include <map>
+#include <set>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -366,6 +368,9 @@ void GameExportDialog::SetupUi() {
     update_source_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
     update_source_label->setVisible(false);
     layout->addWidget(update_source_label);
+    // DLC row: the game's DLC installed in suyu. Portable exports carry it, sealed; the default
+    // export reads it from the installed suyu at each launch.
+    dlc_status_label = add_status_row(tr("DLC:"));
 
     // Coverage row: what earlier Hybrid runs of this game recorded (recomp_gaps.json in the
     // suyu user folder), which the export feeds back in and which says whether a static
@@ -1543,34 +1548,79 @@ std::vector<GameExportDialog::SealSource> GameExportDialog::PortableSources(QStr
                        QStringLiteral("base"), program_id, -1, std::move(base)});
     // The installed update the export uses, as suyu installed it: its NCAs from the NAND, still
     // in their original encryption. An update packed in the game file travels inside it.
-    const FileSys::PatchManager pm{program_id, system_.GetFileSystemController(),
-                                   system_.GetContentProvider()};
-    if (!pm.GetUpdateSelection().installed_exefs) {
+    const auto add_update = [&]() -> bool {
+        const FileSys::PatchManager pm{program_id, system_.GetFileSystemController(),
+                                       system_.GetContentProvider()};
+        if (!pm.GetUpdateSelection().installed_exefs) {
+            return true;
+        }
+        const auto update = pm.GetExeFSUpdate();
+        using Slot = FileSys::ContentProviderUnionSlot;
+        if (!update || !update->slot || (*update->slot != Slot::UserNAND &&
+                                         *update->slot != Slot::SysNAND)) {
+            return true;
+        }
+        const auto* provider = system_.GetContentProviderUnion().GetSlotProvider(*update->slot);
+        if (provider == nullptr) {
+            return true;
+        }
+        const u64 update_id = FileSys::GetUpdateTitleID(program_id);
+        int index = 0;
+        for (const auto type :
+             {FileSys::ContentRecordType::Meta, FileSys::ContentRecordType::Program,
+              FileSys::ContentRecordType::Data, FileSys::ContentRecordType::Control,
+              FileSys::ContentRecordType::HtmlDocument,
+              FileSys::ContentRecordType::LegalInformation}) {
+            if (auto file = provider->GetEntryRaw(update_id, type)) {
+                sources.push_back({QStringLiteral("update-%1.sealed").arg(index++),
+                                   QStringLiteral("update"), update_id, static_cast<int>(type),
+                                   std::move(file)});
+            } else if (type == FileSys::ContentRecordType::Program) {
+                *error = tr("the installed update's program could not be opened");
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!add_update()) {
+        return {};
+    }
+    auto dlc = InstalledDlcSources();
+    sources.insert(sources.end(), std::make_move_iterator(dlc.begin()),
+                   std::make_move_iterator(dlc.end()));
+    return sources;
+}
+
+std::vector<GameExportDialog::SealSource> GameExportDialog::InstalledDlcSources() const {
+    // Each DLC title of the game installed in suyu's NAND, and all of its NCAs as suyu installed
+    // them, in their original encryption. Nothing is decrypted or extracted here.
+    std::vector<SealSource> sources;
+    const u64 program_id = SelectedProgramId();
+    if (program_id == 0) {
         return sources;
     }
-    const auto update = pm.GetExeFSUpdate();
     using Slot = FileSys::ContentProviderUnionSlot;
-    if (!update || !update->slot || (*update->slot != Slot::UserNAND &&
-                                     *update->slot != Slot::SysNAND)) {
-        return sources;
+    const auto& content = system_.GetContentProviderUnion();
+    std::map<u64, const FileSys::ContentProvider*> titles;
+    for (const auto slot : {Slot::UserNAND, Slot::SysNAND}) {
+        const auto* provider = content.GetSlotProvider(slot);
+        if (provider == nullptr) {
+            continue;
+        }
+        for (const auto& entry : provider->ListEntriesFilter(FileSys::TitleType::AOC)) {
+            if (PackagePolicy::IsAddOnContentOf(entry.title_id, program_id)) {
+                titles.try_emplace(entry.title_id, provider);
+            }
+        }
     }
-    const auto* provider = system_.GetContentProviderUnion().GetSlotProvider(*update->slot);
-    if (provider == nullptr) {
-        return sources;
-    }
-    const u64 update_id = FileSys::GetUpdateTitleID(program_id);
     int index = 0;
-    for (const auto type :
-         {FileSys::ContentRecordType::Meta, FileSys::ContentRecordType::Program,
-          FileSys::ContentRecordType::Data, FileSys::ContentRecordType::Control,
-          FileSys::ContentRecordType::HtmlDocument, FileSys::ContentRecordType::LegalInformation}) {
-        if (auto file = provider->GetEntryRaw(update_id, type)) {
-            sources.push_back({QStringLiteral("update-%1.sealed").arg(index++),
-                               QStringLiteral("update"), update_id, static_cast<int>(type),
-                               std::move(file)});
-        } else if (type == FileSys::ContentRecordType::Program) {
-            *error = tr("the installed update's program could not be opened");
-            return {};
+    for (const auto& [title_id, provider] : titles) {
+        for (int type = 0; type < static_cast<int>(FileSys::ContentRecordType::Count); ++type) {
+            if (auto file =
+                    provider->GetEntryRaw(title_id, static_cast<FileSys::ContentRecordType>(type))) {
+                sources.push_back({QStringLiteral("dlc-%1.sealed").arg(index++),
+                                   QStringLiteral("dlc"), title_id, type, std::move(file)});
+            }
         }
     }
     return sources;
@@ -1600,6 +1650,20 @@ void GameExportDialog::RefreshPackageStatus() {
     } else {
         game_file_status_label->setText(tr("Not found: %1").arg(rom_path));
     }
+    if (dlc_status_label) {
+        std::set<quint64> dlc_titles;
+        quint64 dlc_size = 0;
+        for (const auto& source : InstalledDlcSources()) {
+            dlc_titles.insert(source.title_id);
+            dlc_size += source.file->GetSize();
+        }
+        dlc_status_label->setText(
+            dlc_titles.empty()
+                ? tr("None installed")
+                : tr("%1 installed (%2) — included in portable exports")
+                      .arg(dlc_titles.size())
+                      .arg(QLocale().formattedDataSize(static_cast<qint64>(dlc_size))));
+    }
 
     QString reason;
     const bool available = PortableAvailable(&reason);
@@ -1612,10 +1676,10 @@ void GameExportDialog::RefreshPackageStatus() {
     const bool portable = package_type_combo->currentIndex() == 1;
     if (content_label) {
         content_label->setText(
-            portable ? tr("This export contains your game file and its installed update, sealed "
-                          "to this console's keys. Keys and system firmware are never copied. "
-                          "Do not upload exports or their logs to suyu's release or support "
-                          "channels.")
+            portable ? tr("This export contains your game file and any installed update and "
+                          "DLC, sealed to this console's keys. Keys and system firmware are "
+                          "never copied. Do not upload exports or their logs to suyu's release "
+                          "or support channels.")
                      : tr("An export does not contain the game. Each launch reads the game file "
                           "you selected and decrypts it with your own installed keys; AOT "
                           "exports (Source too) contain code translated from it. Keys and "
@@ -1637,13 +1701,21 @@ void GameExportDialog::RefreshPackageStatus() {
     for (const auto& source : sources) {
         extra += source.file->GetSize();
     }
-    const bool with_update = sources.size() > 1;
+    const auto has_role = [&sources](const QString& role) {
+        return std::any_of(sources.begin(), sources.end(),
+                           [&role](const SealSource& source) { return source.role == role; });
+    };
+    const bool with_update = has_role(QStringLiteral("update"));
+    const bool with_dlc = has_role(QStringLiteral("dlc"));
     package_note_label->setText(
         tr("The game file%1 is copied as it is, in its original encryption, and sealed to this "
            "console's keys. On first launch the export asks for your keys and remembers them on "
            "that PC. Keys and firmware are never copied into the export and must come from a "
            "Switch you own. Adds about %2 to the export.")
-            .arg(with_update ? tr(" and its installed update") : QString{},
+            .arg(with_update && with_dlc ? tr(" and its installed update and DLC")
+                 : with_update           ? tr(" and its installed update")
+                 : with_dlc              ? tr(" and its installed DLC")
+                                         : QString{},
                  QLocale().formattedDataSize(static_cast<qint64>(extra))) +
         (error.isEmpty() ? QString{} : QStringLiteral(" ") + tr("Note: %1.").arg(error)));
 }
@@ -5740,7 +5812,7 @@ static QString Latin1(std::string_view text) {
 static bool WriteExportManifest(const QString& package_root, const QString& export_id,
                                 u64 program_id, GameExportDialog::RecompileBackend backend,
                                 bool compiled, bool saves, bool shader_cache, bool settings,
-                                bool portable) {
+                                bool portable, int dlc_count) {
     const bool uses_aot = backend != GameExportDialog::RecompileBackend::Dynarmic;
     QJsonObject manifest;
     manifest[QStringLiteral("schema")] = Latin1(PackagePolicy::kExportManifestSchema);
@@ -5767,6 +5839,12 @@ static bool WriteExportManifest(const QString& package_root, const QString& expo
         {QStringLiteral("nintendo_keys"), false},
         {QStringLiteral("system_firmware"), false},
     };
+    if (portable) {
+        // The number of DLC titles sealed in game/ beside the game file.
+        auto contains = manifest[QStringLiteral("contains")].toObject();
+        contains[QStringLiteral("dlc_count")] = dlc_count;
+        manifest[QStringLiteral("contains")] = contains;
+    }
     // What it needs each time it runs, supplied by the user. A portable export carries the
     // game file, sealed, and runs only with keys from the console it was made with.
     manifest[QStringLiteral("requires_at_launch")] =
@@ -6402,10 +6480,17 @@ void GameExportDialog::OnExport() {
     }
 
     const QString export_id = QString::fromStdString(staging->id);
+    std::set<quint64> dlc_titles;
+    for (const auto& source : seal_sources) {
+        if (source.role == QStringLiteral("dlc")) {
+            dlc_titles.insert(source.title_id);
+        }
+    }
     if (!WriteLicenseNotices(staging_root, uses_aot) ||
         !WriteExportManifest(staging_root, export_id, export_program_id, backend,
                              uses_aot && WantsCompiledOutput(), include_save_data,
-                             include_shader_cache, include_custom_config, portable)) {
+                             include_shader_cache, include_custom_config, portable,
+                             static_cast<int>(dlc_titles.size()))) {
         throw std::runtime_error("Could not write the package notices");
     }
 
