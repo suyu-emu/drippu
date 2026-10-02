@@ -1011,6 +1011,18 @@ static bool ReadCachedFallbackPolicy(const QByteArray& manifest, bool requested,
     return true;
 }
 
+// SUYU_AOT_JIT_MODULES=main,sdk leaves the named modules to the JIT in a Hybrid
+// export without recompiling them. A module whose code links past the 2 GB
+// image limit (TOTK's main) can't be in the image at all.
+static QStringList RequestedJitModules() {
+    QStringList names;
+    for (const auto& name : qEnvironmentVariable("SUYU_AOT_JIT_MODULES")
+                                .split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        names.append(name.trimmed());
+    }
+    return names;
+}
+
 static bool WritePortableVersionOverride(const QString& config_path, u32 app_version,
                                          const QString& display_version) {
     const bool has_override = app_version != 0 || !display_version.isEmpty();
@@ -3530,8 +3542,12 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 (coverage_fingerprint.isEmpty() &&
                  !contents.contains(QStringLiteral("\"coverage_fingerprint\"")));
             QStringList cached_fallback_modules;
-            const bool same_fallback_policy = ReadCachedFallbackPolicy(
+            bool same_fallback_policy = ReadCachedFallbackPolicy(
                 manifest_bytes, fallback_enabled, cached_fallback_modules);
+            for (const auto& name : RequestedJitModules()) {
+                same_fallback_policy =
+                    same_fallback_policy && cached_fallback_modules.contains(name);
+            }
             if (same_scan && same_backend && same_image_abi && same_image_features &&
                 same_correctness_revision && same_coverage &&
                 same_translate_all && same_source && same_fallback_policy &&
@@ -3759,6 +3775,18 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         lifted_code_bytes += mod.text_bytes.size();
         const QString mod_dir = recomp_root + QDir::separator() + mod.name;
         QDir().mkpath(mod_dir);
+        if (fallback_enabled && RequestedJitModules().contains(mod.name)) {
+            QFile stub(mod_dir + QDir::separator() + QStringLiteral("CMakeLists.txt"));
+            if (stub.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream o(&stub);
+                o << "# Module " << mod.name << " left to dynarmic JIT (SUYU_AOT_JIT_MODULES).\n"
+                     "message(STATUS \"[fallback] " << mod.name << " uses dynarmic\")\n";
+            }
+            fallback_modules.append(mod.name);
+            LOG_WARNING(Frontend, "Module {} left to dynarmic JIT by SUYU_AOT_JIT_MODULES",
+                        mod.name.toStdString());
+            continue;
+        }
 
         std::vector<u64> exported_roots = CollectExportedSymbolAddresses(mod);
         {
