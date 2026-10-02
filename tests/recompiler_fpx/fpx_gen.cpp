@@ -113,7 +113,11 @@ int main(int argc, char** argv) {
     // Only the fpx ops count their fast-path hits.
     const std::string probe = "extern unsigned long long g_fpx_probe[3];\n"
                               "#define RECOMP_FPX_PROBE(k) (++g_fpx_probe[k])\n";
-    if (!edited || !Write(dir / "rt_fpx.h", probe + fpx) || !Write(dir / "rt_nokeep.h", nokeep) ||
+    // The out-of-line exact bodies the FPX1 sites (and both controls) call, as
+    // the FPX1 runtime C defines them.
+    if (!edited || !Write(dir / "rt_fpx.h", probe + fpx) ||
+        !Write(dir / "fpx_exact.c", "#include \"rt_fpx.h\"\n" + suyu::recomp::FpxExactC()) ||
+        !Write(dir / "rt_nokeep.h", nokeep) ||
         !Write(dir / "rt_nomid.h", nomid) || !Ops(dir, "fpx", "rt_fpx.h") ||
         !Ops(dir, "nokeep", "rt_nokeep.h") || !Ops(dir, "nomid", "rt_nomid.h")) {
         return 1;

@@ -472,8 +472,9 @@ inline std::string Xsp(u32 r) {
 // The integer value emitter is the reference on every host. With FPX1 each
 // covered op first tries recomp_fpx_<op> (recomp_runtime.h), which computes
 // natively and answers 0 unless the result is provably exact (see the FPX1
-// block of the runtime header); the exact body is the fallback. The prefix
-// opens a do{ ... }while(0) whose break skips the exact body, and
+// block of the runtime header); the exact body is the fallback. FPX1 sites call
+// it out of line (EmitFPOutlined). Inline, as the shadow build keeps it, the
+// prefix opens a do{ ... }while(0) whose break skips the exact body, and
 // EmitFPNativeSuffix closes it. `op` names the helper: add, sub, mul, div,
 // fma, recps, rsqrts (raw inputs _aa/_bb) or sqrt (input _a).
 inline std::string FpxArgs(const char* op) {
@@ -492,6 +493,24 @@ inline std::string EmitFPNativeValue(bool dbl, const char* op) {
     return "do{if(RECOMP_FPX_OPEN(c)&&RECOMP_LIKELY(" + call +
            ",&_v))){RECOMP_FPX_PROBE(1);break;}RECOMP_FPX_PROBE(2);";
 }
+// FPX1 sites call the exact body out of line: recomp_fpe_<op>{32,64}, defined
+// once per module in the runtime C (FpxExactC). Inlining it per site made the
+// exact bodies about 55% of a large title's code (TotK main: 672k sites at
+// ~1.4 KB each, past the 2 GB image limit), and that code only runs when the
+// gate is closed or the native result is not provably exact. The fast path
+// stays inline and unchanged. The shadow build keeps the bodies inline.
+inline bool FpxOutline() {
+    return g_emit_fpx && !g_emit_fpx_shadow;
+}
+// The outlined site: `_v` and the operands are declared by the caller. FMUL's
+// exact body is the multiply-add with the caller's sign-matched zero addend.
+inline std::string EmitFPOutlined(bool dbl, const char* op) {
+    const char* exact = std::strcmp(op, "mul") ? op : "fma";
+    const char* width = dbl ? "64(" : "32(";
+    return std::string("{if(RECOMP_FPX_OPEN(c)&&RECOMP_LIKELY(recomp_fpx_") + op + width +
+           FpxArgs(op) + ",&_v))){RECOMP_FPX_PROBE(1);}else{RECOMP_FPX_PROBE(2);_v=recomp_fpe_" + exact +
+           width + "c," + FpxArgs(exact) + ");}}";
+}
 inline std::string EmitFPNativeSuffix(bool dbl, const char* op) {
     if (!g_emit_fpx) return {};
     if (g_emit_fpx_shadow) {
@@ -509,8 +528,10 @@ inline std::string EmitFPNativeSuffix(bool dbl, const char* op) {
     return "}while(0);";
 }
 
-inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
-    return EmitFPNativeValue(dbl, subtract ? "sub" : "add") +
+// `exact_only`: the bare exact body, for the out-of-line helpers.
+inline std::string EmitFPAddSubValue(bool dbl, bool subtract, bool exact_only = false) {
+    if (!exact_only && FpxOutline()) return EmitFPOutlined(dbl, subtract ? "sub" : "add");
+    return (exact_only ? std::string() : EmitFPNativeValue(dbl, subtract ? "sub" : "add")) +
         "{ const unsigned _f=" + std::string(dbl?"52":"23") +
         ";const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
         (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
@@ -545,14 +566,15 @@ inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
         "if(_rounded>=(_hidden<<1)){_rounded>>=1;++_ea;}"
         "if(_ea>=(unsigned)(_exp>>_f)){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_sa)||(_mode==2&&_sa))?_exp:_exp-1;}"
         "else _v=((_rounded>=_hidden?(uint64_t)_ea:0)<<_f)|(_rounded&_frac);}"
-        "if(_sa)_v|=_sign;}}}" + EmitFPNativeSuffix(dbl, subtract ? "sub" : "add");
+        "if(_sa)_v|=_sign;}}}" + (exact_only ? std::string() : EmitFPNativeSuffix(dbl, subtract ? "sub" : "add"));
 }
 
 // Generated exact product/addend lattice. Inputs _a,_b,_z and output _v are
 // IEEE bit patterns. A multiply supplies a same-sign zero addend so its zero
 // result has the product sign in every rounding mode.
-inline std::string EmitFPDivideValue(bool dbl) {
-    return EmitFPNativeValue(dbl, "div") +
+inline std::string EmitFPDivideValue(bool dbl, bool exact_only = false) {
+    if (!exact_only && FpxOutline()) return EmitFPOutlined(dbl, "div");
+    return (exact_only ? std::string() : EmitFPNativeValue(dbl, "div")) +
         "{ const unsigned _f="+std::string(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+R"C(;
 const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
 const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
@@ -591,7 +613,7 @@ else {
  }
 }
 }
-)C" + EmitFPNativeSuffix(dbl, "div");
+)C" + (exact_only ? std::string() : EmitFPNativeSuffix(dbl, "div"));
 }
 
 // Architectural reciprocal estimate. The estimate is deliberately computed
@@ -664,8 +686,9 @@ else {
 
 // `mul` marks a multiply (FMUL/FNMUL), whose addend is the sign-matched zero
 // the caller supplies: the fast path then needs no fused multiply-add.
-inline std::string EmitFPMulAddValue(bool dbl, bool mul = false) {
-    std::string s=EmitFPNativeValue(dbl, mul ? "mul" : "fma")+
+inline std::string EmitFPMulAddValue(bool dbl, bool mul = false, bool exact_only = false) {
+    if (!exact_only && FpxOutline()) return EmitFPOutlined(dbl, mul ? "mul" : "fma");
+    std::string s=(exact_only ? std::string() : EmitFPNativeValue(dbl, mul ? "mul" : "fma"))+
         "{ const unsigned _f="+std::string(dbl?"52":"23")+
         ",_bias="+(dbl?"1023":"127")+",_count="+(dbl?"67":"9")+
         "; const int _base="+(dbl?"-2148":"-298")+"; uint64_t _p["+
@@ -730,7 +753,7 @@ else {
 }
 }
 )C";
-    s += EmitFPNativeSuffix(dbl, mul ? "mul" : "fma");
+    if (!exact_only) s += EmitFPNativeSuffix(dbl, mul ? "mul" : "fma");
     return s;
 }
 
@@ -742,7 +765,10 @@ else {
 // halve can introduce double rounding. Baseline FP modes only: exception/
 // access trap delivery and FEAT_AFP remain unsupported. The line breaks match
 // what put() emits, so the scalar text is unchanged by sharing it.
-inline std::string EmitFPStepValue(bool dbl, bool half) {
+inline std::string EmitFPStepValue(bool dbl, bool half, bool exact_only = false) {
+    if (!exact_only && FpxOutline()) {
+        return "uint64_t _v=0;" + EmitFPOutlined(dbl, half ? "rsqrts" : "recps");
+    }
     std::string s = std::string("const unsigned _f=")+(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+
             ",_count="+(dbl?"67":"9")+";const int _base="+
             std::to_string((dbl?-2148:-298)-(half?1:0))+";"
@@ -750,7 +776,8 @@ inline std::string EmitFPStepValue(bool dbl, bool half) {
             (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
             (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
             // FPNeg precedes NaN processing in the architectural pseudocode.
-            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;"+EmitFPNativeValue(dbl,half?"rsqrts":"recps")+
+            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;"+
+            (exact_only ? std::string() : EmitFPNativeValue(dbl,half?"rsqrts":"recps"))+
             "unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
             "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
             "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
@@ -796,8 +823,113 @@ inline std::string EmitFPStepValue(bool dbl, bool half) {
             "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
             "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
             "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
-            "if(_negative)_v|=_sign;}}}"+EmitFPNativeSuffix(dbl,half?"rsqrts":"recps");
+            "if(_negative)_v|=_sign;}}}"+
+            (exact_only ? std::string() : EmitFPNativeSuffix(dbl,half?"rsqrts":"recps"));
     return s;
+}
+
+// FSQRT/FABD lane text from raw uint64_t _a/_b to _v, after the FPX prefix:
+// constants, FZ input flushing and NaN propagation. FSQRT continues with
+// EmitFPSqrtTail, FABD with an exact subtraction.
+inline std::string EmitFPSqrtAbdHead(bool dbl, bool sqrt) {
+    return std::string(" const unsigned _f=") + (dbl ? "52" : "23") + "; const uint64_t _hidden=1ULL<<_f,"
+           " _frac=_hidden-1,_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+           ",_sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
+           ",_quiet=_hidden>>1; " + std::string(sqrt ? "unsigned _mode=(unsigned)(c->fpcr>>22)&3;" : "") +
+           " if(c->fpcr&(1ULL<<24)) {"
+           " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign;c->fpsr|=128; }"
+           " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign;c->fpsr|=128; } }"
+           " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+           " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+           " if(_an||_bn) { _v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;"
+           " if(_as||_bs) { c->fpsr|=1; } if(c->fpcr&(1ULL<<25)) { _v=_exp|_quiet; } }";
+}
+inline std::string EmitFPSqrtTail(bool dbl) {
+    return std::string("else if(!(_a&~_sign))_v=_a;"
+           " else if(_a&_sign) { _v=_exp|_quiet;c->fpsr|=1; }"
+           " else if((_a&_exp)==_exp)_v=_a;"
+           " else { const int _bias=") + (dbl ? "1023" : "127") +
+           "; uint64_t _magnitude=_a&_frac;"
+           " int _e=(int)((_a&_exp)>>_f)-(int)_bias;"
+           " if(_a&_exp)_magnitude|=_hidden; else { ++_e;"
+           " while(_magnitude<_hidden) { _magnitude<<=1;--_e; } }"
+           " if(_e%2) { _magnitude<<=1;--_e; }"
+           // Restoring square root of magnitude * 2^fraction_bits.
+           // The radicand can exceed 64 bits, but only two bits are
+           // consumed each step; root and remainder fit uint64_t.
+           " uint64_t _root=0,_rem=0;"
+           " for(int _k=(int)_f;_k>=0;--_k) { int _shift=2*_k-(int)_f;"
+           " uint64_t _pair=(_shift>=0?_magnitude>>_shift:_magnitude<<(-_shift))&3;"
+           " _rem=(_rem<<2)|_pair;uint64_t _trial=(_root<<2)|1;_root<<=1;"
+           " if(_rem>=_trial) { _rem-=_trial;_root|=1; } }"
+           " if(_rem) { c->fpsr|=16;"
+           " if(_mode==1||(_mode==0&&_rem>_root))++_root; }"
+           " _e=_e/2+(int)_bias;"
+           " if(_root>=(_hidden<<1)) { _root>>=1;++_e; }"
+           " _v=((uint64_t)_e<<_f)|(_root&_frac); }";
+}
+
+// The out-of-line exact bodies FPX1 sites call (EmitFPOutlined): one function
+// per op and width, in the runtime C, so once per module (once per image when
+// the static build shares the runtime). Each takes the raw operand bits the
+// inline body read, returns the result bits and updates c->fpsr exactly as the
+// inline body did; the text is the same emitter output. FMUL uses fma.
+inline std::string FpxExactC() {
+    std::string s = R"RT(
+/* FPX1: the exact bodies, out of line. The native fast path stays inline at
+   each site; these run only when its gate is closed or its result is not
+   provably exact, so they are kept out of the hot code. */
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_FPE_COLD __attribute__((noinline, cold))
+#elif defined(_MSC_VER)
+#define RECOMP_FPE_COLD __declspec(noinline)
+#else
+#define RECOMP_FPE_COLD
+#endif
+)RT";
+    for (const bool dbl : {false, true}) {
+        const std::string w = dbl ? "64" : "32";
+        const std::string two = "(GuestContext* c,uint64_t _a,uint64_t _b){uint64_t _v=0;\n";
+        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_add" + w + two + EmitFPAddSubValue(dbl, false, true) +
+             "\nreturn _v;}\n";
+        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_sub" + w + two + EmitFPAddSubValue(dbl, true, true) +
+             "\nreturn _v;}\n";
+        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_div" + w + two + EmitFPDivideValue(dbl, true) +
+             "\nreturn _v;}\n";
+        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_fma" + w +
+             "(GuestContext* c,uint64_t _a,uint64_t _b,uint64_t _z){uint64_t _v=0;\n" +
+             EmitFPMulAddValue(dbl, false, true) + "\nreturn _v;}\n";
+        for (const bool half : {false, true}) {
+            s += "RECOMP_FPE_COLD uint64_t recomp_fpe_" + std::string(half ? "rsqrts" : "recps") + w +
+                 "(GuestContext* c,uint64_t _aa,uint64_t _bb){\n" + EmitFPStepValue(dbl, half, true) +
+                 "\nreturn _v;}\n";
+        }
+        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_sqrt" + w +
+             "(GuestContext* c,uint64_t _a){uint64_t _b=0,_v=0;\n" + EmitFPSqrtAbdHead(dbl, true) +
+             EmitFPSqrtTail(dbl) + "\nreturn _v;}\n";
+    }
+    return s;
+}
+
+// Declarations for the runtime header.
+inline const char* FpxExactH() {
+    return R"RT(/* FPX1: the exact bodies the fast path falls back to, out of line
+   (recomp_runtime.c). Raw operand bits in, result bits out, FPSR in c. */
+uint64_t recomp_fpe_add32(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_sub32(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_div32(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_fma32(GuestContext*,uint64_t,uint64_t,uint64_t);
+uint64_t recomp_fpe_recps32(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_rsqrts32(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_sqrt32(GuestContext*,uint64_t);
+uint64_t recomp_fpe_add64(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_sub64(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_div64(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_fma64(GuestContext*,uint64_t,uint64_t,uint64_t);
+uint64_t recomp_fpe_recps64(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_rsqrts64(GuestContext*,uint64_t,uint64_t);
+uint64_t recomp_fpe_sqrt64(GuestContext*,uint64_t);
+)RT";
 }
 
 // Arm FPMin/FPMax/FPMinNum/FPMaxNum on raw S/D bits `a` and `b`, with bitwise
@@ -3435,44 +3567,19 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 (dbl ? "2" : "4") + "],_r[" + (dbl ? "2" : "4") +
                 "]={0}; memcpy(_n,c->vreg[" + std::to_string(rn) +
                 "],16); memcpy(_m,c->vreg[" + std::to_string(rm) + "],16);");
+            if (sqrt_vec && FpxOutline()) {
+                put("for(unsigned _lane=0;_lane<" + std::to_string(lanes) +
+                    ";++_lane) { uint64_t _a=_n[_lane],_v=0;" + EmitFPOutlined(dbl, "sqrt") +
+                    "_r[_lane]=(" + ct + ")(_v); } memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
+                return true;
+            }
             put("for(unsigned _lane=0;_lane<" + std::to_string(lanes) +
                 ";++_lane) { uint64_t _a=_n[_lane],_b=" +
                 std::string(sqrt_vec ? "0" : "_m[_lane]") + ",_v=0;" +
                 (sqrt_vec ? EmitFPNativeValue(dbl, "sqrt") : std::string()) +
-                " const unsigned _f=" + (dbl ? "52" : "23") + "; const uint64_t _hidden=1ULL<<_f,"
-                " _frac=_hidden-1,_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
-                ",_sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
-                ",_quiet=_hidden>>1; " + std::string(sqrt_vec ? "unsigned _mode=(unsigned)(c->fpcr>>22)&3;" : "") +
-                " if(c->fpcr&(1ULL<<24)) {"
-                " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign;c->fpsr|=128; }"
-                " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign;c->fpsr|=128; } }"
-                " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-                " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-                " if(_an||_bn) { _v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;"
-                " if(_as||_bs) { c->fpsr|=1; } if(c->fpcr&(1ULL<<25)) { _v=_exp|_quiet; } }");
+                EmitFPSqrtAbdHead(dbl, sqrt_vec));
             if (sqrt_vec) {
-                put("else if(!(_a&~_sign))_v=_a;"
-                    " else if(_a&_sign) { _v=_exp|_quiet;c->fpsr|=1; }"
-                    " else if((_a&_exp)==_exp)_v=_a;"
-                    " else { const int _bias=" + std::string(dbl ? "1023" : "127") +
-                    "; uint64_t _magnitude=_a&_frac;"
-                    " int _e=(int)((_a&_exp)>>_f)-(int)_bias;"
-                    " if(_a&_exp)_magnitude|=_hidden; else { ++_e;"
-                    " while(_magnitude<_hidden) { _magnitude<<=1;--_e; } }"
-                    " if(_e%2) { _magnitude<<=1;--_e; }"
-                    // Restoring square root of magnitude * 2^fraction_bits.
-                    // The radicand can exceed 64 bits, but only two bits are
-                    // consumed each step; root and remainder fit uint64_t.
-                    " uint64_t _root=0,_rem=0;"
-                    " for(int _k=(int)_f;_k>=0;--_k) { int _shift=2*_k-(int)_f;"
-                    " uint64_t _pair=(_shift>=0?_magnitude>>_shift:_magnitude<<(-_shift))&3;"
-                    " _rem=(_rem<<2)|_pair;uint64_t _trial=(_root<<2)|1;_root<<=1;"
-                    " if(_rem>=_trial) { _rem-=_trial;_root|=1; } }"
-                    " if(_rem) { c->fpsr|=16;"
-                    " if(_mode==1||(_mode==0&&_rem>_root))++_root; }"
-                    " _e=_e/2+(int)_bias;"
-                    " if(_root>=(_hidden<<1)) { _root>>=1;++_e; }"
-                    " _v=((uint64_t)_e<<_f)|(_root&_frac); }");
+                put(EmitFPSqrtTail(dbl));
             } else {
                 put("else " + EmitFPAddSubValue(dbl, true));
             }
@@ -6412,7 +6519,8 @@ inline const char* FpxH() {
      zero. What is left is IXC, which is already set.
    IEEE add, subtract, multiply, divide, square root and fused multiply-add are
    correctly rounded, so under the host FP mode below every such result equals
-   the ARM result bit for bit. Anything else takes the unchanged exact body.
+   the ARM result bit for bit. Anything else takes the unchanged exact body,
+   which FPX1 sites call out of line (recomp_fpe_*, recomp_runtime.c).
 
    Host contract, enforced by the host once it has negotiated FPX1 through
    recomp_image_fpx_v1: on x86-64 MXCSR round-to-nearest with DAZ and FTZ clear
@@ -7028,7 +7136,7 @@ int  recomp_load_segments(GuestContext* c, const char* data_dir);
         // After GuestContext, before the include guard closes.
         static constexpr std::string_view guard_end = "#endif\n";
         const size_t at = text.rfind(guard_end);
-        text.insert(at, std::string(FpxH()) + FpxH64() +
+        text.insert(at, std::string(FpxH()) + FpxH64() + (fpx == 1 ? FpxExactH() : "") +
                             (fpx == 2 ? "/* FPX1 shadow instrumentation build (never timed). */\n"
                                         "void recomp_fpx_shadow(unsigned kind, int gate, int kept, uint64_t fast,\n"
                                         "    uint64_t exact, uint64_t fpsr_before, uint64_t fpsr_after,\n"
@@ -8018,9 +8126,15 @@ inline const char* RuntimeC() {
     static const std::string abi5_shadow = abi5 + FpxShadowC();
     static const std::string fastmem_shadow = fastmem + FpxShadowC();
     static const std::string guard_gen_shadow = guard_gen + FpxShadowC();
+    static const std::string abi5_fpx = abi5 + FpxExactC();
+    static const std::string fastmem_fpx = fastmem + FpxExactC();
+    static const std::string guard_gen_fpx = guard_gen + FpxExactC();
     if (FpxVariant() == 2) {
         return (EmitGuardGen() ? guard_gen_shadow : g_emit_fastmem ? fastmem_shadow : abi5_shadow)
             .c_str();
+    }
+    if (FpxVariant() == 1) {
+        return (EmitGuardGen() ? guard_gen_fpx : g_emit_fastmem ? fastmem_fpx : abi5_fpx).c_str();
     }
     return (EmitGuardGen() ? guard_gen : g_emit_fastmem ? fastmem : abi5).c_str();
 }
