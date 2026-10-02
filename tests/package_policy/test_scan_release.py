@@ -90,8 +90,10 @@ def kit_members(files=None, manifest_updates=None, listed=None):
 
 
 def windows_members(**extra):
+    # vc_redist.x64.exe: windeployqt adds the Visual C++ runtime installer on CI.
     members = {'suyu.exe': b'MZ placeholder', 'suyu-cmd.exe': b'MZ placeholder', 'Qt6Core.dll': b'MZ placeholder',
-               'platforms/qwindows.dll': b'MZ placeholder', 'LICENSE.txt': b'GPL text placeholder'}
+               'platforms/qwindows.dll': b'MZ placeholder', 'LICENSE.txt': b'GPL text placeholder',
+               'vc_redist.x64.exe': b'MZ placeholder'}
     members.update(kit_members())
     members.update(extra)
     return members

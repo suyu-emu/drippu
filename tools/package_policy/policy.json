@@ -116,6 +116,7 @@
     "windows": [
       "suyu\\.exe",
       "suyu-cmd\\.exe",
+      "vc_redist\\.x64\\.exe",
       "[^/]+\\.dll",
       "LICENSE\\.txt",
       "LICENSES/[^/]+\\.txt",
