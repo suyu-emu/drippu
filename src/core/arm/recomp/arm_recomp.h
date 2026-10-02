@@ -65,7 +65,10 @@ void SetRecompBaseSetter(RecompBaseFn setter);
 /// loaded and the JIT should be used.
 RecompLookupFn GetRecompLookup();
 
-/// schema_version 1 AOT vs Dynarmic execution snapshot.
+/// schema_version 2 AOT vs Dynarmic execution snapshot.
+///
+/// v2 adds `guest_memory` (see GuestMemCounter below). v1 readers keep working:
+/// the new key is additive and no existing key changed shape or meaning.
 ///
 /// Totals are run-lifetime: they survive ArmRecomp attaching a new application
 /// process (the stack-harness restart path). Times are host steady_clock
@@ -78,6 +81,7 @@ RecompLookupFn GetRecompLookup();
 /// fallback_reasons.{lookup_miss,unhandled_opcode,icache_rejected,no_fallback_available},
 /// icache.{clear_instruction_cache_calls,invalidate_cache_range_calls,
 ///         aot_range_rejects,permanent_aot_reject_events,jit_halt_cache_invalidation},
+/// guest_memory.{fast_path_hits,gpu_tracked,debug,other},
 /// plus svc_calls, unresolved_import_traps, and histograms.
 ///
 /// Benchmark comparison (drippu backlog #3) is not this snapshot. The stack
@@ -95,7 +99,7 @@ RecompLookupFn GetRecompLookup();
 /// ofstream) and publishes via dest+".tmp" then rename so a reader never sees a
 /// torn file; an existing dest is replaced (RenameFile refuses overwrite).
 struct RecompExecutionMetrics {
-    static constexpr int kSchemaVersion = 1;
+    static constexpr int kSchemaVersion = 2;
 
     u64 aot_block_executions{};
     u64 aot_time_ns{};
@@ -115,6 +119,20 @@ struct RecompExecutionMetrics {
     u64 aot_range_rejects{};
     u64 permanent_aot_reject_events{};
     u64 jit_halt_cache_invalidation{};
+
+    /// Guest memory accesses the recompiled code resolved through its
+    /// page-table fast path, split by outcome. See GuestMemCounter.
+    ///
+    /// guest_mem_gpu_tracked is the number the GPU track needs: those are
+    /// accesses to a rasterizer-cached page, which the fast path cannot serve
+    /// inline without skipping the invalidation the emulator performs, so they
+    /// are forced out to the emulator on every access. It is the size of the
+    /// problem a GPU-side fast path would have to solve to be worth writing,
+    /// and until something measures it there is no basis for attempting one.
+    u64 guest_mem_fast_path_hits{};
+    u64 guest_mem_gpu_tracked{};
+    u64 guest_mem_debug{};
+    u64 guest_mem_other{};
 };
 
 RecompExecutionMetrics GetRecompExecutionMetrics();

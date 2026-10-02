@@ -21,7 +21,6 @@
 #include <nlohmann/json.hpp>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
-#include <openssl/x509_vfy.h>
 
 #include "common/hex_util.h"
 #include "common/logging.h"
@@ -283,10 +282,8 @@ httplib::Result Send(const std::string& method, const std::string& path, const s
                  : method == "PUT"   ? client.Put(path, headers, body, "application/json")
                                      : client.Post(path, headers, body, "application/json");
     if (!result) {
-        const long verify_result = client.get_openssl_verify_result();
-        LOG_ERROR(WebService, "Send {} {}: httplib error={}, openssl verify_result={} ({})",
-                  method, path, httplib::to_string(result.error()), verify_result,
-                  X509_verify_cert_error_string(verify_result));
+        LOG_ERROR(WebService, "Send {} {}: httplib error={}", method, path,
+                  httplib::to_string(result.error()));
     }
     return result;
 }
@@ -424,12 +421,9 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
     const auto result = client.Post("/api/oauth/token", form);
     if (!result) {
         out.error = "Could not reach the Nextendo account server.";
-        const long verify_result = client.get_openssl_verify_result();
         LOG_ERROR(WebService,
-                  "SignInWithBrowser: token exchange had no response (httplib error={}, "
-                  "openssl verify_result={} [{}])",
-                  httplib::to_string(result.error()), verify_result,
-                  X509_verify_cert_error_string(verify_result));
+                  "SignInWithBrowser: token exchange had no response (httplib error={})",
+                  httplib::to_string(result.error()));
         return out;
     }
     if (result->status != 200) {

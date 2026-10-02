@@ -122,6 +122,84 @@ inline bool DirectBranchTarget(u32 i, u64 pc, u64& out) {
 //
 // Deliberately loose: any ADRP+ADD landing in .text becomes a root. A pair that
 // was really computing a data address only costs one extra block boundary.
+/// True when `insn` is a guest load or store, i.e. an instruction that reaches
+/// the recomp memory fast path at run time.
+///
+/// This exists to bound GPU coupling offline. The run-time
+/// `guest_memory.gpu_tracked` counter answers exactly how much traffic is
+/// GPU-tracked, but only for a title that has been run, and an export is built
+/// without running anything. Counting the instructions that *could* be
+/// GPU-tracked gives the export a denominator: a module with 400k memory-access
+/// sites can at most have 400k GPU-tracked accesses, and one with 200 is not
+/// worth a GPU-side fast path regardless of what the runtime later reports.
+///
+/// Deliberately conservative in what it claims and generous in what it counts:
+/// it over-counts relative to the accesses that are actually GPU-tracked at run
+/// time, so the result is an upper bound and not an estimate of the real figure.
+/// It is a syntactic test with no knowledge of the page table, so it cannot
+/// distinguish a rasterizer-cached page from ordinary memory - that distinction
+/// only exists once a process is running.
+///
+/// SCOPE, and it is narrower than the name suggests. Only the integer and
+/// pointer families are recognised:
+///
+///   LDR/STR (unsigned immediate), LDUR/STUR, LDP/STP (all four forms), and
+///   LDR (literal).
+///
+/// The Advanced SIMD load/store encodings are deliberately NOT matched. They
+/// span several unrelated encoding groups - structure multiple/single, the pair
+/// form, and the single-element form - which do not share a mask, and a mask
+/// loose enough to catch all of them also catches the SIMD ALU and accumulate
+/// groups (ADDV, FMLA, MOVI, DUP, BIC, SMOV and others all sit in the same bits).
+/// A wrong mask here would corrupt the very number this exists to report, and
+/// there is no partial credit: silently including arithmetic as memory traffic
+/// makes a title look GPU-bound when it is not.
+///
+/// So the figure under-reports on SIMD-heavy code, and the bound should be read
+/// as "at least this many", not "at most". Games move the bulk of their vertex
+/// and pixel data through the integer/pointer paths, which is why the bound is
+/// still useful, but closing the gap means a real decode of the Advanced SIMD
+/// load/store groups with tests per group - not a wider mask. Do not widen these
+/// without adding those tests; see src/tests/recompiler for the pattern.
+inline bool IsGuestMemoryAccess(u32 insn) {
+    // Every group below is checked with bit 26 (V) required to be 0. V is the
+    // scalar/SIMD selector in all of them, so leaving it out admits the
+    // Advanced SIMD form of the same encoding - LDR Q0,[X1] is bit-identical to
+    // LDR X0,[X1] apart from V, and so are the pair and literal forms. This is
+    // the single easiest way to get a wrong answer here, hence the one
+    // comparison shared by all four rather than four chances to forget it.
+    constexpr u32 kGprOnly = 0x04000000;
+    if ((insn & kGprOnly) != 0) {
+        // SIMD load/store is out of scope by design; see the note above.
+        return false;
+    }
+    // LDR/STR (immediate, unsigned offset): size 111 V 01 opc.
+    if ((insn & 0x3B000000) == 0x39000000) {
+        return true;
+    }
+    // LDUR/STUR (unscaled, imm9): 1x 111 0 00 0 imm9 opc.
+    if ((insn & 0x3B200C00) == 0x38000000) {
+        return true;
+    }
+    // LDP/STP (signed offset): opc 101 V 0 index LL imm7 Rt2 Rn Rt.
+    if ((insn & 0x3A000000) == 0x28000000) {
+        return true;
+    }
+    // LDR (literal): opc 011 V 00 imm19 Rt.
+    if ((insn & 0x3B000000) == 0x18000000) {
+        return true;
+    }
+    return false;
+}
+
+/// True when `insn` is an SVC. The guest reaches the GPU through the nvdrv
+/// SVC surface, so this is the other statically visible coupling point: a
+/// module issuing GPU service calls shows up here, and one that never does is
+/// not GPU-bound no matter what its memory traffic looks like.
+inline bool IsSupervisorCall(u32 insn) {
+    return (insn & 0xFFE0001F) == 0xD4000001;
+}
+
 inline void CollectAdrpAddTargets(const u8* text, size_t n_bytes, u64 base,
                                   std::vector<u64>& out) {
     const u32 n = static_cast<u32>(n_bytes / 4);
@@ -3267,6 +3345,23 @@ struct RecompileStats {
     /// says which instruction to implement next.
     std::map<u32, UnhandledSite> unhandled_by_signature;
 
+    /// Static upper bound on guest memory accesses this module can perform, and
+    /// the SVC count alongside it. See IsGuestMemoryAccess for what this is and
+    /// is not: it bounds GPU-coupled traffic without running anything, so an
+    /// export can report a figure the runtime's guest_memory.gpu_tracked counter
+    /// can later be checked against.
+    ///
+    /// Not a measurement of GPU coupling. Whether any of these sites actually
+    /// land on a rasterizer-cached page is a property of the live page table and
+    /// cannot be known from the instruction stream.
+    size_t memory_access_sites = 0;
+    size_t svc_sites = 0;
+
+    /// Fraction of walked instructions that reach the guest memory path.
+    double MemoryAccessFraction() const {
+        return emitted ? double(memory_access_sites) / double(emitted) : 0.0;
+    }
+
     /// Fraction of walked instructions the decoder could not translate.
     double UnhandledFraction() const {
         return emitted ? double(unhandled) / double(emitted) : 0.0;
@@ -3441,6 +3536,16 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
             open = Translate(insn, insn_pc, body, &unhandled);
             rcu += body;
             ++stats.emitted;
+            // Counted over walked instructions only, so the totals stay
+            // comparable with `emitted` and with the unhandled histogram beside
+            // them: an instruction the decoder could not decode is not
+            // something the generated code will ever access.
+            if (IsGuestMemoryAccess(insn)) {
+                ++stats.memory_access_sites;
+            }
+            if (IsSupervisorCall(insn)) {
+                ++stats.svc_sites;
+            }
             if (unhandled) {
                 ++stats.unhandled;
                 ++stats.unhandled_by_group[(insn >> 25) & 0xF];
@@ -3915,6 +4020,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
             << stats.UnhandledFraction() << ",\n";
         cov.unsetf(std::ios::floatfield);
 
+        // GPU coupling, statically bounded. This is a ceiling, not a
+        // measurement: memory_access_sites is every instruction that could touch
+        // a rasterizer-cached page, and the run-time guest_memory.gpu_tracked
+        // counter in recomp_execution.json is the real figure to compare it
+        // against. Recorded here because an export is built without running the
+        // title, so this is the only number available at export time.
+        cov << "  \"memory_access_sites\": " << stats.memory_access_sites << ",\n";
+        cov << "  \"svc_sites\": " << stats.svc_sites << ",\n";
+        cov << "  \"memory_access_fraction\": " << std::fixed << std::setprecision(6)
+            << stats.MemoryAccessFraction() << ",\n";
+        cov.unsetf(std::ios::floatfield);
+        cov << "  \"gpu_coupling\": \"static_upper_bound_only\",\n";
+
         cov << "  \"unhandled_by_group\": {";
         bool first_group = true;
         for (const auto& [group, count] : stats.unhandled_by_group) {
@@ -4050,7 +4168,49 @@ typedef struct RecompHostMem {
     uint64_t page_bits;
     uint64_t pointer_mask;
     uint64_t address_space_max;
+    /* Page attribute tag layout, and the tag values themselves, handed over
+       rather than written as literals here. The reason is drift, not brevity:
+       this file is plain C that shares no headers with the emulator, so a
+       literal 3 here would keep compiling after Common::PageType was
+       reordered and would then quietly mis-classify GPU-tracked pages as
+       plain memory. The inline path below only fires when the tag is exactly
+       page_type_memory, so a wrong tag costs correctness, not just a metric.
+
+       The tag check is not redundant with the pointer check. Non-Memory pages
+       store a null pointer *today*, which is the only reason the pointer test
+       alone happens to exclude them; relying on that couples this fast path to
+       a convention maintained somewhere else entirely. */
+    uint64_t page_type_mask;
+    uint64_t page_type_memory;
+    uint64_t page_type_debug;
+    uint64_t page_type_rasterizer_cached;
+    /* Host-owned counters, indexed by RecompGuestMemCounter. Null disables
+       accounting. This is the measurement the ROADMAP's GPU track needs before
+       anything is promoted: it is what shows how much of a recompiled title's
+       memory traffic is GPU-coupled, and therefore whether lifting GPU work
+       into the recompiler is worth attempting at all.
+
+       Counters are incremented from guest threads, so the bumps are relaxed
+       atomics. Deliberately not a function pointer: this sits on the memory
+       fast path, which exists to remove an indirect call. */
+    uint64_t* counters;
 } RecompHostMem;
+
+/* Slot order for RecompHostMem::counters. The two sides pin the same order with
+   static assertions; add to the end only. */
+enum RecompGuestMemCounter {
+    RECOMP_MEM_FAST_PATH_HITS = 0,   /* resolved inline to a plain Memory page */
+    RECOMP_MEM_GPU_TRACKED,          /* fell out: rasterizer-cached page       */
+    RECOMP_MEM_DEBUG,                 /* fell out: debugger-attached page       */
+    RECOMP_MEM_OTHER,                 /* fell out: unmapped, or not resolvable */
+    RECOMP_MEM_SLOT_COUNT
+};
+
+/* Pinned against the same literal the emulator side pins
+   (kRecompGuestMemCounterCount). Growing this enum without growing the
+   emulator's array, or the reverse, then fails to compile on the side that was
+   updated instead of writing out of bounds at run time. */
+typedef char recomp_memcounter_count[RECOMP_MEM_SLOT_COUNT == 4 ? 1 : -1];
 
 typedef struct GuestContext {
     uint64_t x[32]; uint64_t pc; uint8_t n,z,c,v;
@@ -4133,6 +4293,19 @@ typedef char recomp_layout_fpsr[offsetof(GuestContext, fpsr) == 856 ? 1 : -1];
 typedef char recomp_layout_host[offsetof(GuestContext, host_mem) == 832 ? 1 : -1];
 typedef char recomp_layout_chain[offsetof(GuestContext, chain_budget) == 864 ? 1 : -1];
 typedef char recomp_layout_tpidrro[offsetof(GuestContext, tpidrro_el0) == 840 ? 1 : -1];
+
+/* The two copies of RecompHostMem - this one and the emulator's in
+   core/arm/recomp/arm_recomp.cpp - are written by hand and linked by nothing,
+   so they are pinned here rather than trusted. Inserting a field on one side
+   only hands the generated code a function pointer where it expects data, or
+   reads a page table as a count. Offsets below are 64-bit-host values; both
+   sides are compiled 64-bit only (the 32-bit JIT targets still run this
+   runtime on the host), so that is the only layout worth pinning. */
+typedef char recomp_bridgemem_ptemask[offsetof(RecompHostMem, page_type_mask) == 112 ? 1 : -1];
+typedef char recomp_bridgemem_ptemem[offsetof(RecompHostMem, page_type_memory) == 120 ? 1 : -1];
+typedef char recomp_bridgemem_ptedbg[offsetof(RecompHostMem, page_type_debug) == 128 ? 1 : -1];
+typedef char recomp_bridgemem_pterast[offsetof(RecompHostMem, page_type_rasterizer_cached) == 136 ? 1 : -1];
+typedef char recomp_bridgemem_counters[offsetof(RecompHostMem, counters) == 144 ? 1 : -1];
 
 /* Where this module is actually loaded in the guest's address space.
    Every address the static pass bakes in - ADR/ADRP results, branch targets,
@@ -4317,6 +4490,32 @@ uint64_t recomp_cntpct(GuestContext* c){
   }
 }
 
+/* Relaxed increment of one guest-memory counter. Absent counters are the
+   standalone runtime's case (no host bridge) and the pre-counter image
+   revision, so this must stay a no-op rather than a null dereference.
+
+   The increment is atomic because guest threads share these: a lost update
+   would understate GPU coupling, which is the number this exists to measure.
+   Not a function pointer either - this is the memory fast path, which exists
+   to remove an indirect call.
+
+   __atomic_fetch_add is a GCC/Clang builtin and is unavailable under MSVC, so
+   the Windows case goes through InterlockedIncrement64. The fallback is a
+   plain increment, which is only correct for a single-threaded host; it is
+   kept so an exotic compiler still builds rather than failing on a missing
+   builtin. */
+static void recomp_bump(GuestContext* c, int slot){
+  const RecompHostMem* hm = c->host_mem;
+  if(!hm || !hm->counters || slot < 0 || slot >= RECOMP_MEM_SLOT_COUNT) return;
+#if defined(_MSC_VER)
+  InterlockedIncrement64((volatile LONG64*)&hm->counters[slot]);
+#elif defined(__GNUC__) || defined(__clang__)
+  __atomic_fetch_add(&hm->counters[slot], 1, __ATOMIC_RELAXED);
+#else
+  hm->counters[slot]++;
+#endif
+}
+
 /* Resolve a guest address to a host pointer the way Memory::GetPointerImpl
    does: mask, bounds check, one page-table entry, extract the backing pointer.
    A null result means unmapped, debug, GPU-tracked, or a multi-byte access that
@@ -4326,22 +4525,48 @@ uint64_t recomp_cntpct(GuestContext* c){
 
    Deliberately not inlined into the generated code. Forcing it inline at every
    access site was measured: main.dll went from 100 MB to 222 MB and the race
-   phase lost 14%, so whatever the call cost, the instruction cache cost more. */
+   phase lost 14%, so whatever the call cost, the instruction cache cost more.
+
+   The tag check is the load-bearing part. Inlining a store to a page the
+   rasterizer has cached is a silent GPU correctness bug: the emulator's own
+   fast path calls its on_rasterizer hook for exactly these pages, and skipping
+   it leaves the rasterizer reading a stale copy of memory the guest just
+   wrote. Today every non-Memory page stores a null pointer so the pointer test
+   alone excludes them, but that is a convention maintained in memory.cpp, not
+   something this file can see - so the tag is checked explicitly instead. */
 static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va, uint32_t size){
   const RecompHostMem* hm = c->host_mem;
   uintptr_t raw, p;
-  uint64_t page_size, page_off;
+  uint64_t page_size, page_off, tag;
+  int reason = RECOMP_MEM_OTHER;
+  /* No bridge, or no page table yet, means there is nothing to attribute
+     against: the standalone runtime has no counters, and an unpublished table
+     is a start-up state rather than steady-state traffic. */
   if(!hm || !hm->page_entries || size == 0) return 0;
   va &= 0xffffffffffffULL;                 /* AArch64 ignores the top 16 bits */
-  if(va >= hm->address_space_max) return 0;
-  if(size > hm->address_space_max - va) return 0;
-  page_size = 1ULL << hm->page_bits;
-  page_off = va & (page_size - 1);
-  if(page_off > page_size - size) return 0; /* crosses into the next guest page */
-  raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
-                            + (va >> hm->page_bits) * hm->page_entry_stride);
-  p = raw & (uintptr_t)hm->pointer_mask;
-  return p ? (unsigned char*)(p + (uintptr_t)va) : 0;
+  if(va < hm->address_space_max && size <= hm->address_space_max - va){
+    page_size = 1ULL << hm->page_bits;
+    page_off = va & (page_size - 1);
+    if(page_off <= page_size - size){      /* must not cross into the next guest page */
+      raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
+                                + (va >> hm->page_bits) * hm->page_entry_stride);
+      tag = raw & (uintptr_t)hm->page_type_mask;
+      p = raw & (uintptr_t)hm->pointer_mask;
+      if(p && tag == hm->page_type_memory){
+        recomp_bump(c, RECOMP_MEM_FAST_PATH_HITS);
+        return (unsigned char*)(p + (uintptr_t)va);
+      }
+      /* Not a plain mapped page. Attribute the miss so the host can tell a
+         GPU-tracked page (rasterizer invalidation owed) from a debug page from
+         a genuinely unmapped one - downstream all three arrive at load/store
+         as the same null-pointer fallback. */
+      reason = (tag == hm->page_type_rasterizer_cached) ? RECOMP_MEM_GPU_TRACKED
+             : (tag == hm->page_type_debug)            ? RECOMP_MEM_DEBUG
+                                                      : RECOMP_MEM_OTHER;
+    }
+  }
+  recomp_bump(c, reason);
+  return 0;
 }
 
 uint64_t recomp_load8 (GuestContext* c,uint64_t a){

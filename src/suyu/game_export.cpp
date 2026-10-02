@@ -1833,9 +1833,42 @@ void GameExportDialog::MaybeAddToSteam(const QString& game_name, const QString& 
     if (added) {
         // Grid art is what makes the entry read as a real game rather than a
         // generic shortcut; fetched by title from Steam's public endpoints.
-        const QString userdata = steam.GetSteamUserdataPath();
-        if (!userdata.isEmpty()) {
-            steam.FetchArtwork(game_name, userdata);
+        //
+        // The destination has to be a real file path. It used to be the userdata
+        // *directory*, so the download was written to a path named after the
+        // directory and either failed or landed somewhere Steam ignores, and the
+        // shortcut was left with no artwork. GetArtworkCachePath derives a
+        // filename under that directory instead.
+        //
+        // The fetch is async and this SteamIntegration is a local, so it is
+        // destroyed on return and the request dies with it. The parentless
+        // heap instance below outlives the call and applies the artwork when it
+        // lands; a failure is not worth interrupting the export for, so it is
+        // only reported if the export is still on screen.
+        const QString artwork_dir = QString::fromStdString(Common::FS::PathToUTF8String(
+            Common::FS::GetSuyuPath(Common::FS::SuyuPath::CacheDir) / "steam_artwork"));
+        QDir().mkpath(artwork_dir);
+        const QString art_path = QDir(artwork_dir).filePath(
+            QStringLiteral("%1_grid.png").arg(QString(game_name).replace(
+                QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]")), QStringLiteral("_"))));
+
+        if (QFileInfo::exists(art_path)) {
+            steam.SetShortcutArtwork(game_name, art_path);
+        } else {
+            auto* async_steam = new SteamIntegration(this);
+            connect(async_steam, &SteamIntegration::ArtworkFetched, this,
+                    [async_steam, game_name, this](const QString&, const QString& path) {
+                        async_steam->SetShortcutArtwork(game_name, path);
+                        if (status_label != nullptr) {
+                            status_label->setText(
+                                QObject::tr("Added \"%1\" to the Steam library with artwork.")
+                                    .arg(game_name));
+                        }
+                        async_steam->deleteLater();
+                    });
+            connect(async_steam, &SteamIntegration::ArtworkFetchFailed, this,
+                    [async_steam](const QString&, const QString&) { async_steam->deleteLater(); });
+            async_steam->FetchArtwork(game_name, art_path);
         }
     }
     if (status_label != nullptr) {
@@ -2135,6 +2168,18 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 LOG_INFO(Frontend, "AOT coverage [{}]:   unhandled {}: {}",
                          mod.name.toStdString(), suyu::recomp::EncodingGroupName(group), count);
             }
+            // GPU coupling, bounded offline. memory_access_sites is every
+            // instruction that could land on a rasterizer-cached page, so it is
+            // a ceiling rather than a measurement - the real figure is the
+            // run-time guest_memory.gpu_tracked counter, which needs the title to
+            // have been running. Logged here because the export path never runs
+            // the game, so this is the only number available at export time and
+            // it is what a later run should be checked against.
+            LOG_INFO(Frontend,
+                     "AOT GPU coupling [{}]: {} memory-access sites ({:.2f}% of instructions), "
+                     "{} SVC sites (static upper bound, not a measurement)",
+                     mod.name.toStdString(), stats.memory_access_sites,
+                     stats.MemoryAccessFraction() * 100.0, stats.svc_sites);
             if (unhandled_pct > 50.0) {
                 LOG_WARNING(Frontend,
                             "AOT coverage [{}]: over half of all instructions are unhandled. "

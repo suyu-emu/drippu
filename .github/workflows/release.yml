@@ -71,7 +71,7 @@ jobs:
         shell: bash
         run: |
           cmake --version
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DENABLE_UPDATE_CHECKER=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -GNinja 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
@@ -123,7 +123,7 @@ jobs:
         run: |
           cmake --version
           set -o pipefail
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DENABLE_UPDATE_CHECKER=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -167,11 +167,10 @@ jobs:
       - name: Configure
         run: |
           cmake --version
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DENABLE_UPDATE_CHECKER=ON -DYUZU_USE_BUNDLED_QT=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -GNinja \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl);$(brew --prefix ffmpeg);$(brew --prefix libusb);$(brew --prefix enet);$(brew --prefix sdl3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
-            -DYUZU_TESTS=ON \
             -DYUZU_USE_BUNDLED_MOLTENVK=OFF 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
@@ -180,10 +179,11 @@ jobs:
         with:
           name: cmake-log-macos
           path: cmake_configure.log
+      # Tests are compiled and run in tests.yml (Linux + macOS). Keeping the
+      # test suite out of the release build avoids test-only compile errors
+      # surfacing only in the macOS release job.
       - name: Build
-        run: cmake --build build --target suyu suyu-cmd tests macos_moltenvk_smoke -j4
-      - name: Run tests
-        run: ctest --test-dir build --output-on-failure
+        run: cmake --build build --target suyu suyu-cmd macos_moltenvk_smoke -j4
       - name: Run MoltenVK / CAMetalLayer smoke
         timeout-minutes: 5
         env:
@@ -278,7 +278,7 @@ jobs:
           prepare: |
             pkg install -y cmake ninja qt6-base qt6-charts qt6-svg qt6-multimedia openssl pulseaudio vulkan-headers pkgconf libX11 libXext libXrandr libXScrnSaver wayland wayland-protocols libdecor mesa-libs evdev-proto glslang ffmpeg boost-all
           run: |
-            cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON \
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DENABLE_UPDATE_CHECKER=ON \
               -DYUZU_USE_BUNDLED_QT=OFF \
               -DVulkanHeaders_FORCE_BUNDLED=ON \
               -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \

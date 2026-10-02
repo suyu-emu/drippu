@@ -12,7 +12,6 @@
 #include <QPainterPath>
 #include <QToolTip>
 
-#include "suyu/theme.h"
 #include "suyu/uisettings.h"
 
 namespace {
@@ -136,7 +135,7 @@ void PopulationBarChart::paintEvent(QPaintEvent*) {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
 
-    const bool is_dark = Theme::IsDarkMode();
+    const bool is_dark = UISettings::IsDarkTheme();
     const QColor track = is_dark ? QColor(255, 255, 255, 28) : QColor(0, 0, 0, 22);
     const QColor grid = is_dark ? QColor(255, 255, 255, 40) : QColor(0, 0, 0, 35);
     const QColor text_color = is_dark ? QColor(200, 200, 205) : QColor(70, 70, 75);

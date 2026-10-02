@@ -25,6 +25,9 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
     set(CMAKE_C_STANDARD 11)
     enable_testing()
+    # Mirror the emulator tree's warnings-as-errors so this portable check fails
+    # on the same diagnostics as the real build.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../../CMakeModules/StrictWarnings.cmake")
 endif()
 
 enable_language(C)

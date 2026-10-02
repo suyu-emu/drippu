@@ -155,29 +155,9 @@ else()
             $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
     endif()
 
-    add_compile_options(
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=all>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=extra>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=missing-declarations>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=shadow>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=unused>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-attributes>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-invalid-offsetof>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>)
-
-    if (CXX_CLANG OR CXX_ICC OR CXX_APPLE) # Clang, AppleClang, or Intel C++
-        if (NOT MSVC)
-            add_compile_options(
-                $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=shadow-uncaptured-local>
-                $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=implicit-fallthrough>
-                $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=type-limits>)
-        endif()
-        add_compile_options(
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-braced-scalar-init>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-private-field>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-nullability-completeness>)
-    endif()
+    # Shared with the standalone recompiler smoke project so both enforce the
+    # same warnings-as-errors (see src/tests/recompiler/CMakeLists.txt).
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../CMakeModules/StrictWarnings.cmake")
 
     if (ARCHITECTURE_x86_64)
         add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-mcx16>)

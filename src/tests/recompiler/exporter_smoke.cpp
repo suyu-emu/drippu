@@ -170,7 +170,6 @@ std::string ReadFile(const fs::path& path) {
 constexpr u32 kMovzX0_5 = 0xD28000A0u;
 constexpr u32 kMovzX1_7 = 0xD28000E1u;
 constexpr u32 kMovX0Zero = 0xD2800000u;
-constexpr u32 kAddX2X0X1 = 0x8B010002u;
 constexpr u32 kSvc0 = 0xD4000001u;
 constexpr u32 kRetX5 = 0xD65F00A0u;
 constexpr u32 kRetX30 = 0xD65F03C0u;

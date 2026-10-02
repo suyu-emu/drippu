@@ -193,6 +193,12 @@ SteamIntegration::ParseShortcutsVdf(const QByteArray& data) const {
                     sc.start_dir = QString::fromUtf8(value);
                 } else if (key == "icon") {
                     sc.icon = QString::fromUtf8(value);
+                } else if (key == "GridArt" || key == "gridart") {
+                    sc.grid_art = QString::fromUtf8(value);
+                } else if (key == "HeroArt" || key == "heroart") {
+                    sc.hero_art = QString::fromUtf8(value);
+                } else if (key == "LogoArt" || key == "logoart") {
+                    sc.logo_art = QString::fromUtf8(value);
                 } else if (key == "ShortcutPath" || key == "shortcutpath") {
                     sc.shortcut_path = QString::fromUtf8(value);
                 } else if (key == "LaunchOptions" || key == "launchoptions") {
@@ -283,6 +289,12 @@ QByteArray SteamIntegration::SerializeShortcutsVdf(
         VdfWriteString(buf, VdfType::String, "Exe", sc.exe.toUtf8());
         VdfWriteString(buf, VdfType::String, "StartDir", sc.start_dir.toUtf8());
         VdfWriteString(buf, VdfType::String, "icon", sc.icon.toUtf8());
+        // The per-slot artwork keys. Steam reads these independently of `icon`;
+        // writing only `icon` leaves the library grid and the details header
+        // showing generic box art even when a grid image is on disk.
+        VdfWriteString(buf, VdfType::String, "GridArt", sc.grid_art.toUtf8());
+        VdfWriteString(buf, VdfType::String, "HeroArt", sc.hero_art.toUtf8());
+        VdfWriteString(buf, VdfType::String, "LogoArt", sc.logo_art.toUtf8());
         VdfWriteString(buf, VdfType::String, "ShortcutPath", sc.shortcut_path.toUtf8());
         VdfWriteString(buf, VdfType::String, "LaunchOptions", sc.launch_options.toUtf8());
         VdfWriteUint32(buf, "IsHidden", sc.is_hidden ? 1 : 0);
@@ -364,17 +376,32 @@ bool SteamIntegration::AddGameShortcut(const QString& game_title, const QString&
             continue;
         }
         const QString existing = QString(sc.exe).remove(QLatin1Char('"'));
-        if (QFileInfo(existing) == QFileInfo(exe_path)) {
-            return true; // Already correct
+        const bool exe_matches = QFileInfo(existing) == QFileInfo(exe_path);
+        if (!exe_matches) {
+            sc.exe = quoted_exe;
+            sc.start_dir = QStringLiteral("\"%1\"").arg(QFileInfo(exe_path).absolutePath());
+            sc.shortcut_path = QFileInfo(exe_path).absolutePath();
         }
-        sc.exe = quoted_exe;
-        sc.start_dir = QStringLiteral("\"%1\"").arg(QFileInfo(exe_path).absolutePath());
-        sc.shortcut_path = QFileInfo(exe_path).absolutePath();
+        // Applying the icon even when the exe already matched. Returning early
+        // here is what made artwork look broken: the first add has no art, and
+        // the second add - the one that has art to offer - was the call that got
+        // dropped on the floor.
+        if (!icon_path.isEmpty()) {
+            const QString absolute = QFileInfo(icon_path).absoluteFilePath();
+            sc.icon = absolute;
+            sc.grid_art = absolute;
+        }
+        // Reuse the existing AppID. Re-deriving it from the current exe would
+        // give a different ID for a moved install, orphaning the old entry.
+        if (sc.id == 0) {
+            sc.id = GenerateAppId(sc.exe, sc.app_name);
+        }
         QFile out(vdf_path);
-        if (!out.open(QIODevice::WriteOnly)) {
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             return false;
         }
         out.write(SerializeShortcutsVdf(shortcuts));
+        out.close();
         return true;
     }
 
@@ -420,6 +447,93 @@ bool SteamIntegration::AddSuyuSelfShortcut() {
         icon_path.clear();
     }
     return AddGameShortcut(QStringLiteral("suyu"), QString(), icon_path);
+}
+
+QString SteamIntegration::ArtworkTypeSuffix(ArtworkType artwork_type) {
+    switch (artwork_type) {
+    case ArtworkType::Grid:
+        return QStringLiteral("grid");
+    case ArtworkType::Hero:
+        return QStringLiteral("hero");
+    case ArtworkType::Icon:
+        return QStringLiteral("icon");
+    case ArtworkType::Artwork:
+        return QStringLiteral("artwork");
+    }
+    return QStringLiteral("grid");
+}
+
+QString SteamIntegration::GetArtworkCachePath(const QString& owner, quint64 steam_app_id,
+                                              ArtworkType artwork_type) const {
+    const QString userdata = GetSteamUserdataPath();
+    if (userdata.isEmpty()) {
+        return {};
+    }
+    // Keyed on the store AppID rather than the title so a re-download reuses
+    // the file, and on the owner so two users on one machine do not collide.
+    QString owner_dir = owner;
+    owner_dir.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]")),
+                      QStringLiteral("_"));
+    const QString name =
+        QStringLiteral("%1_%2_%3.png")
+            .arg(owner_dir)
+            .arg(steam_app_id)
+            .arg(ArtworkTypeSuffix(artwork_type));
+    return QDir(userdata).filePath(name);
+}
+
+bool SteamIntegration::SetShortcutArtwork(const QString& game_title, const QString& artwork_path,
+                                          ArtworkType artwork_type) {
+    if (artwork_path.isEmpty()) {
+        return false;
+    }
+    const QString vdf_path = FindShortcutsVdf();
+    if (vdf_path.isEmpty()) {
+        return false;
+    }
+    QFile file(vdf_path);
+    if (!file.exists() || !file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    auto shortcuts = ParseShortcutsVdf(file.readAll());
+    file.close();
+
+    const QString absolute = QFileInfo(artwork_path).absoluteFilePath();
+    bool found = false;
+    for (auto& sc : shortcuts) {
+        if (sc.app_name != game_title) {
+            continue;
+        }
+        switch (artwork_type) {
+        case ArtworkType::Grid:
+            sc.grid_art = absolute;
+            break;
+        case ArtworkType::Hero:
+            sc.hero_art = absolute;
+            break;
+        case ArtworkType::Icon:
+            sc.logo_art = absolute;
+            break;
+        case ArtworkType::Artwork:
+            sc.logo_art = absolute;
+            break;
+        }
+        // The launcher icon stays as the exe icon: these are library-display
+        // images and are not what the taskbar entry uses.
+        found = true;
+        break;
+    }
+    if (!found) {
+        return false;
+    }
+
+    QFile out(vdf_path);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+    out.write(SerializeShortcutsVdf(shortcuts));
+    out.close();
+    return true;
 }
 
 bool SteamIntegration::RemoveGameShortcut(const QString& game_title) {
@@ -598,7 +712,12 @@ void SteamIntegration::FetchArtwork(const QString& game_title, const QString& ou
                             }
 
                             QFile file(output_path);
-                            if (!file.open(QIODevice::WriteOnly)) {
+                            // Truncate, not just WriteOnly: re-downloading a
+                            // different artwork size into an existing cache file
+                            // would otherwise leave the tail of the previous,
+                            // larger image behind and produce a corrupt PNG that
+                            // Steam silently declines to display.
+                            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
                                 emit ArtworkFetchFailed(game_title,
                                                         QStringLiteral("Cannot write to %1").arg(output_path));
                                 return;

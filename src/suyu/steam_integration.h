@@ -64,6 +64,15 @@ public:
         bool allow_overlay{true};
         qint32 last_play_time{0};
         QStringList tags;
+
+        // Steam's per-shortcut artwork slots. `icon` above is the small
+        // launcher icon; these are the wide images the library grid, the
+        // details page and the header respectively use. They are separate keys
+        // in shortcuts.vdf, not a variant of `icon`, which is why a shortcut
+        // with a perfectly good grid image can still show the generic box art.
+        QString grid_art;
+        QString hero_art;
+        QString logo_art;
     };
 
     /// List all currently registered shortcuts.
@@ -71,6 +80,29 @@ public:
 
     /// Compute the Steam AppID for a non-Steam shortcut.
     [[nodiscard]] static quint32 GenerateAppId(const QString& exe, const QString& app_name);
+
+    /// Update the artwork of an existing shortcut, creating nothing.
+    ///
+    /// Artwork arrives asynchronously, by which point the shortcut that was
+    /// added to get the download started is already on disk without it.
+    /// Re-adding it wholesale was the previous behaviour and it worked, but it
+    /// re-derives the AppID from the current exe path, so a shortcut whose exe
+    /// moved gets a new ID and the old entry is orphaned in the library.
+    /// Returns false when no shortcut by that name exists.
+    bool SetShortcutArtwork(const QString& game_title, const QString& artwork_path,
+                            ArtworkType artwork_type = ArtworkType::Grid);
+
+    /// Where a given artwork kind is cached, given its owner and Steam AppID.
+    ///
+    /// Fetched art is kept rather than written straight into the Steam
+    /// userdata directory: the caller needs a real file path it owns, and
+    /// userdata is Steam's to manage. Returns empty when there is no Steam
+    /// userdata directory to key off.
+    [[nodiscard]] QString GetArtworkCachePath(const QString& owner, quint64 steam_app_id,
+                                             ArtworkType artwork_type) const;
+
+    /// Filename suffix for an artwork kind, used in the cache path.
+    [[nodiscard]] static QString ArtworkTypeSuffix(ArtworkType artwork_type);
 
 signals:
     void ShortcutAdded(const QString& title);

@@ -206,9 +206,49 @@ add_executable(suyu
     multiplayer/validation.h
     play_time_manager.cpp
     play_time_manager.h
+    nextendo_account_dialog.cpp
+    nextendo_account_dialog.h
+    nextendo_account_page_p.h
+    nextendo_avatar_cache.cpp
+    nextendo_avatar_cache.h
+    nextendo_chat_client.cpp
+    nextendo_chat_client.h
+    nextendo_chat_room.cpp
+    nextendo_chat_room.h
+    nextendo_chat_room.ui
+    nextendo_chat_room_member_delegate.cpp
+    nextendo_chat_room_member_delegate.h
+    nextendo_chat_window.cpp
+    nextendo_chat_window.h
+    nextendo_controller.cpp
+    nextendo_controller.h
+    nextendo_friend_delegate.cpp
+    nextendo_friend_delegate.h
+    nextendo_history_delegate.cpp
+    nextendo_history_delegate.h
+    nextendo_ldn_counts.cpp
+    nextendo_ldn_counts.h
+    nextendo_network_probe.cpp
+    nextendo_network_probe.h
+    nextendo_online_counts.cpp
+    nextendo_online_counts.h
+    nextendo_population_dialog.cpp
+    nextendo_population_dialog.h
+    nextendo_population_history.cpp
+    nextendo_population_history.h
+    nextendo_save_sync.cpp
+    nextendo_save_sync.h
+    nextendo_toast.cpp
+    nextendo_toast.h
     precompiled_headers.h
     qt_common.cpp
     qt_common.h
+    ui/nextendo_profile_chip.cpp
+    ui/nextendo_profile_chip.h
+    ui/nextendo_status_cluster.cpp
+    ui/nextendo_status_cluster.h
+    ui/population_bar_chart.cpp
+    ui/population_bar_chart.h
     set_play_time_dialog.cpp
     set_play_time_dialog.h
     set_play_time_dialog.ui
@@ -275,6 +315,18 @@ if (SUYU_CRASH_DUMPS)
 
     target_link_libraries(suyu PRIVATE libbreakpad_client)
     target_compile_definitions(suyu PRIVATE SUYU_CRASH_DUMPS)
+endif()
+
+# Self-update dialog (Help > Check for Updates + startup check). Tied to the
+# update checker: without ENABLE_UPDATE_CHECKER there is nothing to check
+# against, so the dialog - which calls UpdateChecker - is excluded as well.
+if (ENABLE_UPDATE_CHECKER)
+    target_sources(suyu PRIVATE
+        update_dialog.cpp
+        update_dialog.h
+    )
+
+    target_compile_definitions(suyu PRIVATE ENABLE_UPDATE_CHECKER)
 endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
