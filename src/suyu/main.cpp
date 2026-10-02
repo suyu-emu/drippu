@@ -7574,7 +7574,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
 
     // Kernel module names carry an "nn" prefix that the export directories do
     // not ("nnrtld" against "rtld"), so try both spellings.
-    Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
+    Core::SetRecompBaseSetter([](size_t index, const char* module, const char*, u64 base) {
         // Try the name first - it works for rtld - then fall back to load
         // order. A game's own modules are not named after the files they were
         // exported from: main is named after the game ("cross2_Release.nss"),

@@ -47,8 +47,8 @@
 #include "common/string_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_gap_session.h"
+#include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/recomp/recomp_image_features.h"
-#include "core/arm/recomp/recomp_module_binding.h"
 #include "core/core.h"
 #include "core/perf_stats.h"
 #include "core/core_timing.h"
@@ -117,7 +117,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
-#ifdef __linux__
+#ifdef __unix__
 #include "common/linux/gamemode.h"
 #endif
 
@@ -203,6 +203,25 @@ struct SuyuRecompStaticModule {
 };
 #ifdef SUYU_CMD_STATIC_RECOMP
 const SuyuRecompStaticModule* suyu_recomp_static_modules_v4(unsigned* count);
+// Each registered module's build ID (lower-case hex), parallel to the module
+// list, so an image is bound to the loaded module it was built from rather
+// than to a position. Registrations from before it have none; under MSVC (and
+// so in the export build kit, whose host objects are linked against any
+// export's registry) a default that reports none stands in for the missing
+// symbol, and other compilers are told by suyu_cmd/CMakeLists.txt.
+#ifdef _MSC_VER
+const char* const* suyu_recomp_static_build_ids_v1_absent(unsigned* count) {
+    *count = 0;
+    return nullptr;
+}
+#pragma comment(linker, "/alternatename:suyu_recomp_static_build_ids_v1=suyu_recomp_static_build_ids_v1_absent")
+#ifndef SUYU_RECOMP_BUILD_IDS_V1
+#define SUYU_RECOMP_BUILD_IDS_V1 1
+#endif
+#endif
+#ifdef SUYU_RECOMP_BUILD_IDS_V1
+const char* const* suyu_recomp_static_build_ids_v1(unsigned* count);
+#endif
 #ifdef SUYU_RECOMP_GUARD_V2
 int suyu_recomp_static_guard_v2(unsigned version);
 #endif
@@ -1887,16 +1906,18 @@ int main(int argc, char** argv) {
         rom_found:;
     }
 
-    // Native recompiled CPU modules, in NSO load order: rtld(0), main(1),
-    // subsdk0-N(2..N+1), sdk(last). Whichever way they arrive, registering any
-    // of them makes ArmRecomp run the game's CPU natively instead of dynarmic.
+    // Native recompiled CPU modules. An export may leave modules out (Hybrid
+    // runs them on the JIT), so each image is bound to the loaded module with
+    // its build ID, never to a position. Whichever way they arrive, registering
+    // any of them makes ArmRecomp run the game's CPU natively instead of dynarmic.
     struct RecompModule {
         Core::RecompBlockFn (*lookup)(u64){};
         void (*set_base)(u64){};
         Core::RecompBlockFn run_slice{};
         unsigned image_abi{};
         unsigned (*guard_v2)(unsigned){};
-        std::string name; // informational, for recomp_gaps.json
+        std::string name;     // export name: rtld, main, subsdk0, sdk
+        std::string build_id; // empty for registrations from before build IDs
     };
     static std::vector<RecompModule> s_recomp_modules;
     bool recomp_guard_ready = false;
@@ -1935,6 +1956,16 @@ int main(int argc, char** argv) {
     {
         unsigned count = 0;
         const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v4(&count);
+        unsigned build_id_count = 0;
+        const char* const* build_ids = nullptr;
+#ifdef SUYU_RECOMP_BUILD_IDS_V1
+        build_ids = suyu_recomp_static_build_ids_v1(&build_id_count);
+#endif
+        if (!build_ids || build_id_count != count) {
+            build_ids = nullptr;
+            LOG_WARNING(Frontend, "Static recompiled modules carry no build IDs (registration "
+                                  "predates them); binding images by NSO slot name");
+        }
         for (unsigned i = 0; i < count; ++i) {
             if (!mods[i].image_abi) {
                 LOG_CRITICAL(Frontend, "Static image predates correctness ABI 5; re-export all modules");
@@ -1945,9 +1976,11 @@ int main(int argc, char** argv) {
             }
             s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].run_slice,
                                         mods[i].image_abi(), nullptr,
-                                        mods[i].name ? mods[i].name : ""});
-            LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
-                     mods[i].name ? mods[i].name : "?");
+                                        mods[i].name ? mods[i].name : "",
+                                        build_ids && build_ids[i] ? build_ids[i] : ""});
+            LOG_INFO(Frontend, "Static recompiled module [{}] {} build_id={} — ArmRecomp active",
+                     i, mods[i].name ? mods[i].name : "?",
+                     s_recomp_modules.back().build_id.substr(0, 16));
         }
 #ifdef SUYU_RECOMP_GUARD_V2
         recomp_guard_ready = suyu_recomp_static_guard_v2(2) != 0;
@@ -2177,19 +2210,32 @@ int main(int argc, char** argv) {
         Core::SetRecompFpxReady(recomp_fpx != 0);
         LOG_INFO(Frontend, "Recompiled FPX1 native FP: {} (handshake {:#x})",
                  recomp_fpx ? "negotiated" : "not used", recomp_fpx);
-        Core::SetRecompBaseSetter([](size_t index, const char* live_name, u64 base) {
-            const int image = suyu::recomp::FindRecompModuleForLive(
-                s_recomp_modules.size(),
-                [](size_t i) -> std::string_view { return s_recomp_modules[i].name; }, index,
-                live_name ? std::string_view(live_name) : std::string_view{});
-            if (image >= 0 && s_recomp_modules[image].set_base) {
-                s_recomp_modules[image].set_base(base);
-                // Misses in this module are gaps a re-export can close.
-                Core::RecompGaps::NoteImage(base, s_recomp_modules[image].name);
-            } else {
-                LOG_WARNING(Frontend, "No recompiled image for live module '{}' (#{})",
-                            live_name ? live_name : "", index);
+        // Bind each loaded module to the image built from it, by build ID (see
+        // RecompGaps::MatchImage). Never by position: a Hybrid export that
+        // leaves main to the JIT registers [rtld, subsdk0, sdk], and handing
+        // those the bases of loaded modules 0, 1, 2 gave subsdk0's image main's
+        // base and sdk's image multimedia's. A module with no image runs on the
+        // JIT (or, strict, stops there); an image with no module stays unbound.
+        Core::SetRecompBaseSetter([](size_t index, const char* module, const char* build_id,
+                                     u64 base) {
+            std::vector<Core::RecompGaps::ImageIdentity> images;
+            for (const auto& m : s_recomp_modules) {
+                images.push_back({m.name, m.build_id});
             }
+            const std::string_view id = build_id ? build_id : "";
+            const auto image = Core::RecompGaps::MatchImage(images, index, module ? module : "", id);
+            if (!image || !s_recomp_modules[*image].set_base) {
+                LOG_WARNING(Frontend,
+                            "No recompiled image for module '{}' (#{}, build_id={}, base {:#x})",
+                            module ? module : "?", index, id.substr(0, 16), base);
+                return;
+            }
+            auto& m = s_recomp_modules[*image];
+            m.set_base(base);
+            // Misses in this module are gaps a re-export can close.
+            Core::RecompGaps::NoteImage(base, m.name);
+            LOG_INFO(Frontend, "Recompiled image '{}' bound to module '{}' (#{}, build_id={}, base {:#x})",
+                     m.name, module ? module : "?", index, id.substr(0, 16), base);
         });
         // A window running native recompiled code is a standalone game export,
         // not the suyu dev frontend — the window chrome (title/icon) should
@@ -2814,7 +2860,7 @@ int main(int argc, char** argv) {
         exit(0);
     });
 
-#ifdef __linux__
+#ifdef __unix__
     Common::Linux::StartGamemode();
 #endif
 
@@ -2933,7 +2979,7 @@ int main(int argc, char** argv) {
     void(system.Pause());
     system.ShutdownMainProcess();
 
-#ifdef __linux__
+#ifdef __unix__
     Common::Linux::StopGamemode();
 #endif
 

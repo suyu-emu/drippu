@@ -1240,9 +1240,12 @@ struct ArmRecomp::Impl {
                 // where its own module went.
                 if (const auto setter = g_recomp_base_setter.load(std::memory_order_acquire)) {
                     // modules is keyed by base, so iteration is load order.
+                    // The build ID, as the loader noted it, is what identifies
+                    // the module to its image.
                     size_t index = 0;
                     for (const auto& [module_base, name] : modules) {
-                        setter(index++, name.c_str(), module_base);
+                        const std::string build_id = RecompGaps::ModuleBuildId(module_base);
+                        setter(index++, name.c_str(), build_id.c_str(), module_base);
                     }
                 }
             }
@@ -2265,7 +2268,14 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 LOG_ERROR(Core_ARM, "recomp mem @x{} ({:#x}) [-0x20..+0x30): {}", r, p, dump);
             }
             {
-                const u64 mbase = impl->modules.empty() ? 0 : impl->modules.begin()->first;
+                // The module containing the PC: greatest base not above it
+                // (the first module when the PC is below all of them).
+                u64 mbase = impl->modules.empty() ? 0 : impl->modules.begin()->first;
+                for (const auto& [module_base, name] : impl->modules) {
+                    if (module_base <= impl->ctx.pc) {
+                        mbase = module_base;
+                    }
+                }
                 // A wide window through .rodata, to diff against the exporter's
                 // extracted copy: if the two disagree, the recompiled code is
                 // computing correct addresses into memory that holds something

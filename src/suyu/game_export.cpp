@@ -4037,6 +4037,23 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     o << "  recomp_image_guard_v2_" << m << "(ready?2:0);\n";
                 }
                 o << "  return ready;\n}\n";
+                // Each module's build ID, parallel to s_modules: the host binds
+                // an image to the loaded module with that ID, since an export
+                // may leave modules out and positions then stop lining up.
+                o << "\nconst char* const* suyu_recomp_static_build_ids_v1(unsigned* count);\n"
+                     "static const char* const s_build_ids[] = {\n";
+                for (const auto& m : ordered) {
+                    const auto mod = std::find_if(
+                        module_results.cbegin(), module_results.cend(),
+                        [&](const NsoAnalysisResult& r) { return r.name == m; });
+                    o << "    \"" << (mod != module_results.cend() ? mod->build_id_hex : QString{})
+                      << "\",\n";
+                }
+                o << "};\n"
+                     "const char* const* suyu_recomp_static_build_ids_v1(unsigned* count) {\n"
+                     "    *count = (unsigned)(sizeof(s_build_ids) / sizeof(s_build_ids[0]));\n"
+                     "    return s_build_ids;\n"
+                     "}\n";
                 if (suyu::recomp::g_emit_fastmem) {
                     // ABI 6: every module must report FM1 and accept the host's
                     // page-table layout and context offsets.

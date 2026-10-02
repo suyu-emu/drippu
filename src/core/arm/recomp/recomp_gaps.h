@@ -126,6 +126,28 @@ bool BuildIdMatches(std::string_view a, std::string_view b);
 /// A module name with any directories removed and only [A-Za-z0-9._-] kept.
 std::string SanitizeName(std::string_view name);
 
+/// What a recompiled image says about the module it was built from: its export
+/// name ("rtld", "main", "subsdk0", "sdk") and that module's build ID, which is
+/// empty for registrations that predate build IDs.
+struct ImageIdentity {
+    std::string name;
+    std::string build_id;
+};
+
+/// The image that belongs to a loaded module, or nullopt for none. `load_index`
+/// is the module's position in load order, `module_name` the kernel's name for
+/// it ("nnrtld", "multimedia", "nnSdk") and `module_build_id` its build ID.
+///
+/// When any image carries a build ID, the build ID alone decides: an export
+/// may omit modules (Hybrid runs them on the JIT), so an image's position in
+/// the registration says nothing about which loaded module it belongs to.
+/// Registrations without build IDs fall back to the NSO slot: the module's own
+/// name (without the kernel's "nn" prefix, ignoring case), then the slot its
+/// load position implies (rtld, main, subsdk0..9, sdk).
+std::optional<std::size_t> MatchImage(const std::vector<ImageIdentity>& images,
+                                      std::size_t load_index, std::string_view module_name,
+                                      std::string_view module_build_id);
+
 std::string Serialize(const GapData& data);
 std::optional<GapData> Parse(std::string_view json, std::string* error = nullptr);
 /// Adds `from` into `into`: run counts and hits add, offsets and opcodes dedupe.
@@ -170,6 +192,8 @@ public:
     void ForgetModule(std::uint64_t base);
     /// The module at `base` runs from a recompiled image named `image_name`.
     void NoteImage(std::uint64_t base, std::string_view image_name);
+    /// Build ID of the noted module containing `address`; empty if none.
+    std::string BuildIdAt(std::uint64_t address) const;
     void RecordMiss(std::uint64_t pc);
     void RecordUnimplemented(std::uint32_t insn);
     /// This run as a one-run GapData.

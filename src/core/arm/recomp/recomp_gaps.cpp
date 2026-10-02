@@ -539,6 +539,54 @@ std::string SanitizeName(std::string_view name) {
     return out;
 }
 
+std::optional<std::size_t> MatchImage(const std::vector<ImageIdentity>& images,
+                                      std::size_t load_index, std::string_view module_name,
+                                      std::string_view module_build_id) {
+    const bool by_build_id = std::any_of(images.begin(), images.end(), [](const auto& image) {
+        return !NormalizeBuildId(image.build_id).empty();
+    });
+    if (by_build_id) {
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            if (BuildIdMatches(images[i].build_id, module_build_id)) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+    const auto by_name = [&images](std::string_view name) -> std::optional<std::size_t> {
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            const std::string_view image = images[i].name;
+            if (image.size() == name.size() &&
+                std::equal(image.begin(), image.end(), name.begin(), [](char a, char b) {
+                    const auto lower = [](char c) {
+                        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+                    };
+                    return lower(a) == lower(b);
+                })) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    };
+    if (auto i = by_name(module_name)) {
+        return i;
+    }
+    if (module_name.size() > 2 && (module_name[0] == 'n' || module_name[0] == 'N') &&
+        (module_name[1] == 'n' || module_name[1] == 'N')) {
+        if (auto i = by_name(module_name.substr(2))) {
+            return i;
+        }
+    }
+    static constexpr std::string_view kSlots[] = {
+        "rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4",
+        "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9", "sdk",
+    };
+    if (load_index < std::size(kSlots)) {
+        return by_name(kSlots[load_index]);
+    }
+    return std::nullopt;
+}
+
 std::string Serialize(const GapData& d) {
     std::string o = "{\n";
     o += "  \"schema\": \"" + std::string{kSchemaName} + "\",\n";
@@ -1197,6 +1245,16 @@ void SessionRecorder::NoteImage(std::uint64_t base, std::string_view image_name)
             it->second.name = SanitizeName(image_name);
         }
     }
+}
+
+std::string SessionRecorder::BuildIdAt(std::uint64_t address) const {
+    std::scoped_lock lk{lock};
+    auto it = loaded.upper_bound(address);
+    if (it == loaded.begin()) {
+        return {};
+    }
+    --it;
+    return address - it->first < it->second.size ? it->second.build_id : std::string{};
 }
 
 void SessionRecorder::RecordMiss(std::uint64_t pc) {
