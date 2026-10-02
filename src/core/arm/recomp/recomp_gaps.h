@@ -26,11 +26,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Core::RecompGaps {
@@ -158,6 +160,42 @@ inline constexpr std::size_t kRodataModuleNameBytes = 12 + 8 + 0x200;
 /// {u32 1, u32 end of path, u32} in front of that same struct. `size` may be
 /// smaller than kRodataModuleNameBytes.
 std::string ModuleNameFromRodata(const std::uint8_t* rodata, std::size_t size);
+
+/// One byte of guest memory at an absolute address (0 where unmapped).
+using GuestRead8 = std::function<std::uint8_t(std::uint64_t)>;
+
+/// Absolute address of a loaded module's MOD0 header, or 0 when it has none.
+/// The module's second word (base + 4) is MOD0's offset from the base. Older
+/// SDKs (TOTK 1.0.0) put MOD0 right after it, at +8; newer ones (TOTK 1.4.3
+/// main, subsdk0 and sdk) put it deep in rodata, megabytes in, where a scan
+/// of the first pages never reaches. That scan stays as the fallback for a
+/// module whose word at +4 does not lead to the magic.
+std::uint64_t FindMod0(std::uint64_t module_base, const GuestRead8& read8);
+
+/// One .dynsym entry (Elf64_Sym) with its .dynstr name.
+struct DynSymbol {
+    std::string name;
+    std::uint64_t value = 0;
+    bool defined = false; ///< st_shndx != SHN_UNDEF
+    bool weak = false;    ///< STB_WEAK
+};
+DynSymbol ReadDynSymbol(std::uint64_t symtab_va, std::uint64_t strtab_va, std::uint32_t index,
+                        const GuestRead8& read8);
+
+/// Adds every defined, named .dynsym symbol of the module at `module_base` to
+/// `out` as name -> absolute address; a name already present is kept. .dynsym
+/// and .dynstr are back to back, so the gap between them is the entry count.
+void IndexModuleExports(std::uint64_t module_base, std::uint64_t symtab_va,
+                        std::uint64_t strtab_va, const GuestRead8& read8,
+                        std::unordered_map<std::string, std::uint64_t>& out);
+
+/// What an import slot holds when no loaded module exports its symbol: 0 for
+/// a weak one, as the ABI and the guest's rtld have it, else `trap`. A weak
+/// import that some module does define resolves to that definition instead,
+/// exactly like a strong one.
+inline std::uint64_t UndefinedImportValue(bool weak, std::uint64_t trap) {
+    return weak ? 0 : trap;
+}
 
 std::string Serialize(const GapData& data);
 std::optional<GapData> Parse(std::string_view json, std::string* error = nullptr);

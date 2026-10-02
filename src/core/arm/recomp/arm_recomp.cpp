@@ -22,6 +22,7 @@
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/guest_fp_env.h"
 #include "core/arm/recomp/recomp_gap_session.h"
+#include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/recomp/recomp_diagnostic_sampler.h"
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core.h"
@@ -1337,13 +1338,10 @@ struct ArmRecomp::Impl {
         // MOD0 magic "MOD0" = 0x30444F4D. It sits at the start of rodata
         // (typically mod+0x2000 for rtld), but the actual location is pointed
         // to by a 4-byte offset at mod+4 (per NSO ABI). Scan the first few KB.
-        u64 mod0_va = 0;
-        for (u64 off = 0; off < 0x4000; off += 4) {
-            if (mem.Read32(mod_base + off) == 0x30444F4Du) {
-                mod0_va = mod_base + off;
-                break;
-            }
-        }
+        // Scanning only the first pages missed TOTK 1.4.3's main, subsdk0
+        // and sdk, whose MOD0 is megabytes in: they were never indexed, so
+        // rtld's imports of sdk's nn::init::Start found nothing and stayed 0.
+        const u64 mod0_va = RecompGaps::FindMod0(mod_base, read8);
         if (!mod0_va) return false;
 
         // MOD0 layout: magic(4), dyn_offset(4), bss_start(4), bss_end(4)
@@ -1388,34 +1386,12 @@ struct ArmRecomp::Impl {
         bool defined = false;
         bool weak = false;
     };
+    // st_shndx is the 2-byte field at +6; reading 4 bytes there once spilled
+    // into st_value and corrupted the defined check. An undefined weak symbol
+    // that no module exports resolves to 0 - see the fallthrough below.
     SymInfo ReadSymbol(const DynInfo& d, u32 index) {
-        auto& mem = system.ApplicationMemory();
-        SymInfo s;
-        if (!d.symtab_va) return s;
-        const u64 sym_va = d.symtab_va + static_cast<u64>(index) * 24;
-        const u32 name_off = mem.Read32(sym_va);
-        // st_shndx is a 2-byte field at offset 6 (st_name(4) st_info(1)
-        // st_other(1) st_shndx(2) st_value(8) st_size(8)) - reading 4 bytes
-        // here previously spilled into st_value's low bytes, corrupting the
-        // defined/undefined check for essentially every symbol whose value
-        // had nonzero low 16 bits.
-        const u16 shndx = mem.Read16(sym_va + 6);
-        s.value = mem.Read64(sym_va + 8);
-        s.defined = shndx != 0; // SHN_UNDEF == 0
-        // st_info is the byte at +4; the binding is its high nibble.
-        // STB_WEAK == 2. An undefined weak symbol must resolve to 0, which is
-        // how the guest's own rtld leaves it - see the fallthrough below.
-        s.weak = (static_cast<u8>(mem.Read8(sym_va + 4)) >> 4) == 2;
-        if (d.strtab_va) {
-            std::string name;
-            for (u64 i = 0; i < 512; ++i) {
-                const u8 c = static_cast<u8>(mem.Read8(d.strtab_va + name_off + i));
-                if (!c) break;
-                name.push_back(static_cast<char>(c));
-            }
-            s.name = std::move(name);
-        }
-        return s;
+        auto s = RecompGaps::ReadDynSymbol(d.symtab_va, d.strtab_va, index, read8);
+        return SymInfo{std::move(s.name), s.value, s.defined, s.weak};
     }
 
     // Every module's exported (defined) symbols, keyed by name, so
@@ -1425,7 +1401,6 @@ struct ArmRecomp::Impl {
     // actually writes anything - a relocation processed before its target
     // module's exports are indexed would silently resolve to nothing.
     void IndexExports(const DynInfo& d, std::unordered_map<std::string, u64>& out) {
-        if (!d.symtab_va || !d.strtab_va) return;
         // No count is stored in .dynamic for a plain DT_SYMTAB (that's normally
         // DT_HASH/DT_GNU_HASH territory), but .dynsym and .dynstr are laid out
         // back to back in every Switch module observed so far, so the gap
@@ -1433,17 +1408,7 @@ struct ArmRecomp::Impl {
         // from name-offset values, which was cutting exports short before
         // rtld's own required symbols were reached (18 unresolved externals
         // for rtld itself were enough to trigger its self-abort).
-        u32 max_index = 8192;
-        if (d.strtab_va > d.symtab_va) {
-            const u64 span = d.strtab_va - d.symtab_va;
-            max_index = static_cast<u32>(std::min<u64>(span / 24, 65536));
-        }
-        for (u32 i = 1; i < max_index; ++i) { // index 0 is always the null symbol
-            const auto sym = ReadSymbol(d, i);
-            if (sym.defined && !sym.name.empty()) {
-                out.emplace(sym.name, d.mod_base + sym.value);
-            }
-        }
+        RecompGaps::IndexModuleExports(d.mod_base, d.symtab_va, d.strtab_va, read8, out);
     }
 
     void ApplyRelocTable(const DynInfo& d, u64 table_va, u64 table_sz, u64 entry_sz,
@@ -1552,8 +1517,8 @@ struct ArmRecomp::Impl {
                     // sites on its allocator path, so every allocation took the
                     // hook branch and got nothing back.
                     // Strong symbols keep the trap sentinel.
-                    const u64 stub =
-                        sym.weak ? 0 : (d.trap_va ? d.trap_va : kUnresolvedImportTrap);
+                    const u64 stub = RecompGaps::UndefinedImportValue(
+                        sym.weak, d.trap_va ? d.trap_va : kUnresolvedImportTrap);
                     mem.Write64(d.mod_base + r_offset, stub);
                     // The trap counter cannot report this case - it is only
                     // written when a thread actually reaches kUnresolvedImportTrap,
@@ -1687,6 +1652,9 @@ struct ArmRecomp::Impl {
 
     RecompDiagnosticSampler diagnostics;
     System& system;
+    // Byte reads of this process's memory for the RecompGaps module parsers.
+    const RecompGaps::GuestRead8 read8{
+        [this](u64 va) -> std::uint8_t { return system.ApplicationMemory().Read8(va); }};
     RecompLookupFn lookup{};
     GuestContextView ctx{};
     RecompHostMem bridge{};

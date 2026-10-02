@@ -630,6 +630,76 @@ std::string ModuleNameFromRodata(const std::uint8_t* rodata, std::size_t size) {
     return {};
 }
 
+namespace {
+
+std::uint64_t ReadLe(const GuestRead8& read8, std::uint64_t va, int bytes) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < bytes; ++i) {
+        v |= std::uint64_t{read8(va + i)} << (8 * i);
+    }
+    return v;
+}
+
+} // namespace
+
+std::uint64_t FindMod0(std::uint64_t module_base, const GuestRead8& read8) {
+    constexpr std::uint64_t kMagic = 0x30444F4Du; // "MOD0"
+    const std::uint64_t pointed = module_base + ReadLe(read8, module_base + 4, 4);
+    if (ReadLe(read8, pointed, 4) == kMagic) {
+        return pointed;
+    }
+    for (std::uint64_t off = 0; off < 0x4000; off += 4) {
+        if (ReadLe(read8, module_base + off, 4) == kMagic) {
+            return module_base + off;
+        }
+    }
+    return 0;
+}
+
+DynSymbol ReadDynSymbol(std::uint64_t symtab_va, std::uint64_t strtab_va, std::uint32_t index,
+                        const GuestRead8& read8) {
+    // Elf64_Sym: st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8)
+    // st_size(8) = 24 bytes.
+    DynSymbol s;
+    if (!symtab_va) {
+        return s;
+    }
+    const std::uint64_t sym_va = symtab_va + std::uint64_t{index} * 24;
+    const std::uint64_t name_off = ReadLe(read8, sym_va, 4);
+    s.weak = (read8(sym_va + 4) >> 4) == 2; // binding is st_info's high nibble
+    s.defined = ReadLe(read8, sym_va + 6, 2) != 0; // SHN_UNDEF == 0
+    s.value = ReadLe(read8, sym_va + 8, 8);
+    if (strtab_va) {
+        for (std::uint64_t i = 0; i < 512; ++i) {
+            const auto c = read8(strtab_va + name_off + i);
+            if (!c) {
+                break;
+            }
+            s.name.push_back(static_cast<char>(c));
+        }
+    }
+    return s;
+}
+
+void IndexModuleExports(std::uint64_t module_base, std::uint64_t symtab_va,
+                        std::uint64_t strtab_va, const GuestRead8& read8,
+                        std::unordered_map<std::string, std::uint64_t>& out) {
+    if (!symtab_va || !strtab_va) {
+        return;
+    }
+    std::uint32_t max_index = 8192;
+    if (strtab_va > symtab_va) {
+        max_index = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>)((strtab_va - symtab_va) / 24, 65536));
+    }
+    for (std::uint32_t i = 1; i < max_index; ++i) { // 0 is the null symbol
+        const auto sym = ReadDynSymbol(symtab_va, strtab_va, i, read8);
+        if (sym.defined && !sym.name.empty()) {
+            out.emplace(sym.name, module_base + sym.value);
+        }
+    }
+}
+
 std::string Serialize(const GapData& d) {
     std::string o = "{\n";
     o += "  \"schema\": \"" + std::string{kSchemaName} + "\",\n";
