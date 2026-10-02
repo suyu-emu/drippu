@@ -21,11 +21,11 @@ clean exit.
 
 ## Run
 
-    python make_fixture.py OUTDIR
-    # PowerShell, with an isolated profile (never use your real one):
-    $env:APPDATA = "<scratch>\appdata"; $env:LOCALAPPDATA = "<scratch>\local"
-    $env:SUYU_CMD_CAPTURE_HEADLESS = "1"
-    suyu-cmd.exe -g OUTDIR\main
+        python make_fixture.py OUTDIR
+        # PowerShell, with an isolated profile (never use your real one):
+        $env:APPDATA = "<scratch>\appdata"; $env:LOCALAPPDATA = "<scratch>\local"
+        $env:SUYU_CMD_CAPTURE_HEADLESS = "1"
+        suyu-cmd.exe -g OUTDIR\main
 
 suyu-cmd currently needs `<APPDATA>\suyu\keys\prod.keys` to exist and to hold a
 non-zero `header_key` (an all-zero key crashes NCA identification with a divide
