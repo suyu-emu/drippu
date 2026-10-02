@@ -111,6 +111,13 @@ bool IsRecompFpxReady();
 using RecompBaseFn = void (*)(size_t index, const char* module, const char* build_id, u64 base);
 void SetRecompBaseSetter(RecompBaseFn setter);
 
+/// Called once per process after the base setter has seen every loaded module
+/// and before the first block runs. Logs any registered image left without a
+/// base and returns how many of those have their module loaded; a strict run
+/// refuses to start when that is nonzero.
+using RecompBindCheckFn = size_t (*)();
+void SetRecompBindCheck(RecompBindCheckFn check);
+
 // Installed only for a stopped, explicitly prepared static-image session.
 using RecompModules = std::map<u64, std::string>;
 using RecompPrepareFn = bool (*)(const RecompModules& modules);

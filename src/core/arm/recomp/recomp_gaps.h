@@ -148,6 +148,17 @@ std::optional<std::size_t> MatchImage(const std::vector<ImageIdentity>& images,
                                       std::size_t load_index, std::string_view module_name,
                                       std::string_view module_build_id);
 
+/// Bytes ModuleNameFromRodata may look at: the newer header plus the path struct.
+inline constexpr std::size_t kRodataModuleNameBytes = 12 + 8 + 0x200;
+
+/// The kernel's name for a module ("nnrtld", "EX-King.nss"): the module path
+/// at the start of its read-only segment with any directories removed, or
+/// empty when the segment starts with neither layout. Older SDKs start rodata
+/// with {u32 0, s32 length, char path[length]}; newer ones (TOTK 1.4.3) put
+/// {u32 1, u32 end of path, u32} in front of that same struct. `size` may be
+/// smaller than kRodataModuleNameBytes.
+std::string ModuleNameFromRodata(const std::uint8_t* rodata, std::size_t size);
+
 std::string Serialize(const GapData& data);
 std::optional<GapData> Parse(std::string_view json, std::string* error = nullptr);
 /// Adds `from` into `into`: run counts and hits add, offsets and opcodes dedupe.
@@ -194,6 +205,9 @@ public:
     void NoteImage(std::uint64_t base, std::string_view image_name);
     /// Build ID of the noted module containing `address`; empty if none.
     std::string BuildIdAt(std::uint64_t address) const;
+    /// Whether a noted module has this build ID or, when `build_id` is empty,
+    /// this name (ignoring case).
+    bool HasModule(std::string_view build_id, std::string_view name) const;
     void RecordMiss(std::uint64_t pc);
     void RecordUnimplemented(std::uint32_t insn);
     /// This run as a one-run GapData.

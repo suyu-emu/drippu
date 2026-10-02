@@ -587,6 +587,49 @@ std::optional<std::size_t> MatchImage(const std::vector<ImageIdentity>& images,
     return std::nullopt;
 }
 
+std::string ModuleNameFromRodata(const std::uint8_t* rodata, std::size_t size) {
+    constexpr std::size_t kPathMax = 0x200;
+    const auto word = [&](std::size_t at) -> std::optional<std::uint32_t> {
+        if (at + 4 > size) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint32_t>(rodata[at]) | (std::uint32_t{rodata[at + 1]} << 8) |
+               (std::uint32_t{rodata[at + 2]} << 16) | (std::uint32_t{rodata[at + 3]} << 24);
+    };
+    // {u32 0, s32 length, char path[length]} at `at`, ending by `limit`.
+    const auto path_at = [&](std::size_t at, std::size_t limit) -> std::string {
+        const auto zero = word(at);
+        const auto length = word(at + 4);
+        if (!zero || !length || *zero != 0 || *length == 0 || *length > 0x7fffffffu ||
+            at + 8 + *length > limit) {
+            return {};
+        }
+        const std::size_t start = at + 8;
+        std::size_t end = start + (std::min<std::size_t>)({*length, kPathMax - 1, size - start});
+        end = static_cast<std::size_t>(std::find(rodata + start, rodata + end, '\0') - rodata);
+        std::size_t name = start;
+        for (std::size_t i = start; i < end; ++i) {
+            if (rodata[i] == '/' || rodata[i] == '\\') {
+                name = i + 1;
+            }
+        }
+        return std::string(reinterpret_cast<const char*>(rodata) + name, end - name);
+    };
+    const auto first = word(0);
+    if (!first) {
+        return {};
+    }
+    if (*first == 0) {
+        return path_at(0, std::numeric_limits<std::size_t>::max());
+    }
+    // The newer header's second word is where the path struct after it ends.
+    const auto path_end = word(4);
+    if (*first == 1 && path_end && word(8)) {
+        return path_at(12, *path_end);
+    }
+    return {};
+}
+
 std::string Serialize(const GapData& d) {
     std::string o = "{\n";
     o += "  \"schema\": \"" + std::string{kSchemaName} + "\",\n";
@@ -1255,6 +1298,24 @@ std::string SessionRecorder::BuildIdAt(std::uint64_t address) const {
     }
     --it;
     return address - it->first < it->second.size ? it->second.build_id : std::string{};
+}
+
+bool SessionRecorder::HasModule(std::string_view build_id, std::string_view name) const {
+    std::scoped_lock lk{lock};
+    const std::string wanted = NormalizeBuildId(build_id);
+    const std::string wanted_name = SanitizeName(name);
+    const auto lower = [](char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    return std::any_of(loaded.begin(), loaded.end(), [&](const auto& entry) {
+        const Module& m = entry.second;
+        if (!build_id.empty()) {
+            return !wanted.empty() && m.build_id == wanted;
+        }
+        return !wanted_name.empty() && m.name.size() == wanted_name.size() &&
+               std::equal(m.name.begin(), m.name.end(), wanted_name.begin(),
+                          [&](char a, char b) { return lower(a) == lower(b); });
+    });
 }
 
 void SessionRecorder::RecordMiss(std::uint64_t pc) {

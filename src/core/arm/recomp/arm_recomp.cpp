@@ -433,6 +433,11 @@ constexpr u64 kUnresolvedImportTrap = 0xFFFF'FFFF'0000'0000ULL;
 namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
+std::atomic<RecompBindCheckFn> g_recomp_bind_check{nullptr};
+// The process whose bindings were checked (id | 1 << 63), and whether a strict
+// run refused it because an image never got its module's base.
+std::atomic<u64> g_bind_checked_process{0};
+std::atomic<bool> g_bind_refused{false};
 std::mutex g_process_init_lock;
 std::atomic<RecompPrepareFn> g_recomp_prepare{nullptr};
 
@@ -897,6 +902,10 @@ void SetRecompBaseSetter(RecompBaseFn setter) {
     g_recomp_base_setter.store(setter, std::memory_order_release);
 }
 
+void SetRecompBindCheck(RecompBindCheckFn check) {
+    g_recomp_bind_check.store(check, std::memory_order_release);
+}
+
 RecompLiveStats GetRecompLiveStats() {
     return RecompLiveStats{
         TotalStaticBlocks(),
@@ -1229,12 +1238,18 @@ struct ArmRecomp::Impl {
 
     /// Base address of the module containing `pc`, so an address can be turned
     /// into the module-relative offset a recompiled image is keyed by. The
-    /// module list is fixed once the process is running, so it is read once.
+    /// module list is fixed once the process is running, so it is read once:
+    /// the first guest entry comes after KProcess::Run, which the loader
+    /// precedes. The bind check in RunThread reports any image left unbound.
     u64 ModuleBaseFor(Kernel::KThread* thread, u64 pc) {
         if (!modules_read) {
             modules_read = true;
             if (auto* process = thread->GetOwnerProcess()) {
                 modules = FindModules(process);
+                if (modules.empty()) {
+                    LOG_ERROR(Core_ARM, "recomp: no loaded module could be named; recompiled "
+                                        "images get no base");
+                }
                 g_counters.RecordModules(modules);
                 // Now that the loader has placed everything, tell each image
                 // where its own module went.
@@ -1931,6 +1946,33 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             impl->ModuleBaseFor(thread, impl->ctx.pc);
             impl->ApplyAllRelocations(impl->modules);
             impl->rela_applied = true;
+        }
+    }
+
+    // Once per process, before its first block: every image that should have
+    // been given a base has one, or the run says so instead of faulting on a
+    // module-relative address used as absolute.
+    if (auto* process = thread->GetOwnerProcess()) {
+        const u64 key = process->GetProcessId() | (u64{1} << 63);
+        if (g_bind_checked_process.load(std::memory_order_acquire) != key) {
+            std::scoped_lock lock{g_process_init_lock};
+            if (g_bind_checked_process.load(std::memory_order_relaxed) != key) {
+                const auto check = g_recomp_bind_check.load(std::memory_order_acquire);
+                const size_t unbound = check ? check() : 0;
+                const bool refused = unbound != 0 && StrictNoFallback();
+                if (refused) {
+                    LOG_CRITICAL(Core_ARM,
+                                 "recomp: strict mode - {} recompiled image(s) were never bound "
+                                 "to their loaded module; refusing to run",
+                                 unbound);
+                    RecompGaps::Flush(true, true);
+                }
+                g_bind_refused.store(refused, std::memory_order_relaxed);
+                g_bind_checked_process.store(key, std::memory_order_release);
+            }
+        }
+        if (g_bind_refused.load(std::memory_order_relaxed)) {
+            return HaltReason::PrefetchAbort;
         }
     }
 

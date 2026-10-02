@@ -93,6 +93,10 @@ std::string ModuleBuildId(u64 address) {
     return g_recorder.BuildIdAt(address);
 }
 
+bool HasLoadedModule(std::string_view build_id, std::string_view name) {
+    return g_recorder.HasModule(build_id, name);
+}
+
 void RecordMiss(u64 pc) {
     if (g_active.load(std::memory_order_acquire)) {
         g_recorder.RecordMiss(pc);

@@ -192,6 +192,7 @@ def main():
         exporter = executable(export_build, "smoke_export")
         call([executable(export_build, "smoke_gaps_unit")])
         call([executable(export_build, "smoke_binding_unit")])
+        call([executable(export_build, "smoke_module_name_unit")])
         call([executable(export_build, "smoke_literal_unit")])
         check_coverage_loop(root, exporter, build)
         generated = {}

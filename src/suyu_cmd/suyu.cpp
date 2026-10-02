@@ -1918,6 +1918,7 @@ int main(int argc, char** argv) {
         unsigned (*guard_v2)(unsigned){};
         std::string name;     // export name: rtld, main, subsdk0, sdk
         std::string build_id; // empty for registrations from before build IDs
+        bool bound{};         // given its loaded module's base
     };
     static std::vector<RecompModule> s_recomp_modules;
     bool recomp_guard_ready = false;
@@ -2232,10 +2233,34 @@ int main(int argc, char** argv) {
             }
             auto& m = s_recomp_modules[*image];
             m.set_base(base);
+            m.bound = true;
             // Misses in this module are gaps a re-export can close.
             Core::RecompGaps::NoteImage(base, m.name);
             LOG_INFO(Frontend, "Recompiled image '{}' bound to module '{}' (#{}, build_id={}, base {:#x})",
                      m.name, module ? module : "?", index, id.substr(0, 16), base);
+        });
+        // Before the first block: an image left unbound runs with base 0, so its
+        // first module-relative address faults instead of saying why.
+        Core::SetRecompBindCheck([]() -> size_t {
+            std::string unbound;
+            size_t loaded = 0;
+            for (const auto& m : s_recomp_modules) {
+                if (m.bound) {
+                    continue;
+                }
+                const bool module_loaded = Core::RecompGaps::HasLoadedModule(m.build_id, m.name);
+                loaded += module_loaded ? 1 : 0;
+                unbound += fmt::format("{}{} (build_id={}{})", unbound.empty() ? "" : ", ",
+                                       m.name, m.build_id.substr(0, 16),
+                                       module_loaded ? ", its module is loaded" : "");
+            }
+            if (!unbound.empty()) {
+                LOG_WARNING(Frontend,
+                            "Recompiled image(s) not bound to any loaded module, so their code "
+                            "cannot run statically: {}",
+                            unbound);
+            }
+            return loaded;
         });
         // A window running native recompiled code is a standalone game export,
         // not the suyu dev frontend — the window chrome (title/icon) should
