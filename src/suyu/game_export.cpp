@@ -3515,7 +3515,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !suyu::recomp::g_emit_fastmem ||
                 contents.contains(QStringLiteral("\"image_features\": %1,").arg(image_features));
             const bool same_correctness_revision = contents.contains(
-                QStringLiteral("\"correctness_revision\": \"20260927-hybrid-guard-control-units-v3\","));
+                QStringLiteral("\"correctness_revision\": \"20261001-module-binding-by-build-id-v4\","));
             const bool same_translate_all = contents.contains(
                 QStringLiteral("\"translate_all\": ") +
                 (translate_all ? QStringLiteral("true,") : QStringLiteral("false,")));
@@ -4932,7 +4932,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (suyu::recomp::g_emit_fastmem) {
             out << "  \"image_features\": " << image_features << ",\n";
         }
-        out << "  \"correctness_revision\": \"20260927-hybrid-guard-control-units-v3\",\n";
+        out << "  \"correctness_revision\": \"20261001-module-binding-by-build-id-v4\",\n";
         out << "  \"source_exefs_sha256\": \"" << source_hash << "\",\n";
         out << "  \"translate_all\": " << (translate_all ? "true" : "false") << ",\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
