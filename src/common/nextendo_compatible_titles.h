@@ -11,7 +11,7 @@
 // Only one game version per title can reach Nextendo's servers; there's no server-side
 // version-gate endpoint, so this table is the source of truth.
 //
-// Lives in common/, not citron/: it's read from both the Qt frontend (game-list "needs
+// Lives in common/, not suyu/: it's read from both the Qt frontend (game-list "needs
 // update" badge) and core/hle/service/acc (the actual online PID gate) -- same reason
 // Common::NextendoAccount lives here instead of in either layer alone.
 namespace Nextendo::CompatibleTitles {

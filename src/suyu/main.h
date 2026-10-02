@@ -440,6 +440,10 @@ private slots:
     void OnInstallDecryptionKeys();
     void OnConfigureExternalDecryption();
     void OnAbout();
+#ifdef ENABLE_UPDATE_CHECKER
+    void OnCheckForUpdates();
+    void RunStartupUpdateCheck();
+#endif
     void OnToggleFilterBar();
     void OnToggleStatusBar();
     void OnToggleFoldersInList();

@@ -68,6 +68,37 @@ jobs:
       - name: Run active image ABI smoke suite
         run: python3 tests/recompiler_smoke/run.py
 
+  tests-macos:
+    name: macOS tests
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Install deps
+        run: >-
+          brew install ninja openssl ffmpeg glslang boost pkgconf libusb enet sdl3
+          opus nasm autoconf automake libtool
+      - name: Configure
+        run: |
+          cmake --version
+          set -o pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=OFF -DYUZU_TESTS=ON -DYUZU_CMD=OFF -GNinja \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix openssl);$(brew --prefix ffmpeg);$(brew --prefix libusb);$(brew --prefix enet);$(brew --prefix sdl3)" 2>&1 | tee cmake_configure.log
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cmake-log-tests-macos
+          path: cmake_configure.log
+      - name: Build tests
+        run: cmake --build build --target tests -j4
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
   tests-sanitizer:
     name: Linux x86-64 sanitizers
     runs-on: ubuntu-24.04

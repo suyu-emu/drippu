@@ -34,6 +34,16 @@ const Themes included_themes{{
 
 Values values = {};
 
+// Published by GMainWindow::UpdateThemePalette() after it resolves the
+// effective theme (adaptive themes included). Defaults to false so dialogs
+// opened before the first publish - there should be none, but if there are -
+// get the light styling rather than crashing or reading garbage.
+std::atomic_bool g_is_dark_theme{false};
+
+bool IsDarkTheme() {
+    return g_is_dark_theme.load(std::memory_order_relaxed);
+}
+
 u32 CalculateWidth(u32 height, Settings::AspectRatio ratio) {
     switch (ratio) {
     case Settings::AspectRatio::R4_3:

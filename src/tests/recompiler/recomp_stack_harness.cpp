@@ -2086,7 +2086,7 @@ void ExportExecutionJson(const fs::path& path) {
     std::ifstream in(path);
     std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     ExpectTrue("JSON file not empty", !json.empty());
-    ExpectTrue("JSON schema_version 1", json.find("\"schema_version\": 1") != std::string::npos);
+    ExpectTrue("JSON schema_version 2", json.find("\"schema_version\": 2") != std::string::npos);
     ExpectTrue("JSON kind recomp_execution", json.find("\"kind\": \"recomp_execution\"") != std::string::npos);
     ExpectTrue("JSON clock steady_clock", json.find("\"clock\": \"steady_clock\"") != std::string::npos);
     ExpectTrue("JSON backends.aot", json.find("\"aot\"") != std::string::npos);
@@ -2095,7 +2095,7 @@ void ExportExecutionJson(const fs::path& path) {
     ExpectTrue("JSON icache", json.find("\"icache\"") != std::string::npos);
 
     const auto m = Core::GetRecompExecutionMetrics();
-    ExpectEq("metrics schema", static_cast<u64>(Core::RecompExecutionMetrics::kSchemaVersion), 1);
+    ExpectEq("metrics schema", static_cast<u64>(Core::RecompExecutionMetrics::kSchemaVersion), 2);
     ExpectTrue("AOT block_executions > 0", m.aot_block_executions > 0);
     ExpectTrue("AOT time_ns > 0", m.aot_time_ns > 0);
     ExpectTrue("Dynarmic run+step slices > 0",
@@ -2506,7 +2506,7 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
     std::ostringstream entry_pc;
     entry_pc << "0x" << std::hex << (g_entry + kOffBench);
     nlohmann::json doc{
-        {"schema_version", 1},
+        {"schema_version", 2},
         {"kind", "recomp_benchmark"},
         {"clock", "steady_clock"},
         {"related",
@@ -2599,8 +2599,8 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
     std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     ExpectTrue("bench JSON kind recomp_benchmark",
                json.find("\"kind\": \"recomp_benchmark\"") != std::string::npos);
-    ExpectTrue("bench JSON schema_version 1",
-               json.find("\"schema_version\": 1") != std::string::npos);
+    ExpectTrue("bench JSON schema_version 2",
+               json.find("\"schema_version\": 2") != std::string::npos);
     ExpectTrue("bench JSON hybrid_aot mode", json.find("\"hybrid_aot\"") != std::string::npos);
     ExpectTrue("bench JSON jit mode", json.find("\"jit\"") != std::string::npos);
     ExpectTrue("bench JSON not_single_shift",

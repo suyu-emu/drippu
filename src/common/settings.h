@@ -729,6 +729,11 @@ struct Values {
 #endif
     };
     Setting<bool> controller_navigation{linkage, true, "controller_navigation", Category::Controls};
+    Setting<int> navigation_repeat_delay{linkage, 500, "navigation_repeat_delay",
+                                         Category::Controls};
+    Setting<int> navigation_repeat_interval{linkage, 150, "navigation_repeat_interval",
+                                            Category::Controls};
+    Setting<float> navigation_deadzone{linkage, 0.5f, "navigation_deadzone", Category::Controls};
     Setting<bool> enable_joycon_driver{linkage, true, "enable_joycon_driver", Category::Controls};
     Setting<bool> enable_procon_driver{linkage, false, "enable_procon_driver", Category::Controls};
 
@@ -895,6 +900,42 @@ struct Values {
     /// refuse-everything behaviour.
     Setting<std::string> network_replacement_host{linkage, "", "network_replacement_host",
                                                   Category::Network};
+
+    // Nextendo (opt-in community network). Off by default; enabling it redirects
+    // the relevant game traffic at the Nimbus/DNS layer, never by shipping secrets.
+    Setting<bool> enable_nextendo{linkage, false, "enable_nextendo", Category::Network};
+    Setting<std::string> nextendo_server_ip{linkage, "51.178.29.194", "nextendo_server_ip",
+                                            Category::Network};
+    Setting<std::string> nextendo_nat_ip{linkage, "164.132.111.120", "nextendo_nat_ip",
+                                         Category::Network};
+    Setting<std::string> nextendo_pid{linkage, "", "nextendo_pid", Category::Network};
+    // Governs the automatic pull-on-boot/push-on-stop cloud save sync only -- the manual
+    // "Download Save" button in the Nextendo Account dialog is an explicit per-click action
+    // and isn't gated by this, since that's already opt-in every time.
+    Setting<bool> nextendo_cloud_sync_enabled{linkage, true, "nextendo_cloud_sync_enabled",
+                                              Category::Network};
+
+    // Self-update. The compiled-in defaults point at this project's own
+    // releases (see CMakeModules/GenerateSCMRev.cmake); the settings below let
+    // the user retarget the updater without rebuilding - at a fork, or at a new
+    // home if drippu ever moves to another host. Hosts speak either the GitHub
+    // releases API or the project's own "fake" API (a `base` key plus an
+    // `assets` list); Common::Net::UpdateSource documents both.
+    //
+    // Empty means "use the compiled-in default" for each field. The four
+    // update_* fields together form one override source; update_extra_sources
+    // holds further sources, one per line, in UpdateSource serialized form.
+    Setting<bool> update_check_startup{linkage, true, "update_check_startup",
+                                       Category::Miscellaneous};
+    Setting<std::string> update_repo_override{linkage, "", "update_repo_override",
+                                              Category::Miscellaneous};
+    Setting<std::string> update_api_host{linkage, "", "update_api_host",
+                                         Category::Miscellaneous};
+    Setting<std::string> update_api_path{linkage, "", "update_api_path",
+                                         Category::Miscellaneous};
+    Setting<std::string> update_website{linkage, "", "update_website", Category::Miscellaneous};
+    Setting<std::string> update_extra_sources{linkage, "", "update_extra_sources",
+                                              Category::Miscellaneous};
 
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",

@@ -95,7 +95,7 @@ public:
                     skip_cert_verification);
     }
 
-    Result DoHandshake() override {
+    Result DoHandshake(std::span<const std::string> /*requested_alpn_protos*/) override {
         while (1) {
             Result r;
             switch (handshake_state) {

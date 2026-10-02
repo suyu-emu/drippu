@@ -15,6 +15,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/sockets/bsd.h"
 #include "core/hle/service/ssl/cert_store.h"
+#include "core/hle/service/ssl/nextendo_nat_rewrite.h"
 #include "core/hle/service/ssl/ssl.h"
 #include "core/hle/service/ssl/ssl_backend.h"
 #include "core/internal_network/network.h"
@@ -217,7 +218,20 @@ private:
 
     Result DoHandshakeImpl() {
         ASSERT_OR_EXECUTE(!did_handshake && socket, { return ResultNoSocket; });
-        Result res = backend->DoHandshake();
+        // next_alpn_proto is the raw wire-format list the guest passed to SetNextAlpnProto
+        // (length-prefixed entries). Split it out so backends can pick the protocols they
+        // support; the ssl_backend_none stub has no use for it.
+        std::vector<std::string> requested_alpn_protos;
+        for (size_t i = 0; i < next_alpn_proto.size();) {
+            const auto len = static_cast<size_t>(next_alpn_proto[i]);
+            if (len == 0 || i + 1 + len > next_alpn_proto.size()) {
+                break;
+            }
+            requested_alpn_protos.emplace_back(reinterpret_cast<const char*>(&next_alpn_proto[i + 1]),
+                                               len);
+            i += 1 + len;
+        }
+        Result res = backend->DoHandshake(requested_alpn_protos);
         did_handshake = res.IsSuccess();
         return res;
     }
@@ -267,7 +281,18 @@ private:
 
     Result WriteImpl(size_t* out_size, std::span<const u8> data) {
         ASSERT_OR_EXECUTE(did_handshake, { return ResultInternalError; });
-        return backend->Write(out_size, data);
+
+        // Splatoon 2's station responses carry our private LAN IP where the external IP should
+        // be; substitute it pre-TLS and report the original length back to the guest.
+        std::vector<u8> rewritten;
+        const bool did_rewrite = Service::SSL::TryFixupStationAddress(data, rewritten);
+        const std::span<const u8> send_data = did_rewrite ? std::span<const u8>(rewritten) : data;
+
+        const Result res = backend->Write(out_size, send_data);
+        if (did_rewrite && res.IsSuccess()) {
+            *out_size = data.size();
+        }
+        return res;
     }
 
     Result PendingImpl(s32* out_pending) {
