@@ -2638,32 +2638,6 @@ static FileSys::VirtualDir ExtractExeFsFromRom(const std::string& rom_path,
     return nullptr;
 }
 
-// Save every file in a VirtualDir to disk recursively.
-// Returns number of bytes written, -1 on failure.
-static qint64 DumpVirtualDir(const FileSys::VirtualDir& vdir, const QString& dest_dir) {
-    if (!vdir) return 0;
-    QDir().mkpath(dest_dir);
-    qint64 total = 0;
-    for (const auto& f : vdir->GetFiles()) {
-        const auto data = f->ReadAllBytes();
-        QFile out(dest_dir + QLatin1Char('/') + QString::fromStdString(f->GetName()));
-        if (!out.open(QIODevice::WriteOnly)) return -1;
-        if (out.write(reinterpret_cast<const char*>(data.data()),
-                      static_cast<qint64>(data.size())) != static_cast<qint64>(data.size()) ||
-            !out.flush() || out.error() != QFile::NoError) {
-            return -1;
-        }
-        total += static_cast<qint64>(data.size());
-    }
-    for (const auto& sub : vdir->GetSubdirectories()) {
-        const qint64 r = DumpVirtualDir(
-            sub, dest_dir + QLatin1Char('/') + QString::fromStdString(sub->GetName()));
-        if (r < 0) return -1;
-        total += r;
-    }
-    return total;
-}
-
 // Extract the same effective RomFS that the loader uses for the Program NCA.
 // The ExeFS extractor above selects the effective update via PatchManager;
 // packaging a base RomFS beside that ExeFS makes an internally inconsistent
