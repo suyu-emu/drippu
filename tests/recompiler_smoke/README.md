@@ -91,6 +91,13 @@ image to its own module, the omitted module gets none, and an image whose
 module is not loaded stays unbound. Registrations without build IDs bind by
 NSO slot name instead. Images were once bound by position, which this fails.
 
+## Literal loads
+
+`smoke_literal_unit` translates LDR and LDRSW (literal) for GPRs and Q
+registers and checks that each reads from `g_module_base` plus the module
+offset, like ADR/ADRP. The suite above runs at base 0, where a missing base
+goes unnoticed; TOTK main faulted on exactly that.
+
 ## Coverage loop (recomp_gaps.json)
 
 `smoke_gaps_unit` checks `core/arm/recomp/recomp_gaps.cpp` on its own: the

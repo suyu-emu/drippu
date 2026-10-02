@@ -1251,8 +1251,11 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 field = (i >> 5) & 0x7FFFF;
         const s64 offset = (field & 0x40000) ? (s64)field - 0x80000 : (s64)field;
         const u64 address = pc + (u64)(offset * 4);
-        char literal[32];
-        snprintf(literal, sizeof literal, "0x%llxULL", (unsigned long long)address);
+        // Module-relative like ADR/ADRP above: the load base is only known at
+        // run time.
+        char literal[48];
+        snprintf(literal, sizeof literal, "(g_module_base+0x%llxULL)",
+                 (unsigned long long)address);
         const std::string addr = literal;
         if (!V && opc == 3) {
             put("/* prfm literal: hint, no effect */");
