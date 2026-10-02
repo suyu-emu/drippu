@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <system_error>
@@ -55,12 +56,15 @@ struct Value {
     bool boolean = false;
     std::string text; // string contents, or the number's literal
     std::vector<Value> array;
-    std::vector<std::pair<std::string, Value>> object;
+    // Keys and values side by side: a std::pair holding Value cannot be formed while
+    // Value is still incomplete, which clang with libstdc++ rejects.
+    std::vector<std::string> keys;
+    std::vector<Value> values;
 
     const Value* Get(std::string_view key) const {
-        for (const auto& [k, v] : object) {
-            if (k == key) {
-                return &v;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == key) {
+                return &values[i];
             }
         }
         return nullptr;
@@ -203,7 +207,8 @@ private:
                 if (!Parse(item, depth + 1)) {
                     return false;
                 }
-                v.object.emplace_back(std::move(key), std::move(item));
+                v.keys.push_back(std::move(key));
+                v.values.push_back(std::move(item));
                 Skip();
                 if (pos < s.size() && s[pos] == ',') {
                     ++pos;
@@ -459,8 +464,13 @@ std::uint64_t GapData::Misses() const {
     return n;
 }
 
+std::uint64_t GapData::UnsupportedInstructionKinds() const {
+    return std::max<std::uint64_t>(unimplemented.size(), imported_unsupported_kinds);
+}
+
 bool GapData::Clean() const {
-    return Misses() == 0 && modules.empty() && no_image.empty() && unimplemented.empty();
+    return Misses() == 0 && modules.empty() && no_image.empty() && unimplemented.empty() &&
+           imported_unsupported_kinds == 0;
 }
 
 std::string TitleIdHex(std::uint64_t title_id) {
@@ -542,6 +552,12 @@ std::string Serialize(const GapData& d) {
          ",\n";
     o += std::string{"  \"truncated\": "} + (d.truncated ? "true" : "false") + ",\n";
     o += "  \"unattributed_misses\": " + std::to_string(d.unattributed_misses) + ",\n";
+    if (d.imported_unsupported_kinds != 0 || d.imported_unsupported_hits != 0) {
+        o += "  \"imported_unsupported_instruction_kinds\": " +
+             std::to_string(d.imported_unsupported_kinds) + ",\n";
+        o += "  \"imported_unsupported_instruction_hits\": " +
+             std::to_string(d.imported_unsupported_hits) + ",\n";
+    }
     WriteModules(o, "modules", d.modules, true);
     WriteModules(o, "modules_without_image", d.no_image, false);
     o += "  \"unimplemented_opcodes\": [";
@@ -601,6 +617,8 @@ std::optional<GapData> Parse(std::string_view json, std::string* error) {
     d.strict_runs = CountOr0(root.Get("strict_static_runs"));
     d.clean_runs = CountOr0(root.Get("clean_runs"));
     d.unattributed_misses = CountOr0(root.Get("unattributed_misses"));
+    d.imported_unsupported_kinds = CountOr0(root.Get("imported_unsupported_instruction_kinds"));
+    d.imported_unsupported_hits = CountOr0(root.Get("imported_unsupported_instruction_hits"));
     if (const Value* b = root.Get("last_run_strict_static"); b && b->type == Value::Type::Bool) {
         d.last_run_strict = b->boolean;
     }
@@ -649,6 +667,373 @@ void Merge(GapData& into, const GapData& from) {
     for (const auto& [insn, hits] : from.unimplemented) {
         AddOpcode(into, insn, hits);
     }
+    into.imported_unsupported_kinds =
+        std::max(into.imported_unsupported_kinds, from.imported_unsupported_kinds);
+    into.imported_unsupported_hits =
+        SatAdd(into.imported_unsupported_hits, from.imported_unsupported_hits);
+}
+
+// ---- Shared coverage ----
+
+namespace {
+
+std::uint64_t Cap(std::uint64_t value) {
+    return std::min(value, kMaxSharedCount);
+}
+
+bool ValidSharedOffset(std::uint64_t offset) {
+    return offset < kMaxSharedOffset && (offset & 3) == 0;
+}
+
+bool IsCanonicalBuildId(std::string_view id) {
+    return id.size() == 64 && NormalizeBuildId(id) == id;
+}
+
+/// Exactly these keys, each at most once.
+bool KeysAre(const Value& object, std::initializer_list<std::string_view> allowed,
+             std::string& error, std::string_view where) {
+    std::vector<std::string_view> seen;
+    for (const std::string& key : object.keys) {
+        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+            error = "unsupported field '" + SanitizeName(key) + "' in " + std::string{where};
+            return false;
+        }
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+            error = "duplicate field '" + SanitizeName(key) + "' in " + std::string{where};
+            return false;
+        }
+        seen.push_back(key);
+    }
+    return true;
+}
+
+std::optional<std::uint64_t> SharedCount(const Value* v, std::string& error,
+                                         std::string_view what) {
+    const auto count = AsCount(v);
+    if (!count || *count > kMaxSharedCount) {
+        error = std::string{what} + " is not a count";
+        return std::nullopt;
+    }
+    return count;
+}
+
+} // namespace
+
+SharedCoverage ToShared(const GapData& d) {
+    SharedCoverage out;
+    std::uint64_t id = 0;
+    out.title_id = d.title_id.size() == 16 && ParseHex(d.title_id, id) && id != 0
+                       ? TitleIdHex(id)
+                       : std::string{};
+    out.runs = Cap(d.runs);
+    out.hybrid_runs = Cap(d.hybrid_runs);
+    out.strict_runs = Cap(d.strict_runs);
+    out.clean_runs = Cap(d.clean_runs);
+    out.truncated = d.truncated;
+    out.unattributed_misses = Cap(d.unattributed_misses);
+    // Counted, never listed: the encodings themselves stay in local diagnostics.
+    out.unsupported_instruction_kinds = Cap(d.UnsupportedInstructionKinds());
+    std::uint64_t hits = d.imported_unsupported_hits;
+    for (const auto& [insn, count] : d.unimplemented) {
+        hits = SatAdd(hits, count);
+    }
+    out.unsupported_instruction_hits = Cap(hits);
+    for (const auto& [build_id, m] : d.modules) {
+        if (!IsCanonicalBuildId(build_id)) {
+            continue;
+        }
+        if (out.modules.size() >= kMaxModules) {
+            out.truncated = true;
+            break;
+        }
+        SharedModule& target = out.modules[build_id];
+        target.hits = Cap(m.hits);
+        for (const auto& [offset, count] : m.offsets) {
+            if (ValidSharedOffset(offset) && target.offsets.size() < kMaxOffsetsPerModule) {
+                target.offsets.emplace(offset, Cap(count));
+            }
+        }
+    }
+    for (const auto& [build_id, m] : d.no_image) {
+        if (IsCanonicalBuildId(build_id) && out.modules_without_image.size() < kMaxModules) {
+            out.modules_without_image.emplace(build_id, Cap(m.hits));
+        }
+    }
+    return out;
+}
+
+std::string SerializeShared(const SharedCoverage& d) {
+    std::string o = "{\n";
+    o += "  \"schema\": \"" + std::string{kSharedSchemaName} + "\",\n";
+    o += "  \"schema_version\": " + std::to_string(kSharedSchemaVersion) + ",\n";
+    o += "  \"description\": \"" + std::string{kSharedDescription} + "\",\n";
+    o += "  \"title_id\": \"" + d.title_id + "\",\n";
+    o += "  \"runs\": " + std::to_string(d.runs) + ",\n";
+    o += "  \"hybrid_runs\": " + std::to_string(d.hybrid_runs) + ",\n";
+    o += "  \"strict_static_runs\": " + std::to_string(d.strict_runs) + ",\n";
+    o += "  \"clean_runs\": " + std::to_string(d.clean_runs) + ",\n";
+    o += std::string{"  \"truncated\": "} + (d.truncated ? "true" : "false") + ",\n";
+    o += "  \"unattributed_misses\": " + std::to_string(d.unattributed_misses) + ",\n";
+    o += "  \"unsupported_instruction_kinds\": " +
+         std::to_string(d.unsupported_instruction_kinds) + ",\n";
+    o += "  \"unsupported_instruction_hits\": " + std::to_string(d.unsupported_instruction_hits) +
+         ",\n";
+    o += "  \"modules\": [";
+    bool first = true;
+    for (const auto& [id, m] : d.modules) {
+        o += first ? "\n    {" : ",\n    {";
+        first = false;
+        o += "\"build_id\": \"" + id + "\", \"hits\": " + std::to_string(m.hits) +
+             ", \"offsets\": [";
+        bool first_offset = true;
+        for (const auto& [offset, hits] : m.offsets) {
+            o += first_offset ? "" : ", ";
+            first_offset = false;
+            o += "[\"" + Hex(offset) + "\", " + std::to_string(hits) + "]";
+        }
+        o += "]}";
+    }
+    o += first ? "],\n" : "\n  ],\n";
+    o += "  \"modules_without_image\": [";
+    first = true;
+    for (const auto& [id, hits] : d.modules_without_image) {
+        o += first ? "\n    {" : ",\n    {";
+        first = false;
+        o += "\"build_id\": \"" + id + "\", \"hits\": " + std::to_string(hits) + "}";
+    }
+    o += first ? "]\n}\n" : "\n  ]\n}\n";
+    return o;
+}
+
+std::optional<SharedCoverage> ParseShared(std::string_view json, std::string* error) {
+    std::string local;
+    std::string& e = error ? *error : local;
+    if (json.size() > kMaxFileBytes) {
+        e = "file is too large";
+        return std::nullopt;
+    }
+    Value root;
+    if (!Reader{json}.Document(root, e)) {
+        return std::nullopt;
+    }
+    if (root.type != Value::Type::Object) {
+        e = "not a JSON object";
+        return std::nullopt;
+    }
+    if (!KeysAre(root,
+                 {"schema", "schema_version", "description", "title_id", "runs", "hybrid_runs",
+                  "strict_static_runs", "clean_runs", "truncated", "unattributed_misses",
+                  "unsupported_instruction_kinds", "unsupported_instruction_hits", "modules",
+                  "modules_without_image"},
+                 e, "the file")) {
+        return std::nullopt;
+    }
+    const Value* schema = root.Get("schema");
+    if (!schema || schema->type != Value::Type::String || schema->text != kSharedSchemaName) {
+        e = "not a suyu shared coverage file";
+        return std::nullopt;
+    }
+    const auto version = AsCount(root.Get("schema_version"));
+    if (!version || *version != kSharedSchemaVersion) {
+        e = "unsupported schema_version";
+        return std::nullopt;
+    }
+    if (const Value* text = root.Get("description");
+        text && (text->type != Value::Type::String || text->text != kSharedDescription)) {
+        e = "description is not the schema's";
+        return std::nullopt;
+    }
+    SharedCoverage d;
+    const Value* title = root.Get("title_id");
+    std::uint64_t title_id = 0;
+    if (!title || title->type != Value::Type::String || title->text.size() != 16 ||
+        !ParseHex(title->text, title_id) || title_id == 0) {
+        e = "bad title_id";
+        return std::nullopt;
+    }
+    d.title_id = TitleIdHex(title_id);
+    const std::pair<const char*, std::uint64_t*> counts[] = {
+        {"runs", &d.runs},
+        {"hybrid_runs", &d.hybrid_runs},
+        {"strict_static_runs", &d.strict_runs},
+        {"clean_runs", &d.clean_runs},
+        {"unattributed_misses", &d.unattributed_misses},
+        {"unsupported_instruction_kinds", &d.unsupported_instruction_kinds},
+        {"unsupported_instruction_hits", &d.unsupported_instruction_hits},
+    };
+    for (const auto& [key, target] : counts) {
+        const auto count = SharedCount(root.Get(key), e, key);
+        if (!count) {
+            return std::nullopt;
+        }
+        *target = *count;
+    }
+    const Value* truncated = root.Get("truncated");
+    if (!truncated || truncated->type != Value::Type::Bool) {
+        e = "truncated is not a boolean";
+        return std::nullopt;
+    }
+    d.truncated = truncated->boolean;
+
+    const auto bounded_list = [&e](const Value* list, const char* what) -> const Value* {
+        if (!list || list->type != Value::Type::Array) {
+            e = std::string{what} + " is not an array";
+            return nullptr;
+        }
+        if (list->array.size() > kMaxModules) {
+            e = std::string{what} + " has too many modules";
+            return nullptr;
+        }
+        return list;
+    };
+    const auto build_id_of = [&e](const Value& item) -> std::optional<std::string> {
+        const Value* id = item.Get("build_id");
+        if (!id || id->type != Value::Type::String || !IsCanonicalBuildId(id->text)) {
+            e = "bad build_id";
+            return std::nullopt;
+        }
+        return id->text;
+    };
+
+    const Value* modules = bounded_list(root.Get("modules"), "modules");
+    if (!modules) {
+        return std::nullopt;
+    }
+    for (const Value& item : modules->array) {
+        if (item.type != Value::Type::Object) {
+            e = "module entry is not an object";
+            return std::nullopt;
+        }
+        if (!KeysAre(item, {"build_id", "hits", "offsets"}, e, "a module")) {
+            return std::nullopt;
+        }
+        const auto id = build_id_of(item);
+        if (!id) {
+            return std::nullopt;
+        }
+        if (d.modules.count(*id)) {
+            e = "duplicate build_id";
+            return std::nullopt;
+        }
+        const auto hits = SharedCount(item.Get("hits"), e, "hits");
+        if (!hits) {
+            return std::nullopt;
+        }
+        const Value* offsets = item.Get("offsets");
+        if (!offsets || offsets->type != Value::Type::Array ||
+            offsets->array.size() > kMaxOffsetsPerModule) {
+            e = "offsets is not a bounded array";
+            return std::nullopt;
+        }
+        SharedModule m;
+        m.hits = *hits;
+        for (const Value& pair : offsets->array) {
+            std::uint64_t offset = 0;
+            if (pair.type != Value::Type::Array || pair.array.size() != 2 ||
+                pair.array[0].type != Value::Type::String || pair.array[0].text.size() > 8 ||
+                !ParseHex(pair.array[0].text, offset) || !ValidSharedOffset(offset)) {
+                e = "bad offset entry";
+                return std::nullopt;
+            }
+            const auto count = SharedCount(&pair.array[1], e, "offset count");
+            if (!count) {
+                return std::nullopt;
+            }
+            if (!m.offsets.emplace(offset, *count).second) {
+                e = "duplicate offset";
+                return std::nullopt;
+            }
+        }
+        d.modules.emplace(*id, std::move(m));
+    }
+    const Value* without = bounded_list(root.Get("modules_without_image"), "modules_without_image");
+    if (!without) {
+        return std::nullopt;
+    }
+    for (const Value& item : without->array) {
+        if (item.type != Value::Type::Object) {
+            e = "module entry is not an object";
+            return std::nullopt;
+        }
+        if (!KeysAre(item, {"build_id", "hits"}, e, "a module without image")) {
+            return std::nullopt;
+        }
+        const auto id = build_id_of(item);
+        if (!id) {
+            return std::nullopt;
+        }
+        if (d.modules_without_image.count(*id)) {
+            e = "duplicate build_id";
+            return std::nullopt;
+        }
+        const auto hits = SharedCount(item.Get("hits"), e, "hits");
+        if (!hits) {
+            return std::nullopt;
+        }
+        d.modules_without_image.emplace(*id, *hits);
+    }
+    return d;
+}
+
+std::optional<SharedCoverage> ParseImport(std::string_view json, std::string* error,
+                                          bool* legacy) {
+    std::string local;
+    std::string& e = error ? *error : local;
+    if (legacy) {
+        *legacy = false;
+    }
+    Value root;
+    if (json.size() > kMaxFileBytes) {
+        e = "file is too large";
+        return std::nullopt;
+    }
+    if (!Reader{json}.Document(root, e)) {
+        return std::nullopt;
+    }
+    const Value* schema = root.type == Value::Type::Object ? root.Get("schema") : nullptr;
+    if (schema && schema->type == Value::Type::String && schema->text == kSharedSchemaName) {
+        return ParseShared(json, &e);
+    }
+    auto old = Parse(json, &e);
+    if (!old) {
+        return std::nullopt;
+    }
+    if (legacy) {
+        *legacy = true;
+    }
+    // Module names and raw encodings stop here.
+    return ToShared(*old);
+}
+
+void MergeShared(GapData& into, const SharedCoverage& from) {
+    if (into.title_id.empty()) {
+        into.title_id = from.title_id;
+    }
+    into.runs = SatAdd(into.runs, from.runs);
+    into.hybrid_runs = SatAdd(into.hybrid_runs, from.hybrid_runs);
+    into.strict_runs = SatAdd(into.strict_runs, from.strict_runs);
+    into.clean_runs = SatAdd(into.clean_runs, from.clean_runs);
+    into.unattributed_misses = SatAdd(into.unattributed_misses, from.unattributed_misses);
+    into.truncated |= from.truncated;
+    for (const auto& [id, m] : from.modules) {
+        ModuleGaps* target = FindOrAddModule(into.modules, id, {}, into.truncated);
+        if (!target) {
+            continue;
+        }
+        target->hits = SatAdd(target->hits, m.hits);
+        for (const auto& [offset, hits] : m.offsets) {
+            AddOffset(*target, offset, hits, into.truncated);
+        }
+    }
+    for (const auto& [id, hits] : from.modules_without_image) {
+        if (ModuleGaps* target = FindOrAddModule(into.no_image, id, {}, into.truncated)) {
+            target->hits = SatAdd(target->hits, hits);
+        }
+    }
+    into.imported_unsupported_kinds =
+        std::max(into.imported_unsupported_kinds, from.unsupported_instruction_kinds);
+    into.imported_unsupported_hits =
+        SatAdd(into.imported_unsupported_hits, from.unsupported_instruction_hits);
 }
 
 std::vector<std::uint64_t> RootsFor(const GapData& data, std::string_view build_id) {
@@ -695,7 +1080,8 @@ std::string Fingerprint(const GapData& data) {
     return buf;
 }
 
-std::optional<GapData> ReadFile(const std::filesystem::path& path, std::string* error) {
+namespace {
+std::optional<std::string> ReadText(const std::filesystem::path& path, std::string* error) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
     if (ec) {
@@ -717,16 +1103,14 @@ std::optional<GapData> ReadFile(const std::filesystem::path& path, std::string* 
         }
         return std::nullopt;
     }
-    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    return Parse(text, error);
+    return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-bool WriteFile(const std::filesystem::path& path, const GapData& data, std::string* error) {
+bool WriteText(const std::filesystem::path& path, const std::string& text, std::string* error) {
     std::filesystem::path tmp = path;
     tmp += ".tmp";
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        const std::string text = Serialize(data);
         out.write(text.data(), static_cast<std::streamsize>(text.size()));
         if (!out) {
             if (error) {
@@ -745,6 +1129,33 @@ bool WriteFile(const std::filesystem::path& path, const GapData& data, std::stri
         return false;
     }
     return true;
+}
+} // namespace
+
+std::optional<GapData> ReadFile(const std::filesystem::path& path, std::string* error) {
+    const auto text = ReadText(path, error);
+    return text ? Parse(*text, error) : std::nullopt;
+}
+
+bool WriteFile(const std::filesystem::path& path, const GapData& data, std::string* error) {
+    return WriteText(path, Serialize(data), error);
+}
+
+std::optional<SharedCoverage> ReadImportFile(const std::filesystem::path& path, std::string* error,
+                                             bool* legacy) {
+    const auto text = ReadText(path, error);
+    return text ? ParseImport(*text, error, legacy) : std::nullopt;
+}
+
+bool WriteSharedFile(const std::filesystem::path& path, const SharedCoverage& data,
+                     std::string* error) {
+    if (data.title_id.size() != 16) {
+        if (error) {
+            *error = "the coverage has no valid title ID";
+        }
+        return false;
+    }
+    return WriteText(path, SerializeShared(data), error);
 }
 
 // ---- SessionRecorder ----

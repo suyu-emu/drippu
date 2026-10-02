@@ -33,3 +33,20 @@ Packaging is currently limited to Windows MSVC single-config Ninja Release.
 Objects and libraries may contain debugging source-path strings; they do not
 require those paths to exist. Retain GPL source/license distribution obligations
 through the corresponding release source archive and license bundle.
+
+Package-policy checks in `package.py`: packaging refuses a build tree whose
+`SUYU_CMD_RECOMP_DIR` is set, so a per-game configuration cannot produce the
+generic kit. Objects must come from `CMakeFiles/suyu-export-host-<mode>.dir`
+inside the build tree, libraries from the build tree, the pinned CPM package
+cache or bare SDK names, and anything named `recomp_registration`,
+`recomp_static_*` or living under `recomp`/`recomp_modules` is rejected. The kit
+is assembled in a fresh hidden sibling staging directory, its file set is
+compared with the manifest, and only then does it replace the destination; a
+non-empty destination that is not an earlier export build kit is refused and
+left untouched, and stale files from earlier kits never survive. `manifest.json`
+adds `policy_version`, `producer_source_revision` (git HEAD, or `GIT-COMMIT` in a
+source archive), a `files` table with the SHA256 of every other file in the kit,
+and a note. The consumer also refuses any file under `inputs/` that the manifest
+does not list. These hashes identify packaged inputs and detect corruption; they
+do not grant permission or establish legal clearance. `tools/package_policy/scan_release.py`
+re-checks the finished archive against the same manifest.

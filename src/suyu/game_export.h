@@ -5,6 +5,7 @@
 
 #include <array>
 #include <optional>
+#include <vector>
 #include <QCheckBox>
 #include <QDialog>
 #include <QComboBox>
@@ -17,6 +18,8 @@
 #include <QStringList>
 #include <QVector>
 
+#include "common/package_policy.h"
+#include "core/file_sys/vfs/vfs_types.h"
 #include "suyu/wikipedia_cover.h"
 
 namespace Core {
@@ -73,6 +76,24 @@ public:
                                  int format_index = -1, int backend_index = -1,
                                  int full_scan = -1, quint32 app_version = 0,
                                  const QString& display_version = {});
+    /// Test-only options for the next TriggerExportForTesting() run.
+    struct TestExportOptions {
+        /// What happens to an existing folder with the package's name. Headless runs never
+        /// answer a prompt: the default reports a conflict and changes nothing.
+        Common::PackagePolicy::ConflictPolicy conflict = Common::PackagePolicy::ConflictPolicy::Fail;
+        /// Optional data checkboxes: -1 leaves them, 0/1 sets them.
+        int include_save = -1;
+        int include_shader = -1;
+        int include_config = -1;
+        /// Throws at this step ("precompile", "package", "validate") so tests can prove a
+        /// failed export leaves no package and the previous one untouched.
+        QString fail_at;
+        /// Package type: -1 leaves the dialog's choice, 0 = uses the game file, 1 = portable.
+        int package = -1;
+    };
+    void SetTestExportOptions(const TestExportOptions& options);
+    /// True when the last test export stopped because its destination already existed.
+    bool ExportConflictForTesting() const;
     bool IsExportInProgressForTesting() const;
     bool HasExportResultForTesting() const;
     bool ExportSucceededForTesting() const;
@@ -104,6 +125,11 @@ public:
     static QString DefaultExportRoot();
     /// Remember @p dir as an export output root for future lookups.
     static void RememberOutputRoot(const QString& dir);
+    /// The game file an export was made from is kept in this suyu's settings, by the
+    /// package's export ID, rather than as a path inside a package that may be moved.
+    static void RememberExportSource(const QString& export_id, const QString& rom_path);
+    /// The recorded game file for the package in @p package_dir, or empty.
+    static QString RecordedExportSource(const QString& package_dir);
 
     enum class TargetPlatform {
         Windows,
@@ -126,9 +152,10 @@ private slots:
     void OnBrowseOutput();
     void OnExport();
     void OnInstallUpdate();
-    /// Merge a coverage file from another player into this suyu's store for the game.
+    /// Merge a shared coverage file into this suyu's store for the game.
     void OnImportCoverage();
-    /// Save the game's recorded coverage (IDs, offsets, counts, opcodes only) to share.
+    /// Save the game's recorded coverage as shareable execution metadata: build IDs, code
+    /// offsets and counts. No raw instruction bytes, names or paths are written.
     void OnExportCoverage();
 
 protected:
@@ -165,6 +192,28 @@ private:
                                    quint32* title_version = nullptr) const;
     /// Refresh the Update row after the ROM changes or an update is installed.
     void RefreshUpdateStatus();
+    /// Refresh the Keys, Firmware and Game file rows and what the package type combo offers.
+    void RefreshPackageStatus();
+    /// Whether a portable package can be made for the current selection; when it cannot,
+    /// @p reason says why.
+    bool PortableAvailable(QString* reason) const;
+    /// The game file and installed update and DLC NCAs a portable export carries, with their
+    /// size.
+    struct SealSource {
+        QString name;        ///< file name inside game/
+        QString role;        ///< "base", "update" or "dlc"
+        quint64 title_id{};
+        int record_type{-1}; ///< ContentRecordType of an update or DLC NCA
+        FileSys::VirtualFile file;
+    };
+    std::vector<SealSource> PortableSources(QString* error) const;
+    /// The selected game's DLC installed in suyu's NAND, every NCA of each DLC title.
+    std::vector<SealSource> InstalledDlcSources() const;
+    /// Copies @p sources into <package_root>/game, sealed, and writes seal.json. Returns false
+    /// with @p error set on failure, or with @p cancelled set when the user stopped it.
+    bool SealGameFiles(const std::vector<SealSource>& sources, const QString& package_root,
+                       const std::string& export_id, quint64 program_id, QString* error,
+                       bool* cancelled);
     /// Ask for an update NSP, check it belongs to the selected game, and install it.
     /// Returns true when an update was installed.
     bool PromptAndInstallUpdate();
@@ -184,6 +233,8 @@ private:
     QString test_export_output;
     quint32 test_app_version{};
     QString test_display_version;
+    TestExportOptions test_options_;
+    bool test_export_conflict{false};
     /// Modules the last export routed to the Dynarmic JIT after a recompile or
     /// compile failure. Reported to the user when the export finishes, so a
     /// partially-degraded package cannot look like a clean one.
@@ -199,9 +250,10 @@ private:
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,
                              RecompileBackend backend, const QString& game_name);
 
-    /// Package the translated output into a platform-specific export bundle.
+    /// Package the translated output into a platform-specific export bundle rooted at
+    /// @p package_root, the staging folder that becomes the package once validated.
     bool PackageNativeExport(const QString& rom_path, const QString& cache_dir,
-                             const QString& output_dir, const QString& game_name,
+                             const QString& package_root, const QString& game_name,
                              TargetPlatform platform, RecompileBackend backend);
 
     QLineEdit* rom_path_edit{};
@@ -247,8 +299,18 @@ private:
     /// Moves the bar to @p fraction of @p stage - never backwards - and, when given, shows
     /// @p status.
     void ReportStage(ExportStage stage, double fraction, const QString& status = {});
+    QLabel* keys_status_label{};
+    QLabel* firmware_status_label{};
+    QLabel* game_file_status_label{};
+    /// "Uses your game file" (reference) or "Portable" (sealed game file in the package).
+    QComboBox* package_type_combo{};
+    QLabel* package_note_label{};
+    /// The general note on what an export contains, which depends on the package type.
+    QLabel* content_label{};
     QLabel* update_status_label{};
     QLabel* update_source_label{};
+    /// The selected game's installed DLC, which portable exports carry.
+    QLabel* dlc_status_label{};
     QPushButton* install_update_button{};
     QLabel* coverage_status_label{};
     QPushButton* export_coverage_button{};

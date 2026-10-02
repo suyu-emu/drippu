@@ -302,10 +302,14 @@ struct System::Impl {
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window,
                             const std::string& filepath,
-                            Service::AM::FrontendAppletParameters& params) {
+                            Service::AM::FrontendAppletParameters& params,
+                            FileSys::VirtualFile game_file = nullptr) {
         InitializeKernel(system);
 
-        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
+        // A caller-supplied file (such as a decrypting view) replaces the one at filepath,
+        // for the game card as well.
+        const auto file =
+            game_file ? game_file : GetGameFileFromPath(virtual_filesystem, filepath);
 
         // Create the application process
         Loader::ResultStatus load_result{};
@@ -382,7 +386,9 @@ struct System::Impl {
 
         if (Settings::values.gamecard_inserted) {
             if (Settings::values.gamecard_current_game) {
-                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, filepath));
+                fs_controller.SetGameCard(game_file ? game_file
+                                                    : GetGameFileFromPath(virtual_filesystem,
+                                                                          filepath));
             } else if (!Settings::values.gamecard_path.GetValue().empty()) {
                 const auto& gamecard_path = Settings::values.gamecard_path.GetValue();
                 fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, gamecard_path));
@@ -623,6 +629,15 @@ void System::InitializeDebugger() {
 SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                 Service::AM::FrontendAppletParameters& params) {
     return impl->Load(*this, emu_window, filepath, params);
+}
+
+SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, FileSys::VirtualFile game_file,
+                                Service::AM::FrontendAppletParameters& params) {
+    if (game_file == nullptr) {
+        return SystemResultStatus::ErrorGetLoader;
+    }
+    const std::string name = game_file->GetName();
+    return impl->Load(*this, emu_window, name, params, std::move(game_file));
 }
 
 bool System::IsPoweredOn() const {

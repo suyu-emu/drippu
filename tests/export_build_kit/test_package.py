@@ -6,8 +6,9 @@ import unittest
 import shutil
 import subprocess
 import json
+import hashlib
 
-spec = importlib.util.spec_from_file_location('kit_package', Path(__file__).resolve().parents[2] / 'tools/export_build_kit/package.py')
+spec =importlib.util.spec_from_file_location('kit_package', Path(__file__).resolve().parents[2] / 'tools/export_build_kit/package.py')
 kit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(kit)
 
@@ -17,6 +18,42 @@ class PackageTests(unittest.TestCase):
         metadata = build / 'CMakeFiles/fixture/CMakeCXXCompiler.cmake'
         metadata.parent.mkdir(parents=True, exist_ok=True)
         metadata.write_text('set(CMAKE_CXX_COMPILER_VERSION "19.44.35207")\n')
+
+    def synthetic_build(self, root, name='original-build', extra_objects=None, libraries='core.lib kernel32.lib'):
+        """A fake Ninja tree whose host objects live under the generic host targets' .dir."""
+        build = root / name
+        build.mkdir()
+        self.write_compiler_metadata(build)
+        (build / 'core.lib').write_bytes(b'core.lib')
+        manifest = ''
+        for mode in ['strict', 'hybrid']:
+            host_dir = build / 'CMakeFiles' / ('suyu-export-host-' + mode + '.dir')
+            host_dir.mkdir(parents=True)
+            objects = ['host.obj', 'registry_probe.c.obj'] + list((extra_objects or {}).get(mode, []))
+            for obj in objects:
+                (host_dir / obj).write_bytes((mode + obj).encode())
+            listed = ' '.join('CMakeFiles/suyu-export-host-' + mode + '.dir/' + obj for obj in objects)
+            manifest += ('build bin/suyu-export-host-' + mode + '.exe: CXX_EXECUTABLE_LINKER__Release ' + listed + ' | core.lib\n'
+                         '  LINK_LIBRARIES = ' + libraries + '\n  LINK_FLAGS = /machine:x64 /ENTRY:mainCRTStartup\n')
+        (build / 'build.ninja').write_text(manifest)
+        return build
+
+    def assert_manifest_matches(self, output):
+        manifest = json.loads((output / 'manifest.json').read_text())
+        policy = json.loads((Path(__file__).resolve().parents[2] / 'tools/package_policy/policy.json').read_text())
+        self.assertEqual(manifest['policy_version'], policy['policy_version'])
+        self.assertRegex(manifest['producer_source_revision'], '^[0-9a-f]{40,64}$')
+        self.assertIn('do not grant permission', manifest['note'])
+        actual = {p.relative_to(output).as_posix() for p in output.rglob('*') if p.is_file()}
+        self.assertEqual(actual, set(manifest['files']) | {'manifest.json'})
+        for relative, digest in manifest['files'].items():
+            self.assertEqual(hashlib.sha256((output / relative).read_bytes()).hexdigest(), digest, relative)
+        for relative, digest in manifest['inputs'].items():
+            self.assertEqual(manifest['files'][relative], digest)
+        return manifest
+
+    def leftovers(self, parent):
+        return [p.name for p in parent.iterdir() if '.staging-' in p.name or '.old-' in p.name]
 
     @unittest.skipUnless(shutil.which('cl'), 'Run from an x64 Visual Studio developer environment')
     def test_real_windows_link_after_producer_tree_removed(self):
@@ -37,6 +74,7 @@ class PackageTests(unittest.TestCase):
             kit.package(build, output, kit.REVISION)
             self.assertEqual(json.loads((output / 'manifest.json').read_text())['producer_compiler_version'],
                              kit.producer_compiler_version(build))
+            self.assert_manifest_matches(output)
             # Rename both producer locations: none of their original paths exist.
             source.rename(root / 'hidden-source')
             build.rename(root / 'hidden-build')
@@ -95,6 +133,13 @@ class PackageTests(unittest.TestCase):
                     finally:
                         header.write_bytes(original)
 
+            unlisted = output / 'inputs/unlisted.obj'
+            unlisted.write_bytes(b'not listed in the manifest')
+            try:
+                assert_configure_rejected('unlisted-input', 'Unlisted build-kit input: inputs/unlisted.obj')
+            finally:
+                unlisted.unlink()
+
             copied_input = next((output / 'inputs').iterdir())
             original = copied_input.read_bytes()
             copied_input.write_bytes(bytes([original[0] ^ 1]) + original[1:])
@@ -106,16 +151,7 @@ class PackageTests(unittest.TestCase):
     def test_relocation_excludes_probe_and_preserves_system_libraries(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            build = root / 'original-build'
-            build.mkdir()
-            self.write_compiler_metadata(build)
-            for name in ['host.obj', 'registry_probe.c.obj', 'core.lib']:
-                (build / name).write_bytes(name.encode())
-            manifest = ''
-            for mode in ['strict', 'hybrid']:
-                manifest += ('build bin/suyu-export-host-' + mode + '.exe: CXX_EXECUTABLE_LINKER__Release host.obj registry_probe.c.obj | core.lib\n'
-                             '  LINK_LIBRARIES = core.lib kernel32.lib\n  LINK_FLAGS = /machine:x64 /ENTRY:mainCRTStartup\n')
-            (build / 'build.ninja').write_text(manifest)
+            build = self.synthetic_build(root)
             output = root / 'relocated-kit'
             kit.package(build, output, kit.REVISION)
             frozen = (output / 'strict.cmake').read_text()
@@ -123,7 +159,147 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn('registry_probe', frozen)
             self.assertIn('kernel32.lib', frozen)
             self.assertIn('${CMAKE_CURRENT_LIST_DIR}/inputs/', frozen)
-            self.assertEqual(len(list((output / 'inputs').iterdir())), 2)
+            # One host object per mode plus the shared core.lib.
+            self.assertEqual(len(list((output / 'inputs').iterdir())), 3)
+            self.assert_manifest_matches(output)
+            self.assertEqual(self.leftovers(root), [])
+
+    def test_manifest_records_policy_source_revision_and_hashes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / 'kit'
+            kit.package(self.synthetic_build(root), output, kit.REVISION)
+            manifest = self.assert_manifest_matches(output)
+            self.assertEqual(manifest['revision'], kit.REVISION)
+            self.assertEqual(manifest['producer_compiler_version'], '19.44.35207')
+            for relative in ['strict.cmake', 'hybrid.cmake', 'CMakeLists.txt', 'revision.txt',
+                             'src/suyu_cmd/recomp_modules/CMakeLists.txt']:
+                self.assertIn(relative, manifest['files'])
+            self.assertNotIn('manifest.json', manifest['files'])
+
+    def test_source_revision_falls_back_to_git_commit_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaisesRegex(ValueError, 'source revision'):
+                kit.source_revision(root)
+            (root / 'GIT-COMMIT').write_text('0123456789abcdef0123456789abcdef01234567\n')
+            self.assertEqual(kit.source_revision(root), '0123456789abcdef0123456789abcdef01234567')
+
+    def test_game_configured_build_tree_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build = self.synthetic_build(root)
+            (build / 'CMakeCache.txt').write_text('SUYU_CMD_RECOMP_DIR:PATH=C:/exports/some-game\n')
+            with self.assertRaisesRegex(ValueError, 'SUYU_CMD_RECOMP_DIR'):
+                kit.package(build, root / 'kit', kit.REVISION)
+            self.assertFalse((root / 'kit').exists())
+            self.assertEqual(self.leftovers(root), [])
+            # An unset/empty entry is what a generic tree has.
+            (build / 'CMakeCache.txt').write_text('SUYU_CMD_RECOMP_DIR:PATH=\nSUYU_CMD_RECOMP_PREBUILT_DIR:PATH=\n')
+            kit.package(build, root / 'kit', kit.REVISION)
+            self.assertTrue((root / 'kit/manifest.json').is_file())
+
+    def test_game_specific_or_foreign_inputs_are_rejected(self):
+        strict_dir = 'CMakeFiles/suyu-export-host-strict.dir/'
+        cases = {
+            'registration object': dict(extra_objects={'strict': ['recomp_registration.c.obj']}),
+            'static module library': dict(libraries='core.lib recomp_static_main.lib'),
+            'module directory library': dict(libraries='core.lib recomp/core2.lib'),
+            'modules directory library': dict(libraries='core.lib recomp_modules/core2.lib'),
+        }
+        for name, options in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                build = self.synthetic_build(root, **options)
+                for relative in ['recomp/core2.lib', 'recomp_modules/core2.lib', 'recomp_static_main.lib']:
+                    (build / relative).parent.mkdir(exist_ok=True)
+                    (build / relative).write_bytes(b'x')
+                with self.assertRaisesRegex(ValueError, 'Game-specific'):
+                    kit.package(build, root / 'kit', kit.REVISION)
+                self.assertFalse((root / 'kit').exists())
+                self.assertEqual(self.leftovers(root), [])
+        with self.subTest('object outside the host target directory'), tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build = self.synthetic_build(root)
+            (build / 'stray.obj').write_bytes(b'x')
+            text = (build / 'build.ninja').read_text().replace(strict_dir + 'host.obj', 'stray.obj')
+            (build / 'build.ninja').write_text(text)
+            with self.assertRaisesRegex(ValueError, 'not an output of the generic'):
+                kit.package(build, root / 'kit', kit.REVISION)
+        with self.subTest('object of another target'), tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build = self.synthetic_build(root)
+            other = build / 'CMakeFiles/other-target.dir'
+            other.mkdir(parents=True)
+            (other / 'x.obj').write_bytes(b'x')
+            text = (build / 'build.ninja').read_text().replace(strict_dir + 'host.obj', 'CMakeFiles/other-target.dir/x.obj')
+            (build / 'build.ninja').write_text(text)
+            with self.assertRaisesRegex(ValueError, 'not an output of the generic'):
+                kit.package(build, root / 'kit', kit.REVISION)
+        with self.subTest('library outside the build tree'), tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            outside = root / 'elsewhere.lib'
+            outside.write_bytes(b'x')
+            build = self.synthetic_build(root, libraries='core.lib ' + outside.as_posix())
+            with self.assertRaisesRegex(ValueError, 'outside the build tree'):
+                kit.package(build, root / 'kit', kit.REVISION)
+        with self.subTest('pinned CPM cache library is allowed'), tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cached = root / 'work/.cache/cpm/sdl3/1.0/lib/SDL3.lib'
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b'x')
+            build = self.synthetic_build(root, libraries='core.lib ' + cached.as_posix())
+            kit.package(build, root / 'kit', kit.REVISION)
+            self.assertTrue(any(p.name.endswith('-SDL3.lib') for p in (root / 'kit/inputs').iterdir()))
+
+    def test_dirty_destination_is_replaced_by_exactly_the_manifest_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build = self.synthetic_build(root)
+            output = root / 'bin/export-build-kit'
+            kit.package(build, output, kit.REVISION)
+            (output / 'inputs/stale.obj').write_bytes(b'stale')
+            (output / 'extra.txt').write_text('extra')
+            (output / 'nested').mkdir()
+            (output / 'nested/leftover.bin').write_bytes(b'x')
+            kit.package(build, output, kit.REVISION)
+            for relative in ['inputs/stale.obj', 'extra.txt', 'nested/leftover.bin']:
+                self.assertFalse((output / relative).exists(), relative)
+            self.assert_manifest_matches(output)
+            self.assertEqual(self.leftovers(output.parent), [])
+
+    def test_empty_destination_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / 'kit'
+            output.mkdir()
+            kit.package(self.synthetic_build(root), output, kit.REVISION)
+            self.assert_manifest_matches(output)
+
+    def test_foreign_destination_is_refused_and_untouched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / 'documents'
+            output.mkdir()
+            (output / 'notes.txt').write_text('keep me')
+            with self.assertRaisesRegex(ValueError, 'not an export build kit'):
+                kit.package(self.synthetic_build(root), output, kit.REVISION)
+            self.assertEqual([p.name for p in output.iterdir()], ['notes.txt'])
+            self.assertEqual((output / 'notes.txt').read_text(), 'keep me')
+            self.assertEqual(self.leftovers(root), [])
+
+    def test_failed_package_leaves_existing_kit_and_no_staging(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            build = self.synthetic_build(root)
+            output = root / 'kit'
+            kit.package(build, output, kit.REVISION)
+            before = (output / 'manifest.json').read_bytes()
+            (build / 'CMakeFiles/suyu-export-host-hybrid.dir/host.obj').unlink()
+            with self.assertRaisesRegex(ValueError, 'Missing link input'):
+                kit.package(build, output, kit.REVISION)
+            self.assertEqual((output / 'manifest.json').read_bytes(), before)
+            self.assertEqual(self.leftovers(root), [])
 
     def test_missing_non_system_input_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:

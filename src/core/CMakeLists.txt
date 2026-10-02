@@ -41,10 +41,14 @@ add_library(core STATIC
     crypto/ctr_encryption_layer.h
     crypto/encryption_layer.cpp
     crypto/encryption_layer.h
+    crypto/hmac_sha256.cpp
+    crypto/hmac_sha256.h
     crypto/key_manager.cpp
     crypto/key_manager.h
     crypto/partition_data_manager.cpp
     crypto/partition_data_manager.h
+    crypto/portable_seal.cpp
+    crypto/portable_seal.h
     crypto/xts_encryption_layer.cpp
     crypto/xts_encryption_layer.h
     debugger/debugger.cpp

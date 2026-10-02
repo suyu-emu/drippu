@@ -14,7 +14,9 @@
 #include <iostream>
 #include <memory>
 #include <regex>
+#include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <stop_token>
 #include <thread>
@@ -23,14 +25,20 @@
 #include <fmt/ostream.h>
 #include <nlohmann/json.hpp>
 #include <stb_image_write.h>
+#include <SDL3/SDL_dialog.h>
+#include <SDL3/SDL_error.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_init.h>
 #include <SDL3/SDL_messagebox.h>
 #include <SDL3/SDL_misc.h>
+#include <SDL3/SDL_timer.h>
 
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
 #include "suyu_cmd/native_status.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
+#include "common/package_policy.h"
 #include "common/fs/path_util.h"
 #include "common/nvidia_flags.h"
 #include "common/scm_rev.h"
@@ -46,6 +54,7 @@
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
+#include "core/crypto/portable_seal.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
@@ -756,42 +765,59 @@ static int ProbeDecodeList(const std::string& list_path, const std::string& out_
 // export built elsewhere) or when that suyu is no longer there.
 // Each line is one way to find it, first match wins: a path relative to the
 // record, then an absolute one that may start with an %ENVIRONMENT% variable.
+/// A path as the exporter records it: absolute, relative to `base`, or starting with a
+/// %VARIABLE% (the home folder) expanded here. Empty when it cannot be expanded.
+static std::filesystem::path ExpandRecordedPath(std::string line, const std::filesystem::path& base) {
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    std::filesystem::path exe;
+    const auto close = line.starts_with('%') ? line.find('%', 1) : std::string::npos;
+    if (close != std::string::npos) {
+        const std::string name = line.substr(1, close - 1);
+#ifdef _WIN32
+        const wchar_t* value = _wgetenv(Common::UTF8ToUTF16W(name).c_str());
+        if (value == nullptr) {
+            return {};
+        }
+        exe = std::filesystem::path{std::wstring(value) +
+                                    Common::UTF8ToUTF16W(line.substr(close + 1))};
+#else
+        const char* value = std::getenv(name.c_str());
+        if (value == nullptr) {
+            return {};
+        }
+        exe = std::filesystem::path{std::string(value) + line.substr(close + 1)};
+#endif
+    } else {
+        exe = std::filesystem::path{Common::FS::ToU8String(line)};
+    }
+    if (!exe.empty() && exe.is_relative()) {
+        exe = (base / exe).lexically_normal();
+    }
+    return exe;
+}
+
+/// The user's own game file (or extracted folder) a validated export starts, as the
+/// exporter recorded it in user/config/game-source.ini. The package holds no game data.
+static std::filesystem::path RecordedGameSource(const std::filesystem::path& user_root) {
+    std::ifstream in(user_root / "config" / "game-source.ini");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.starts_with("path=")) {
+            return ExpandRecordedPath(line.substr(5), user_root / "config");
+        }
+    }
+    return {};
+}
+
 static std::filesystem::path RecordedSuyuExecutable(const std::filesystem::path& user_root) {
     std::ifstream in(user_root / "config" / "suyu-install.txt");
     std::string line;
     while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        std::filesystem::path exe;
-        const auto close = line.starts_with('%') ? line.find('%', 1) : std::string::npos;
-        if (close != std::string::npos) {
-            const std::string name = line.substr(1, close - 1);
-#ifdef _WIN32
-            const wchar_t* value = _wgetenv(Common::UTF8ToUTF16W(name).c_str());
-            if (value == nullptr) {
-                continue;
-            }
-            exe = std::filesystem::path{std::wstring(value) +
-                                        Common::UTF8ToUTF16W(line.substr(close + 1))};
-#else
-            const char* value = std::getenv(name.c_str());
-            if (value == nullptr) {
-                continue;
-            }
-            exe = std::filesystem::path{std::string(value) + line.substr(close + 1)};
-#endif
-        } else {
-            exe = std::filesystem::path{Common::FS::ToU8String(line)};
-        }
-        if (exe.empty()) {
-            continue;
-        }
-        if (exe.is_relative()) {
-            exe = (user_root / "config" / exe).lexically_normal();
-        }
+        const auto exe = ExpandRecordedPath(line, user_root / "config");
         std::error_code ec;
-        if (std::filesystem::is_regular_file(exe, ec)) {
+        if (!exe.empty() && std::filesystem::is_regular_file(exe, ec)) {
             return exe;
         }
     }
@@ -830,6 +856,22 @@ static std::filesystem::path InstalledNandDirectory(const std::filesystem::path&
     }
     const std::filesystem::path nand{Common::FS::ToU8String(value)};
     return nand.is_relative() ? installed_root / nand : nand;
+}
+
+// Starts the installed suyu with one flag, such as -install-keys. Detached: suyu keeps
+// running after this game exits.
+static void StartInstalledSuyu(const std::filesystem::path& suyu_exe, const std::string& flag) {
+#ifdef _WIN32
+    const std::wstring args(flag.begin(), flag.end());
+    ShellExecuteW(nullptr, L"open", suyu_exe.wstring().c_str(), args.c_str(),
+                  suyu_exe.parent_path().wstring().c_str(), SW_SHOWNORMAL);
+#else
+    if (fork() == 0) {
+        setsid();
+        execl(suyu_exe.c_str(), suyu_exe.c_str(), flag.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+#endif
 }
 
 // An exported package is double-clicked by a player with no console and no
@@ -872,21 +914,9 @@ static bool ReportExportProblem(const char* title, const std::string& message,
         return false;
     }
     switch (chosen) {
-    case InstallInSuyu: {
-        // Detached: suyu keeps running after this game exits.
-#ifdef _WIN32
-        const std::wstring args(flag.begin(), flag.end());
-        ShellExecuteW(nullptr, L"open", suyu_exe.wstring().c_str(), args.c_str(),
-                      suyu_exe.parent_path().wstring().c_str(), SW_SHOWNORMAL);
-#else
-        if (fork() == 0) {
-            setsid();
-            execl(suyu_exe.c_str(), suyu_exe.c_str(), flag.c_str(), static_cast<char*>(nullptr));
-            _exit(127);
-        }
-#endif
+    case InstallInSuyu:
+        StartInstalledSuyu(suyu_exe, flag);
         return false;
-    }
     case OpenFolder: {
         // Created first, so there is somewhere to put the missing files.
         std::error_code ec;
@@ -918,6 +948,402 @@ static bool HasEntries(const std::filesystem::path& dir) {
     std::error_code ec;
     return std::filesystem::is_directory(dir, ec) &&
            std::filesystem::directory_iterator(dir, ec) != std::filesystem::directory_iterator();
+}
+
+// ---- Portable exports ----
+// A portable export carries the user's game file and installed update NCAs unchanged, sealed
+// with a key derived from the sd_seed of the console it was made with (core/crypto/
+// portable_seal.h). It runs only with keys from that console, read from the per-user keys
+// folder like every export's keys; keys inside the package are never used.
+
+namespace PortableSeal = Core::Crypto::PortableSeal;
+
+struct PortableSealedFile {
+    std::filesystem::path path;
+    u64 title_id = 0;
+    FileSys::ContentRecordType record_type = FileSys::ContentRecordType::Program;
+    u64 size = 0;
+    PortableSeal::Nonce nonce{};
+};
+
+struct PortableSealInfo {
+    std::string export_id;
+    PortableSeal::CheckValue check{};
+    PortableSealedFile base;
+    std::vector<PortableSealedFile> updates;
+    std::vector<PortableSealedFile> dlc;
+};
+
+static std::string ReadSmallTextFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::string text;
+    if (in) {
+        text.resize(1 << 20);
+        in.read(text.data(), static_cast<std::streamsize>(text.size()));
+        text.resize(static_cast<std::size_t>(in.gcount()));
+    }
+    return text;
+}
+
+/// True when the package's manifest declares the portable package type.
+static bool IsPortablePackage(const std::filesystem::path& package_dir) {
+    return Common::PackagePolicy::ManifestDeclaresPortable(ReadSmallTextFile(
+        package_dir / std::string{Common::PackagePolicy::kExportManifestName}));
+}
+
+/// The sealed files of a portable export, from game/seal.json. Every name, size and nonce is
+/// checked; nothing outside the package's game/ folder can be named.
+static std::optional<PortableSealInfo> ReadPortableSeal(const std::filesystem::path& package_dir,
+                                                        std::string* error) {
+    namespace PP = Common::PackagePolicy;
+    const auto fail = [error](std::string why) -> std::optional<PortableSealInfo> {
+        *error = std::move(why);
+        return std::nullopt;
+    };
+    const auto manifest = nlohmann::json::parse(
+        ReadSmallTextFile(package_dir / std::string{PP::kExportManifestName}), nullptr, false);
+    const std::filesystem::path game_dir = package_dir / std::string{PP::kPortableGameDir};
+    const auto seal =
+        nlohmann::json::parse(ReadSmallTextFile(game_dir / std::string{PP::kPortableSealName}),
+                              nullptr, false);
+    if (!manifest.is_object() || !seal.is_object()) {
+        return fail("export-package.json or game/seal.json is missing or unreadable");
+    }
+    const auto text = [](const nlohmann::json& object, const char* key) {
+        const auto it = object.find(key);
+        return it != object.end() && it->is_string() ? it->get<std::string>() : std::string{};
+    };
+    PortableSealInfo info;
+    info.export_id = text(seal, "export_id");
+    if (text(seal, "format") != PortableSeal::kSealFormat) {
+        return fail("game/seal.json has an unknown format");
+    }
+    if (info.export_id.empty() || info.export_id != text(manifest, "export_id")) {
+        return fail("game/seal.json belongs to another export");
+    }
+    if (!PortableSeal::FromHex(text(seal, "check"), info.check.data(), info.check.size())) {
+        return fail("game/seal.json has no valid check value");
+    }
+    const auto files = seal.find("files");
+    if (files == seal.end() || !files->is_array()) {
+        return fail("game/seal.json lists no files");
+    }
+    static const std::regex kName{R"((base|update-[0-9]{1,2}|dlc-[0-9]{1,4})\.sealed)"};
+    bool has_base = false;
+    std::set<std::pair<u64, FileSys::ContentRecordType>> dlc_records;
+    for (const auto& entry : *files) {
+        if (!entry.is_object()) {
+            return fail("game/seal.json has a malformed file entry");
+        }
+        PortableSealedFile file;
+        const std::string name = text(entry, "name");
+        const std::string role = text(entry, "role");
+        const std::string title = text(entry, "title_id");
+        const std::string size = text(entry, "size");
+        // The role follows from the name: base.sealed, update-<n>.sealed or dlc-<n>.sealed.
+        const std::string_view name_role = name == PP::kPortableBaseName ? "base"
+                                           : name.starts_with("update-") ? "update"
+                                                                         : "dlc";
+        if (!std::regex_match(name, kName) || role != name_role || title.size() != 16 ||
+            size.empty() || size.size() > 20 ||
+            !std::all_of(size.begin(), size.end(), [](char c) { return c >= '0' && c <= '9'; }) ||
+            !PortableSeal::FromHex(text(entry, "nonce"), file.nonce.data(), file.nonce.size())) {
+            return fail("game/seal.json has a malformed entry for " + name);
+        }
+        std::array<u8, 8> title_bytes{};
+        if (!PortableSeal::FromHex(title, title_bytes.data(), title_bytes.size())) {
+            return fail("game/seal.json has a malformed title ID for " + name);
+        }
+        for (const u8 byte : title_bytes) {
+            file.title_id = (file.title_id << 8) | byte;
+        }
+        // Twenty digits can still exceed u64; report that as damage, not a crash.
+        try {
+            file.size = std::stoull(size);
+        } catch (const std::out_of_range&) {
+            return fail("game/seal.json has a malformed size for " + name);
+        }
+        file.path = game_dir / name;
+        if (role != "base") {
+            const auto type = entry.find("record_type");
+            if (type == entry.end() || !type->is_number_integer() ||
+                type->get<std::int64_t>() < 0 ||
+                type->get<std::int64_t>() >=
+                    static_cast<std::int64_t>(FileSys::ContentRecordType::Count)) {
+                return fail("game/seal.json has no content type for " + name);
+            }
+            file.record_type = static_cast<FileSys::ContentRecordType>(type->get<int>());
+            if (role == "update") {
+                info.updates.push_back(std::move(file));
+            } else if (!dlc_records.emplace(file.title_id, file.record_type).second) {
+                return fail("game/seal.json lists the same DLC content twice");
+            } else {
+                info.dlc.push_back(std::move(file));
+            }
+        } else {
+            if (has_base) {
+                return fail("game/seal.json lists two game files");
+            }
+            has_base = true;
+            info.base = std::move(file);
+        }
+    }
+    if (!has_base) {
+        return fail("game/seal.json lists no game file");
+    }
+    // DLC is accepted only for the sealed game itself.
+    for (const auto& dlc : info.dlc) {
+        if (!PP::IsAddOnContentOf(dlc.title_id, info.base.title_id)) {
+            return fail("game/seal.json lists DLC for another game: " +
+                        Common::FS::PathToUTF8String(dlc.path.filename()));
+        }
+    }
+    return info;
+}
+
+/// The sd_seed in a key file of the usual "name = hex" form, if it has one.
+static std::optional<Core::Crypto::Key128> ReadSdSeed(const std::filesystem::path& keys_file) {
+    std::ifstream in(keys_file);
+    std::string line;
+    while (std::getline(in, line)) {
+        line.erase(std::remove_if(line.begin(), line.end(),
+                                  [](unsigned char c) { return std::isspace(c); }),
+                   line.end());
+        const auto equals = line.find('=');
+        if (equals == std::string::npos || line.starts_with('#')) {
+            continue;
+        }
+        std::string name = line.substr(0, equals);
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        Core::Crypto::Key128 seed{};
+        if (name == "sd_seed" &&
+            PortableSeal::FromHex(line.substr(equals + 1), seed.data(), seed.size())) {
+            return seed;
+        }
+    }
+    return std::nullopt;
+}
+
+/// True when @p sd_seed is the one the export was sealed with.
+static bool SealMatches(const PortableSealInfo& seal, const Core::Crypto::Key128& sd_seed) {
+    const auto key = PortableSeal::DeriveKey(sd_seed, seal.export_id);
+    const auto check = key ? PortableSeal::ComputeCheck(*key) : std::nullopt;
+    return check && PortableSeal::CheckEquals(*check, seal.check);
+}
+
+/// Asks for prod.keys with the system's file picker. Empty when the user cancels.
+static std::filesystem::path ChooseKeyFile() {
+    struct Pick {
+        std::atomic<bool> done{false};
+        std::string path;
+    } pick;
+    static const SDL_DialogFileFilter kFilters[] = {{"Key files", "keys"}, {"All files", "*"}};
+    const bool events = SDL_InitSubSystem(SDL_INIT_EVENTS);
+    SDL_ShowOpenFileDialog(
+        [](void* userdata, const char* const* files, int) {
+            auto* result = static_cast<Pick*>(userdata);
+            if (files != nullptr && files[0] != nullptr) {
+                result->path = files[0];
+            } else if (files == nullptr) {
+                LOG_ERROR(Frontend, "The file picker could not be shown: {}", SDL_GetError());
+            }
+            result->done = true;
+        },
+        &pick, nullptr, kFilters, 2, nullptr, false);
+    while (!pick.done) {
+        if (events) {
+            SDL_PumpEvents();
+        }
+        SDL_Delay(20);
+    }
+    if (events) {
+        SDL_QuitSubSystem(SDL_INIT_EVENTS);
+    }
+    return pick.path.empty() ? std::filesystem::path{}
+                             : std::filesystem::path{Common::FS::ToU8String(pick.path)};
+}
+
+enum class KeySetupChoice { Choose, InstallInSuyu, Quit };
+
+static KeySetupChoice AskForKeys(const char* title, const std::string& message,
+                                 const std::filesystem::path& suyu_exe) {
+    std::vector<SDL_MessageBoxButtonData> buttons;
+    buttons.push_back({SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT,
+                       static_cast<int>(KeySetupChoice::Choose), "Choose keys..."});
+    if (!suyu_exe.empty()) {
+        buttons.push_back({0, static_cast<int>(KeySetupChoice::InstallInSuyu), "Install keys"});
+    }
+    buttons.push_back({SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,
+                       static_cast<int>(KeySetupChoice::Quit), "Quit"});
+    const SDL_MessageBoxData box{SDL_MESSAGEBOX_INFORMATION | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT,
+                                 nullptr,
+                                 title,
+                                 message.c_str(),
+                                 static_cast<int>(buttons.size()),
+                                 buttons.data(),
+                                 nullptr};
+    int chosen = static_cast<int>(KeySetupChoice::Quit);
+    if (!SDL_ShowMessageBox(&box, &chosen)) {
+        return KeySetupChoice::Quit;
+    }
+    return static_cast<KeySetupChoice>(chosen);
+}
+
+/// Installs the key files beside @p chosen (prod.keys, and title.keys and key_retail.bin when
+/// present) into @p keys_dir, as suyu's Install Decryption Keys does, after checking that they
+/// are from the console the export was sealed with. Keys inside the package are refused.
+static bool InstallKeysForPortable(const std::filesystem::path& chosen,
+                                   const std::filesystem::path& keys_dir,
+                                   const std::filesystem::path& package_dir,
+                                   const PortableSealInfo& seal, bool* wrong_console,
+                                   std::string* error) {
+    std::error_code ec;
+    const std::filesystem::path source_dir =
+        std::filesystem::is_directory(chosen, ec) ? chosen : chosen.parent_path();
+    if (Common::PackagePolicy::IsWithin(package_dir, source_dir)) {
+        *error = "Key files inside this export's folder are never used. Choose your key files "
+                 "where you keep them, outside the export.";
+        return false;
+    }
+    const auto prod_keys = source_dir / "prod.keys";
+    if (!std::filesystem::is_regular_file(prod_keys, ec)) {
+        *error = "prod.keys was not found in " + Common::FS::PathToUTF8String(source_dir) + ".";
+        return false;
+    }
+    const auto sd_seed = ReadSdSeed(prod_keys);
+    if (!sd_seed) {
+        *error = "The chosen prod.keys has no sd_seed. Dump the keys again from your console, "
+                 "including sd_seed.";
+        return false;
+    }
+    if (!SealMatches(seal, *sd_seed)) {
+        *wrong_console = true;
+        *error = "These keys are from a different console than the one this export was made "
+                 "with. They were not installed.";
+        return false;
+    }
+    std::filesystem::create_directories(keys_dir, ec);
+    for (const char* name : {"prod.keys", "title.keys", "key_retail.bin"}) {
+        const auto source = source_dir / name;
+        if (!std::filesystem::is_regular_file(source, ec)) {
+            continue;
+        }
+        const auto destination = keys_dir / name;
+        if (std::filesystem::equivalent(source, destination, ec)) {
+            continue;
+        }
+        if (!std::filesystem::copy_file(source, destination,
+                                        std::filesystem::copy_options::overwrite_existing, ec)) {
+            *error = std::string{"Could not install "} + name + ": " + ec.message();
+            return false;
+        }
+    }
+    LOG_INFO(Frontend, "Installed key files for this export into {}",
+             Common::FS::PathToUTF8String(keys_dir));
+    return true;
+}
+
+/// The seal key of a portable export, from the keys installed for this user. On a first
+/// launch without them, asks for the user's key files and installs them for later launches.
+/// Empty after the user has been told why the export cannot start.
+static std::optional<Core::Crypto::Key128> UnlockPortableExport(
+    const PortableSealInfo& seal, const std::filesystem::path& package_dir,
+    const std::filesystem::path& suyu_exe) {
+    auto& keys = Core::Crypto::KeyManager::Instance();
+    const auto keys_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
+    const auto keys_text = Common::FS::PathToUTF8String(keys_dir);
+    const bool headless = std::getenv("SUYU_CMD_CAPTURE_HEADLESS") != nullptr;
+    const auto installed_seed = [&]() -> std::optional<Core::Crypto::Key128> {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(keys_dir / "prod.keys", ec) &&
+            !std::filesystem::is_regular_file(keys_dir / "prod.keys_autogenerated", ec)) {
+            return std::nullopt;
+        }
+        if (!keys.HasKey(Core::Crypto::S128KeyType::SDSeed)) {
+            return std::nullopt;
+        }
+        return keys.GetKey(Core::Crypto::S128KeyType::SDSeed);
+    };
+    const auto wrong_console = [&] {
+        ReportExportProblem(
+            "Keys from another console",
+            fmt::format("These keys are from a different console than the one this export was "
+                        "made with,\nso it cannot start. It runs only with the keys of that "
+                        "console.\n\nKeys folder: {}",
+                        keys_text),
+            keys_dir, false, {}, "", "");
+    };
+
+    auto sd_seed = installed_seed();
+    while (!sd_seed) {
+        std::error_code ec;
+        const bool has_prod = std::filesystem::is_regular_file(keys_dir / "prod.keys", ec);
+        const char* title = has_prod ? "Keys without sd_seed" : "Missing keys";
+        const std::string message = fmt::format(
+            "{}\n\nThis export runs with the keys of the console it was made with.\n"
+            "Choose your key files (prod.keys, and title.keys if you have it).\n\n"
+            "They are installed for your user account in\n{}\n"
+            "as suyu's Install Decryption Keys does, and used again on later launches.\n"
+            "They are never copied into this export.",
+            has_prod ? fmt::format("The keys in {} have no sd_seed, which this export needs.",
+                                   keys_text)
+                     : fmt::format("Missing keys: prod.keys was not found in {}.", keys_text),
+            keys_text);
+        std::filesystem::path chosen;
+        if (headless) {
+            LOG_CRITICAL(Frontend, "{}: {}", title, message);
+            // Automation answers the setup with a folder or file to install keys from.
+            const char* from = std::getenv("SUYU_CMD_SETUP_KEYS_FROM");
+            if (from == nullptr || *from == '\0') {
+                return std::nullopt;
+            }
+            chosen = std::filesystem::path{Common::FS::ToU8String(from)};
+        } else {
+            switch (AskForKeys(title, message, suyu_exe)) {
+            case KeySetupChoice::InstallInSuyu:
+                StartInstalledSuyu(suyu_exe, "-install-keys");
+                return std::nullopt;
+            case KeySetupChoice::Quit:
+                return std::nullopt;
+            case KeySetupChoice::Choose:
+                chosen = ChooseKeyFile();
+                break;
+            }
+            if (chosen.empty()) {
+                continue;
+            }
+        }
+        bool other_console = false;
+        std::string error;
+        if (!InstallKeysForPortable(chosen, keys_dir, package_dir, seal, &other_console,
+                                    &error)) {
+            if (other_console) {
+                wrong_console();
+                return std::nullopt;
+            }
+            LOG_CRITICAL(Frontend, "Keys not installed: {}", error);
+            if (headless) {
+                return std::nullopt;
+            }
+            const SDL_MessageBoxButtonData ok{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "OK"};
+            const SDL_MessageBoxData box{SDL_MESSAGEBOX_WARNING, nullptr, "Keys not installed",
+                                         error.c_str(), 1, &ok, nullptr};
+            int ignored = 0;
+            SDL_ShowMessageBox(&box, &ignored);
+            continue;
+        }
+        keys.ReloadKeys();
+        sd_seed = installed_seed();
+        if (!sd_seed && headless) {
+            return std::nullopt;
+        }
+    }
+    if (!SealMatches(seal, *sd_seed)) {
+        wrong_console();
+        return std::nullopt;
+    }
+    return PortableSeal::DeriveKey(*sd_seed, seal.export_id);
 }
 
 int main(int argc, char** argv) {
@@ -962,6 +1388,9 @@ int main(int argc, char** argv) {
     // Both stay empty when this executable is not an exported package.
     std::filesystem::path installed_nand;
     std::filesystem::path export_user_root;
+    // Logged once logging is up: which recorded locations led back into the package.
+    bool ignored_package_suyu = false;
+    bool ignored_package_nand = false;
     {
         namespace FS = Common::FS;
 #ifdef _WIN32
@@ -1031,20 +1460,30 @@ int main(int argc, char** argv) {
             // as path_util does for it; otherwise it is the usual location.
             const std::filesystem::path recorded_suyu = RecordedSuyuExecutable(user_root);
             std::error_code portable_ec;
-            std::filesystem::path installed_root;
-            std::filesystem::path installed_config;
+#ifdef _WIN32
+            const std::filesystem::path default_root = FS::GetAppDataRoamingDirectory() / "suyu";
+            const std::filesystem::path default_config = default_root / "config";
+#else
+            const std::filesystem::path default_root =
+                FS::GetDataDirectory("XDG_DATA_HOME") / "suyu";
+            const std::filesystem::path default_config =
+                FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
+#endif
+            std::filesystem::path installed_root = default_root;
+            std::filesystem::path installed_config = default_config;
             if (!recorded_suyu.empty() &&
                 std::filesystem::is_directory(recorded_suyu.parent_path() / "user", portable_ec)) {
-                installed_root = recorded_suyu.parent_path() / "user";
-                installed_config = installed_root / "config";
-            } else {
-#ifdef _WIN32
-                installed_root = FS::GetAppDataRoamingDirectory() / "suyu";
-                installed_config = installed_root / "config";
-#else
-                installed_root = FS::GetDataDirectory("XDG_DATA_HOME") / "suyu";
-                installed_config = FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
-#endif
+                // Keys and firmware must come from an installation outside this
+                // package. A record leading back into it - a copy of suyu placed
+                // inside, or an edited path - is ignored rather than letting the
+                // package supply its own.
+                if (Common::PackagePolicy::AcceptInstalledRoot(
+                        exe_dir, recorded_suyu.parent_path() / "user")) {
+                    installed_root = recorded_suyu.parent_path() / "user";
+                    installed_config = installed_root / "config";
+                } else {
+                    ignored_package_suyu = true;
+                }
             }
             // Coverage gaps are pooled in the installed suyu's user folder, which
             // its exporter reads; with no installed suyu there is nowhere to pool.
@@ -1057,6 +1496,11 @@ int main(int argc, char** argv) {
             std::filesystem::create_directories(installed_root / "keys", portable_ec);
             FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_root / "keys");
             installed_nand = InstalledNandDirectory(installed_root, installed_config);
+            // The installed suyu's own NAND setting may not point back in here either.
+            if (!Common::PackagePolicy::AcceptInstalledRoot(exe_dir, installed_nand)) {
+                ignored_package_nand = true;
+                installed_nand = installed_root / "nand";
+            }
             export_user_root = user_root;
             g_export_package = true;
         }
@@ -1065,6 +1509,13 @@ int main(int argc, char** argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+    if (ignored_package_suyu) {
+        LOG_WARNING(Frontend, "Ignoring a recorded suyu inside this package; keys and firmware "
+                              "come from the default installation");
+    }
+    if (ignored_package_nand) {
+        LOG_WARNING(Frontend, "Ignoring an installed NAND folder inside this package");
+    }
 
     // mk8-recomp: --probe-isa <rom> prints the title's CPU architecture and
     // exits, before any config, window or emulation setup.
@@ -1343,6 +1794,56 @@ int main(int argc, char** argv) {
     };
 
     Common::ConfigureNvidiaEnvironmentFlags();
+
+    // A portable package carries the user's game file, sealed to the console it was made
+    // with. It is opened once the keys for that console are known, further down.
+    std::optional<PortableSealInfo> portable_seal;
+    if (filepath.empty() && !export_user_root.empty() &&
+        IsPortablePackage(export_user_root.parent_path())) {
+        std::string seal_error;
+        portable_seal = ReadPortableSeal(export_user_root.parent_path(), &seal_error);
+        if (!portable_seal) {
+            ReportExportProblem(
+                "Export damaged",
+                fmt::format("This portable export cannot be opened: {}.\n\nExport the game "
+                            "again.",
+                            seal_error),
+                export_user_root.parent_path(), false, {}, "", "");
+            return 2;
+        }
+        filepath = Common::FS::PathToUTF8String(portable_seal->base.path);
+        LOG_INFO(Frontend, "Export: portable package, game file sealed in {}", filepath);
+    }
+
+    // A package made by the validated exporter carries no game data. It starts the
+    // user's own game file, which is read and decrypted with the keys installed in suyu,
+    // exactly as suyu itself would; nothing inside the package is used in its place.
+    if (filepath.empty() && !export_user_root.empty() &&
+        std::filesystem::is_regular_file(
+            export_user_root.parent_path() / Common::PackagePolicy::kExportManifestName)) {
+        const auto source = RecordedGameSource(export_user_root);
+        std::error_code source_ec;
+        std::filesystem::path launch = source;
+        if (!source.empty() && std::filesystem::is_directory(source, source_ec)) {
+            launch = std::filesystem::is_directory(source / "exefs", source_ec)
+                         ? source / "exefs" / "main"
+                         : source / "main";
+        }
+        if (source.empty() || !std::filesystem::is_regular_file(launch, source_ec)) {
+            ReportExportProblem(
+                "Game file not found",
+                fmt::format("This exported game starts your own copy of the game, which was not "
+                            "found{}{}.\n\nPut the game file back, or export the game again "
+                            "from where it is now.",
+                            source.empty() ? "" : " at\n",
+                            source.empty() ? "" : Common::FS::PathToUTF8String(source)),
+                source.empty() ? export_user_root / "config" : source.parent_path(), false, {},
+                "", "");
+            return 2;
+        }
+        filepath = Common::FS::PathToUTF8String(launch);
+        LOG_INFO(Frontend, "Export: starting the user's game file {}", filepath);
+    }
 
     // Auto-detect ROM / exefs alongside the executable when no -g flag is given
     if (filepath.empty() && !static_cast<u32>(load_parameters.applet_id)) {
@@ -1740,6 +2241,14 @@ int main(int argc, char** argv) {
     // still reports keys that are present but unusable, handled further down.
     const std::filesystem::path suyu_exe =
         installed_nand.empty() ? std::filesystem::path{} : RecordedSuyuExecutable(export_user_root);
+    std::optional<Core::Crypto::Key128> portable_key;
+    if (portable_seal) {
+        portable_key =
+            UnlockPortableExport(*portable_seal, export_user_root.parent_path(), suyu_exe);
+        if (!portable_key) {
+            return 2;
+        }
+    }
     if (!installed_nand.empty()) {
         const auto keys_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir);
         std::error_code keys_ec;
@@ -1754,12 +2263,31 @@ int main(int argc, char** argv) {
                             "in suyu (Tools > Install Decryption Keys), then start the game "
                             "again. Copying prod.keys into that folder works just as well.",
                             Common::FS::PathToUTF8String(keys_dir)),
-                keys_dir, false, suyu_exe, "-install-keys", "Install keys in suyu");
+                keys_dir, false, suyu_exe, "-install-keys", "Install keys");
             return 2;
         }
         // Same rule as the filesystem fallback: this package's own NAND wins,
-        // otherwise the installed one is read.
+        // otherwise the installed one is read. A package made by the validated
+        // exporter (export-package.json) never contains firmware, so firmware
+        // found in its NAND was put there afterwards and is not used in place of
+        // the installed firmware.
         const auto registered = std::filesystem::path("system") / "Contents" / "registered";
+        std::error_code manifest_ec;
+        const auto package_nand_firmware = export_user_root / "nand" / registered;
+        if (std::filesystem::is_regular_file(
+                export_user_root.parent_path() / Common::PackagePolicy::kExportManifestName,
+                manifest_ec) &&
+            HasEntries(package_nand_firmware)) {
+            ReportExportProblem(
+                "Firmware inside the export",
+                fmt::format("This exported game has system firmware in its own folder ({}).\n\n"
+                            "Exported games read firmware only from the installed suyu. Remove "
+                            "that folder, then start the game again.",
+                            Common::FS::PathToUTF8String(package_nand_firmware)),
+                package_nand_firmware, false, suyu_exe, "-install-firmware",
+                "Install firmware");
+            return 2;
+        }
         if (!HasEntries(export_user_root / "nand" / registered) &&
             !HasEntries(installed_nand / registered)) {
             const auto firmware_dir = installed_nand / registered;
@@ -1769,7 +2297,7 @@ int main(int argc, char** argv) {
                 "continue anyway, but Mii screens and some menus may fail.",
                 Common::FS::PathToUTF8String(firmware_dir));
             if (!ReportExportProblem("Missing firmware", message, firmware_dir, true, suyu_exe,
-                                     "-install-firmware", "Install firmware in suyu")) {
+                                     "-install-firmware", "Install firmware")) {
                 return 2;
             }
         }
@@ -1898,11 +2426,66 @@ int main(int argc, char** argv) {
     } else {
         load_parameters.applet_id = Service::AM::AppletId::Application;
     }
+    // A portable package's sealed files are opened through views that remove the seal. The
+    // game file and update NCAs underneath are as the user's console made them, and the loader
+    // decrypts them with the user's keys like any game file.
+    FileSys::VirtualFile portable_game;
+    if (portable_seal) {
+        const auto open_sealed = [&](const PortableSealedFile& sealed) -> FileSys::VirtualFile {
+            auto file = explicit_vfs->OpenFile(Common::FS::PathToUTF8String(sealed.path),
+                                               FileSys::OpenMode::Read);
+            if (!file || file->GetSize() != sealed.size) {
+                return nullptr;
+            }
+            return PortableSeal::OpenSealed(std::move(file), *portable_key, sealed.nonce);
+        };
+        portable_game = open_sealed(portable_seal->base);
+        bool complete = portable_game != nullptr;
+        for (const auto& update : portable_seal->updates) {
+            auto file = open_sealed(update);
+            if (!file) {
+                complete = false;
+                break;
+            }
+            explicit_provider.AddEntry(FileSys::TitleType::Update, update.record_type,
+                                       update.title_id, std::move(file));
+        }
+        if (!complete) {
+            ReportExportProblem("Export damaged",
+                                "A sealed file in this export's game folder is missing or has the "
+                                "wrong size. Export the game again.",
+                                export_user_root.parent_path() / "game", false, {}, "", "");
+            return 2;
+        }
+        // DLC is optional: a sealed DLC file that cannot be opened leaves that DLC out, and
+        // the game runs without it. A wrong key never gets here; it is refused above.
+        std::size_t dlc_entries = 0;
+        for (const auto& dlc : portable_seal->dlc) {
+            auto file = open_sealed(dlc);
+            if (!file) {
+                LOG_WARNING(Frontend, "Sealed DLC file {} is missing or has the wrong size; "
+                                      "continuing without DLC {:016X}",
+                            Common::FS::PathToUTF8String(dlc.path.filename()), dlc.title_id);
+                continue;
+            }
+            explicit_provider.AddEntry(FileSys::TitleType::AOC, dlc.record_type, dlc.title_id,
+                                       std::move(file));
+            ++dlc_entries;
+        }
+        if (!portable_seal->updates.empty() || dlc_entries != 0) {
+            system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                           &explicit_provider);
+            LOG_INFO(Frontend, "Registered {} sealed update entries and {} sealed DLC entries",
+                     portable_seal->updates.size(), dlc_entries);
+        }
+    }
     if (!explicit_content_base) {
         // Match the Qt frontend's launch registration: a container can carry
         // control data and additional content besides its primary program.
         // This provider outlives System and does not install anything into NAND.
-        const auto launch_file = system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read);
+        const auto launch_file =
+            portable_game ? portable_game
+                          : system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read);
         const auto launch_loader = launch_file ? Loader::GetLoader(system, launch_file) : nullptr;
         u64 program_id{};
         if (launch_loader && launch_loader->ReadProgramId(program_id) == Loader::ResultStatus::Success) {
@@ -2002,8 +2585,19 @@ int main(int argc, char** argv) {
             fallback_name.resize(fallback_name.size() - suffix.size());
         }
     }
+    if (portable_seal) {
+        // The sealed file's name says nothing; the package folder is named after the game.
+        fallback_name = Common::FS::PathToUTF8String(export_user_root.parent_path().filename());
+        for (const std::string_view suffix : {" - Dynarmic JIT", " - Hybrid AOT + JIT"}) {
+            if (fallback_name.ends_with(suffix) && fallback_name.size() > suffix.size()) {
+                fallback_name.resize(fallback_name.size() - suffix.size());
+            }
+        }
+    }
     SuyuCmd::SetNativeLaunchName(app_name_override.value_or(fallback_name));
-    const Core::SystemResultStatus load_result{system.Load(*emu_window, filepath, load_parameters)};
+    const Core::SystemResultStatus load_result{
+        portable_game ? system.Load(*emu_window, portable_game, load_parameters)
+                      : system.Load(*emu_window, filepath, load_parameters)};
     LOG_INFO(Frontend, "suyu-cmd: system.Load returned: {}", static_cast<int>(load_result));
 
     switch (load_result) {
@@ -2030,6 +2624,9 @@ int main(int argc, char** argv) {
             // here; an export names the keys folder instead of carrying on.
             using Loader::ResultStatus;
             switch (static_cast<ResultStatus>(error_id)) {
+            // A wrong header key decrypts the NCA header to garbage, which the
+            // loader reports as a bad header rather than as a key error.
+            case ResultStatus::ErrorBadNCAHeader:
             case ResultStatus::ErrorMissingProductionKeyFile:
             case ResultStatus::ErrorMissingHeaderKey:
             case ResultStatus::ErrorIncorrectHeaderKey:
@@ -2049,7 +2646,7 @@ int main(int argc, char** argv) {
                                     "title.keys into that folder works just as well.",
                                     Common::FS::PathToUTF8String(keys_dir),
                                     static_cast<ResultStatus>(error_id)),
-                        keys_dir, false, suyu_exe, "-install-keys", "Install keys in suyu");
+                        keys_dir, false, suyu_exe, "-install-keys", "Install keys");
                     return 2;
                 }
                 break;

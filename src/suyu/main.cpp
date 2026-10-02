@@ -2060,35 +2060,6 @@ void GMainWindow::AllowOSSleep() {
 
 bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletParameters params,
                           u64 title_id, bool allow_auto_recomp, bool require_auto_recomp) {
-    if (Loader::AppLoader_NRO::IdentifyType(
-            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
-        if (!CheckFirmwarePresence()) {
-            const auto response = QMessageBox::question(
-                this, tr("Firmware Not Found"),
-                tr("Nintendo Switch firmware was not detected for this launch.\n\n"
-                   "If you already installed firmware, this may be a detection mismatch.\n"
-                   "Choose Continue to attempt launch anyway, or Cancel to stop."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
-                return false;
-            }
-        }
-
-        if (!ContentManager::AreKeysPresent()) {
-            const auto response = QMessageBox::warning(
-                this, tr("No Decryption Keys Detected"),
-                tr("No local decryption keys were detected.\n\n"
-                   "Install your keys via\n"
-                   "Tools > Install Decryption Keys,\n"
-                   "or configure an external decryption tool if you prefer.\n\n"
-                   "If your games are already decrypted, choose Continue."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
-                return false;
-            }
-        }
-    }
-
     // Shutdown previous session if the emu thread is still active...
     if (emu_thread != nullptr) {
         ShutdownGame();
@@ -2237,6 +2208,34 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
                 const std::string error_code = fmt::format("({:04X}-{:04X})", loader_id, error_id);
                 LOG_CRITICAL(Frontend, "Failed to load ROM! {}", error_code);
 
+                // A key the game needs is not installed: say so and offer to install keys,
+                // rather than suggesting the dump is bad.
+                using Loader::ResultStatus;
+                const auto status = static_cast<ResultStatus>(error_id);
+                if (status == ResultStatus::ErrorMissingHeaderKey ||
+                    status == ResultStatus::ErrorMissingProductionKeyFile ||
+                    status == ResultStatus::ErrorMissingTitlekey ||
+                    status == ResultStatus::ErrorMissingTitlekek ||
+                    status == ResultStatus::ErrorMissingKeyAreaKey ||
+                    status == ResultStatus::ErrorMissingSDSeed) {
+                    QMessageBox box(
+                        QMessageBox::Warning, tr("Decryption Keys Missing"),
+                        tr("This game cannot be read because a decryption key is missing (%1).\n\n"
+                           "Install the keys dumped from your own Switch, then start the game "
+                           "again. suyu does not provide, generate or download keys.")
+                            .arg(QString::fromStdString(GetResultStatusString(status))),
+                        QMessageBox::NoButton, this);
+                    QPushButton* install =
+                        box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
+                    box.addButton(QMessageBox::Cancel);
+                    box.setDefaultButton(install);
+                    box.exec();
+                    if (box.clickedButton() == install) {
+                        QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
+                    }
+                    break;
+                }
+
                 const auto title =
                     tr("Error while loading ROM! %1", "%1 signifies a numeric error code.")
                         .arg(QString::fromStdString(error_code));
@@ -2318,6 +2317,45 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
                            StartGameType type, bool require_auto_recomp,
                            InputCommon::TasInput::TasBootMode tas_boot_mode) try {
     LOG_INFO(Frontend, "suyu starting...");
+
+    // Check for keys and firmware before the loader opens the file, so a
+    // missing key is reported to the player before any decryption is attempted.
+    if (Loader::AppLoader_NRO::IdentifyType(
+            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
+        if (!ContentManager::AreKeysPresent()) {
+            QMessageBox box(QMessageBox::Warning, tr("Decryption Keys Missing"),
+                            tr("suyu has no decryption keys installed.\n\n"
+                               "Games need the keys dumped from your own Switch. suyu does not "
+                               "provide, generate or download them.\n\n"
+                               "Install your keys now? Choose Continue only for content that "
+                               "needs no keys, such as homebrew."),
+                            QMessageBox::NoButton, this);
+            QPushButton* install =
+                box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
+            QPushButton* proceed = box.addButton(tr("Continue"), QMessageBox::DestructiveRole);
+            box.addButton(QMessageBox::Cancel);
+            box.setDefaultButton(install);
+            box.exec();
+            if (box.clickedButton() == install) {
+                QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
+                return;
+            }
+            if (box.clickedButton() != proceed) {
+                return;
+            }
+        }
+        if (!CheckFirmwarePresence()) {
+            const auto response = QMessageBox::question(
+                this, tr("Firmware Not Found"),
+                tr("Nintendo Switch firmware was not detected for this launch.\n\n"
+                   "If you already installed firmware, this may be a detection mismatch.\n"
+                   "Choose Continue to attempt launch anyway, or Cancel to stop."),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (response != QMessageBox::Yes) {
+                return;
+            }
+        }
+    }
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
@@ -5736,6 +5774,7 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                         dialog->IsExportInProgressForTesting()},
                                        {QStringLiteral("done"), dialog->HasExportResultForTesting()},
                                        {QStringLiteral("success"), dialog->ExportSucceededForTesting()},
+                                       {QStringLiteral("conflict"), dialog->ExportConflictForTesting()},
                                        {QStringLiteral("progress"), dialog->ExportProgressForTesting()},
                                        {QStringLiteral("status"), dialog->ExportStatusForTesting()},
                                        {QStringLiteral("output_path"),
@@ -6085,6 +6124,33 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                             static_cast<quint32>(params[QStringLiteral("app_version")].toInteger());
                         const QString display_version =
                             params[QStringLiteral("display_version")].toString();
+                        // Headless runs never answer a prompt: an existing destination
+                        // is a reported conflict unless the caller chooses otherwise.
+                        GameExportDialog::TestExportOptions options;
+                        const QString conflict =
+                            params[QStringLiteral("conflict")].toString().trimmed().toLower();
+                        options.conflict =
+                            conflict == QStringLiteral("keep_both")
+                                ? Common::PackagePolicy::ConflictPolicy::KeepBoth
+                            : conflict == QStringLiteral("replace")
+                                ? Common::PackagePolicy::ConflictPolicy::ReplaceWithBackup
+                                : Common::PackagePolicy::ConflictPolicy::Fail;
+                        const auto tri_state = [&params](const char* key) {
+                            const QString name = QString::fromLatin1(key);
+                            return params.contains(name) ? (params[name].toBool() ? 1 : 0) : -1;
+                        };
+                        options.include_save = tri_state("include_save");
+                        options.include_shader = tri_state("include_shader");
+                        options.include_config = tri_state("include_config");
+                        options.fail_at = params[QStringLiteral("fail_at")].toString().trimmed();
+                        // "reference" (uses the game file) or "portable" (sealed game file in
+                        // the package); anything else leaves the dialog's choice.
+                        const QString package =
+                            params[QStringLiteral("package")].toString().trimmed().toLower();
+                        options.package = package == QStringLiteral("portable")    ? 1
+                                          : package == QStringLiteral("reference") ? 0
+                                                                                   : -1;
+                        dialog->SetTestExportOptions(options);
                         QTimer::singleShot(0, dialog, [dialog, rom_path, output_dir, format_index,
                                                        backend_index, full_scan, app_version,
                                                        display_version] {
@@ -6308,6 +6374,40 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                             {QStringLiteral("required"), QJsonArray{QStringLiteral("path")}}},
                 [install_firmware_from_directory](const QJsonObject& params) -> QJsonObject {
                     return install_firmware_from_directory(params[QStringLiteral("path")].toString());
+                });
+
+            mcp_server_->RegisterTool(
+                QStringLiteral("install_content_from_path"),
+                QStringLiteral("Install an NSP (DLC or update) into the NAND the way Install Files does, without dialogs."),
+                QJsonObject{{QStringLiteral("type"), QStringLiteral("object")},
+                            {QStringLiteral("properties"),
+                             QJsonObject{{QStringLiteral("path"),
+                                          QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
+                                                      {QStringLiteral("description"),
+                                                       QStringLiteral("Absolute path to the .nsp file")}}}}},
+                            {QStringLiteral("required"), QJsonArray{QStringLiteral("path")}}},
+                [this](const QJsonObject& params) -> QJsonObject {
+                    const auto path = params[QStringLiteral("path")].toString().toStdString();
+                    if (!QFileInfo(params[QStringLiteral("path")].toString()).isFile()) {
+                        return QJsonObject{{QStringLiteral("result"), QStringLiteral("not_found")}};
+                    }
+                    const auto result = ContentManager::InstallNSP(
+                        *system, *vfs, path, [](size_t, size_t) { return false; });
+                    const char* name = "failure";
+                    switch (result) {
+                    case ContentManager::InstallResult::Success:
+                        name = "success";
+                        break;
+                    case ContentManager::InstallResult::Overwrite:
+                        name = "overwrite";
+                        break;
+                    case ContentManager::InstallResult::BaseInstallAttempted:
+                        name = "base_install_attempted";
+                        break;
+                    case ContentManager::InstallResult::Failure:
+                        break;
+                    }
+                    return QJsonObject{{QStringLiteral("result"), QString::fromLatin1(name)}};
                 });
 
             mcp_server_->RegisterTool(
@@ -6787,13 +6887,23 @@ void GMainWindow::OnLaunchStaticBuild(const QString& executable) {
     // manifest checks. When the export records its source title, open that
     // title in this host instead; LoadROM will select the current cached bundle
     // before creating the guest process.
+    // Current packages record only a title and file name; the full path of the game
+    // file stays in this suyu's settings, found through the package's export ID. Packages
+    // from before that carried the path in game_source.txt.
+    QString recorded_source = GameExportDialog::RecordedExportSource(build.absolutePath());
     QFile source_reference(build.absolutePath() + QDir::separator() +
                            QStringLiteral("game_source.txt"));
-    if (source_reference.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    if (recorded_source.isEmpty() &&
+        source_reference.open(QIODevice::ReadOnly | QIODevice::Text)) {
         const QString line = QString::fromUtf8(source_reference.readLine()).trimmed();
         const QString prefix = QStringLiteral("Recompiled from: ");
         if (line.startsWith(prefix)) {
-            const QString source_path = QDir::fromNativeSeparators(line.mid(prefix.size()));
+            recorded_source = line.mid(prefix.size());
+        }
+    }
+    {
+        if (!recorded_source.isEmpty()) {
+            const QString source_path = QDir::fromNativeSeparators(recorded_source);
             if (QFileInfo::exists(source_path)) {
                 QString launch_path = source_path;
                 u64 hosted_program_id = 0;

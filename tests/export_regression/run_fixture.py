@@ -45,10 +45,13 @@ def main() -> int:
     qt_root = resolve_qt_root(build, args.qt_root)
     source = SOURCE.read_text(encoding="utf-8")
     helpers = "\n".join((
-        extract(source, "static bool CopyFileReplacingExisting(", "// True when both paths"),
-        extract(source, "static bool CopyDeconstructedExeFs(", "// Fingerprint the effective files"),
-        # Stops before SeedPortableConfig, which needs suyu's settings.
-        extract(source, "static QString HashExeFsFiles(", "static bool SeedPortableConfig("),
+        extract(source, "namespace PackagePolicy = Common::PackagePolicy;", "#ifdef _WIN32"),
+        # Includes IsSamePath and the runtime DLL list and content notice after it.
+        extract(source, "static bool CopyFileReplacingExisting(", "// Save data lives at"),
+        # Stops before NpdmMatchesTitle, which needs suyu's loaders.
+        extract(source, "static bool CopyDeconstructedExeFs(",
+                "// An extracted ExeFS names its title in main.npdm."),
+        extract(source, "static QString HashExeFsFiles(", "void GameExportDialog::SetLibraryEntries("),
         extract(source, "static bool HasUnpairedStandaloneNcaUpdate(",
                 "static FileSys::VirtualFile ExtractRomFsFromRom("),
     ))
@@ -77,10 +80,13 @@ def main() -> int:
 #include <QTextStream>
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
+#include "common/package_policy.h"
 #define LOG_ERROR(...) do {} while (false)
+#define LOG_INFO(...) do {} while (false)
 using u64 = std::uint64_t;
 using u32 = std::uint32_t;
 namespace suyu::recomp {
@@ -109,8 +115,24 @@ using VirtualFile = std::shared_ptr<VfsFile>;
 '''
     body = r'''
 static bool writeFile(const QString& path, const QByteArray& bytes) {
+    QDir().mkpath(QFileInfo(path).absolutePath());
     QFile file(path);
     return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
+}
+// Synthetic formats: an NSO header with a payload, and a RomFS header.
+static QByteArray nso(const QByteArray& payload) {
+    QByteArray bytes(0x100, '\0');
+    bytes.replace(0, 4, "NSO0");
+    return bytes + payload;
+}
+static QByteArray romfs() {
+    QByteArray bytes(0x80, '\0');
+    bytes[0] = 0x50;
+    return bytes;
+}
+static QByteArray readAll(const QString& path) {
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
 }
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
@@ -118,22 +140,33 @@ int main(int argc, char** argv) {
     const QString root = QString::fromLocal8Bit(argv[1]);
     const QString src = root + "/source";
     const QString dst = root + "/export/exefs";
-    if (!QDir().mkpath(src) || !writeFile(src + "/main", "code-v1") ||
-        !writeFile(src + "/subsdk0", "old-module") ||
-        !writeFile(src + "/romfs.bin", "synthetic-romfs")) return 3;
+    if (!QDir().mkpath(src) || !writeFile(src + "/main", nso("code-v1")) ||
+        !writeFile(src + "/subsdk0", nso("old-module")) ||
+        !writeFile(src + "/romfs.bin", romfs())) return 3;
     const QString first = HashExeFsFiles({}, src);
     if (first.isEmpty() || !CopyDeconstructedExeFs(src, dst) ||
         !QFile::exists(dst + "/main") || !QFile::exists(dst + "/subsdk0") ||
         QFile::exists(dst + "/romfs.bin")) return 4;
-    if (!writeFile(src + "/main", "code-v2") || !QFile::remove(src + "/subsdk0")) return 5;
+    if (!writeFile(src + "/main", nso("code-v2")) || !QFile::remove(src + "/subsdk0")) return 5;
     const QString second = HashExeFsFiles({}, src);
     if (second.isEmpty() || second == first || !CopyDeconstructedExeFs(src, dst) ||
         !QFile::exists(dst + "/main") || QFile::exists(dst + "/subsdk0")) return 6;
-    QFile current(dst + "/main");
-    if (!current.open(QIODevice::ReadOnly) || current.readAll() != "code-v2") return 7;
+    if (readAll(dst + "/main") != nso("code-v2")) return 7;
     if (HashExeFsFiles({}, src) != second) return 8;
     if (CopyDeconstructedExeFs(src, src) || !QFile::exists(src + "/main")) return 9;
     if (CopyDeconstructedExeFs(src.toUpper(), src) || !QFile::exists(src + "/main")) return 9;
+    // Only files a loader reads are copied, and anything else stops the copy: an
+    // unknown sibling, a key file, or a file named like a module that is not one.
+    for (const auto& [name, bytes] : std::vector<std::pair<QString, QByteArray>>{
+             {"notes.txt", "unrelated"},
+             {"prod.keys", "master_key_00 = 00112233445566778899aabbccddeeff\n"},
+             {"sdk", "not an executable"}}) {
+        const QString dirty = root + "/dirty-" + QString(name).replace('.', '_');
+        const QString dirty_dst = root + "/dirty-out-" + QString(name).replace('.', '_');
+        if (!writeFile(dirty + "/main", nso("code")) || !writeFile(dirty + "/" + name, bytes) ||
+            CopyDeconstructedExeFs(dirty, dirty_dst) ||
+            QFile::exists(dirty_dst + "/" + name)) return 30;
+    }
     const QString pkg = root + "/export";
     const QString cache = pkg + "/aot_cache";
     if (!QDir().mkpath(cache + "/launcher") ||
@@ -189,6 +222,62 @@ int main(int argc, char** argv) {
             ini.contains("System/application_display_version_override") ||
             ini.value("Other/retained").toString() != "yes") return 19;
     }
+    // One allowlist decides every setting a package config carries, from the global file
+    // and the per-game file alike; the per-game file itself is never shipped.
+    const QString global_ini = root + "/settings/qt-config.ini";
+    const QString custom_ini = root + "/settings/custom/0100000000010000.ini";
+    {
+        QSettings global(global_ini, QSettings::IniFormat);
+        global.setValue("Renderer/backend", 1);
+        global.setValue("Renderer/backend/default", false);
+        global.setValue("Renderer/vulkan_device", 3);
+        global.setValue("Renderer/renderer_debug", true);
+        global.setValue("Cpu/cpu_debug_mode", true);
+        global.setValue("System/device_name", "Someone's PC");
+        global.setValue("Data%20Storage/nand_directory", "C:/Users/someone/nand");
+        global.setValue("WebService/suyu_token", "synthetic-token");
+        global.setValue("UI/Paths/romsPath", "C:/Users/someone/games");
+        global.sync();
+        QSettings custom(custom_ini, QSettings::IniFormat);
+        custom.setValue("Renderer/use_vsync", 0);
+        custom.setValue("Renderer/use_vsync/use_global", false);
+        custom.setValue("System/current_user", 5);
+        custom.setValue("System/current_user/use_global", false);
+        custom.setValue("Renderer/evil_key", "x");
+        custom.setValue("Renderer/evil_key/use_global", false);
+        custom.setValue("Controls/player_0_guid", "synthetic");
+        custom.sync();
+    }
+    const QString seeded = root + "/seed/user/config/sdl2-config.ini";
+    QStringList stray;
+    if (!SeedPortableConfig(seeded, global_ini, custom_ini) ||
+        !PortableConfigIsClean(seeded, &stray) || !stray.isEmpty()) return 40;
+    {
+        QSettings ini(seeded, QSettings::IniFormat);
+        if (ini.value("Renderer/backend").toInt() != 1 || ini.value("Renderer/use_vsync").toInt() != 0)
+            return 41;
+        for (const auto* key : {"Renderer/vulkan_device", "Renderer/renderer_debug",
+                                "Cpu/cpu_debug_mode", "System/device_name",
+                                "Data%20Storage/nand_directory", "WebService/suyu_token",
+                                "UI/Paths/romsPath", "System/current_user", "Renderer/evil_key",
+                                "Controls/player_0_guid"}) {
+            if (ini.contains(key)) return 42;
+        }
+        const QByteArray raw = readAll(seeded);
+        if (raw.contains("someone") || raw.contains("synthetic")) return 43;
+    }
+    // Deselected per-game settings leave only the global allowlisted values.
+    const QString seeded_global = root + "/seed-global/sdl2-config.ini";
+    if (!SeedPortableConfig(seeded_global, global_ini, {})) return 44;
+    if (QSettings(seeded_global, QSettings::IniFormat).contains("Renderer/use_vsync")) return 45;
+    // Anything written outside the allowlist afterwards is caught on the file itself.
+    {
+        QSettings ini(seeded, QSettings::IniFormat);
+        ini.setValue("Data%20Storage/sdmc_directory", "C:/elsewhere");
+        ini.sync();
+    }
+    stray.clear();
+    if (PortableConfigIsClean(seeded, &stray) || stray.isEmpty()) return 46;
     const QString registry_root = root + "/registry";
     const QStringList selected{QStringLiteral("main"), QStringLiteral("subsdk1")};
     if (!QDir().mkpath(registry_root) || !WriteRegistration(registry_root, selected)) return 20;
@@ -232,12 +321,14 @@ int main(int argc, char** argv) {
             "/nologo", "/EHsc", "/std:c++20", "/Zc:__cplusplus", "/utf-8", "/MD",
             f"/I{qt_root / 'include'}", f"/I{qt_root / 'include/QtCore'}",
             f"/I{qt_root / 'mkspecs/win32-msvc'}", str(cpp),
+            f"/I{ROOT / 'src'}", str(ROOT / "src/common/package_policy.cpp"),
             "/link", f"/LIBPATH:{qt_root / 'lib'}", "Qt6Core.lib", f"/OUT:{exe}",
         ]
         subprocess.run(command, cwd=directory, env=env, check=True)
         env["PATH"] = str(qt_root / "bin") + os.pathsep + env.get("PATH", "")
         subprocess.run([exe, directory / "fixture"], env=env, check=True)
-    print("PASS: ExeFS/cache, Source cleanup, NCA pairing, fallback policy, version reset, registry write failures")
+    print("PASS: ExeFS roles/cache, rejected siblings, Source cleanup, NCA pairing, fallback policy, "
+          "settings allowlist, version reset, registry write failures")
     return 0
 
 

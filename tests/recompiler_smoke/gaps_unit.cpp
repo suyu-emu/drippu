@@ -186,8 +186,90 @@ int Recorder() {
     return 0;
 }
 
+// The shared form: execution metadata only, strictly read, and never a way back
+// in for raw encodings, names or paths.
+int Shared() {
+    G::GapData local = OneRun(0x1234, 2);
+    local.modules[kIdA].name = "C:/Users/someone/game/main";
+    local.modules[kIdA].offsets[0x1235] = 1;          // not instruction-aligned: dropped
+    local.modules[kIdA].offsets[0x1'0000'0000] = 1;   // past 4 GiB: dropped
+    local.no_image[kIdB] = G::ModuleGaps{"nro", kIdB, 7, {}};
+    local.unimplemented[0x12345678] = 4;
+    const G::SharedCoverage shared = G::ToShared(local);
+    const std::string text = G::SerializeShared(shared);
+    // No raw words (d503233f / 12345678), no names, no paths.
+    CHECK(text.find("d503233f") == std::string::npos && text.find("12345678") == std::string::npos);
+    CHECK(text.find("main") == std::string::npos && text.find("Users") == std::string::npos &&
+          text.find("nro") == std::string::npos);
+    CHECK(text.find("no raw instruction bytes included") != std::string::npos);
+    // Aggregates survive, so the UI does not report zero unsupported instructions.
+    CHECK(shared.unsupported_instruction_kinds == 2 && shared.unsupported_instruction_hits == 7);
+    CHECK(shared.modules.at(kIdA).offsets.size() == 1 && shared.modules.at(kIdA).offsets.at(0x1234) == 2);
+    CHECK(shared.modules_without_image.at(kIdB) == 7);
+
+    // Deterministic and round-trips exactly.
+    auto back = G::ParseShared(text);
+    CHECK(back && G::SerializeShared(*back) == text);
+
+    // Strict reader: unknown fields, free text, bad values and raw opcode lists fail.
+    const auto rejects = [&](std::string from, std::string to) {
+        std::string doc = text;
+        const auto at = doc.find(from);
+        if (at == std::string::npos) {
+            return false;
+        }
+        doc.replace(at, from.size(), to);
+        std::string error;
+        return !G::ParseShared(doc, &error) && !error.empty();
+    };
+    CHECK(rejects("\"runs\": 1", "\"runs\": 1, \"comment\": \"hello\""));
+    CHECK(rejects("\"runs\": 1", "\"runs\": 1, \"unimplemented_opcodes\": [[\"d503233f\", 3]]"));
+    CHECK(rejects("\"runs\": 1", "\"runs\": 1, \"runs\": 2"));
+    CHECK(rejects("\"hits\": 2,", "\"hits\": 2, \"name\": \"main\","));
+    CHECK(rejects("\"description\": \"Execution metadata; no raw instruction bytes included.\"",
+                  "\"description\": \"C:/Users/someone\""));
+    CHECK(rejects("[\"1234\", 2]", "[\"1235\", 2]"));
+    CHECK(rejects("[\"1234\", 2]", "[\"100000000\", 2]"));
+    CHECK(rejects("[\"1234\", 2]", "[\"1234\", -2]"));
+    CHECK(rejects("[\"1234\", 2]", "[\"1234\", 9007199254740992]"));
+    CHECK(rejects("\"title_id\": \"0100000000001000\"", "\"title_id\": \"\""));
+    CHECK(rejects(kIdA, "AA00000000000000000000000000000000000000000000000000000000000001"));
+    CHECK(rejects("\"schema_version\": 1", "\"schema_version\": 2"));
+    CHECK(rejects("\"truncated\": false", "\"truncated\": 0"));
+
+    // A legacy recomp_gaps file is accepted for import but converted: its opcodes and
+    // names do not come through, and exporting afterwards stays clean.
+    bool legacy = false;
+    auto imported = G::ParseImport(G::Serialize(local), nullptr, &legacy);
+    CHECK(imported && legacy);
+    CHECK(G::SerializeShared(*imported).find("12345678") == std::string::npos);
+    G::GapData store;
+    store.title_id = "0100000000001000";
+    store.unimplemented[0xd503201f] = 1; // this machine's own diagnostics
+    G::MergeShared(store, *imported);
+    // Local diagnostics keep their own opcode, gain no foreign ones, and know at least
+    // as many unsupported kinds as the file reported.
+    CHECK(store.unimplemented.size() == 1 && store.unimplemented.count(0xd503201f));
+    CHECK(store.UnsupportedInstructionKinds() == 2 && !store.Clean());
+    // The recompiler still gets usable, build-ID-matched roots.
+    const auto roots = G::RootsFor(store, kIdA);
+    CHECK(roots.size() == 1 && roots[0] == 0x1234);
+    // The merged store round-trips through its own file without losing the totals.
+    auto reread = G::Parse(G::Serialize(store));
+    CHECK(reread && reread->imported_unsupported_kinds == 2 &&
+          reread->imported_unsupported_hits == 7 && reread->unimplemented.size() == 1);
+    const std::string again = G::SerializeShared(G::ToShared(*reread));
+    CHECK(again.find("d503201f") == std::string::npos && again.find("12345678") == std::string::npos);
+    // Shared input is parsed by the shared rules.
+    auto shared_in = G::ParseImport(text, nullptr, &legacy);
+    CHECK(shared_in && !legacy);
+    CHECK(!G::ParseImport("{\"schema\": \"suyu-shared-coverage\", \"extra\": 1}"));
+    std::printf("PASS shared coverage\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
-    return Schema() || MergeDedupe() || BuildIds() || NoPaths() || Recorder();
+    return Schema() || MergeDedupe() || BuildIds() || NoPaths() || Recorder() || Shared();
 }
