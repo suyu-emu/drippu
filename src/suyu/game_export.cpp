@@ -1110,7 +1110,7 @@ static bool PortableConfigIsClean(const QString& config_path, QStringList* stray
     const QSettings ini(config_path, QSettings::IniFormat);
     for (const QString& key : ini.allKeys()) {
         QString base = key;
-        for (const QString suffix : {QStringLiteral("/default"), QStringLiteral("/use_global")}) {
+        for (const QString& suffix : {QStringLiteral("/default"), QStringLiteral("/use_global")}) {
             if (base.endsWith(suffix)) {
                 base.chop(suffix.size());
                 break;
