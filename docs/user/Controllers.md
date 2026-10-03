@@ -4,6 +4,41 @@ Most of the controls should work out of the box. If not, please use a joystick c
 
 - https://github.com/dkosmari/calibrate-joystick
 
+## Controllers in exported games
+
+A game made with **File > Export Game** (Windows package) sets up controllers by
+itself. You don't need to configure anything first.
+
+- The first gamepad you connect becomes **Player 1**.
+- More gamepads become Players 2–8, in the order they connect. Each one acts as a
+  Pro Controller.
+- Unplug a pad and that player disconnects. Plug it back in and it returns to the same
+  player slot (Players 2–8; the next pad to connect always takes an empty Player 1).
+- Player 1 is never left empty. If every pad is unplugged, the keyboard goes back to
+  Player 1.
+- Devices that aren't gamepads are ignored.
+- Left and right Joy-Con halves combine into one player automatically.
+- The Home button works on gamepads.
+
+Press **F12** in the game for the controls panel:
+
+- **Combine Joy-Cons into one player** / **Split Joy-Cons into two players** changes how
+  Joy-Con halves are used.
+- **Resolution Scale** sets the internal resolution. It's saved in the package and
+  takes effect the next time the game starts.
+- **Use keyboard** or **Rebind** sets controls by hand. Doing either turns automatic
+  assignment off for that package. To turn it back on, set
+  `auto_assign_controllers=true` under `[Controls]` in the package's
+  `user\config\sdl2-config.ini`.
+
+Limitations:
+
+- Joy-Con handling (auto-assign, Combine/Split) is covered by automated tests but has not
+  been tried with real Joy-Cons yet.
+- Linux and macOS exports are Source only, so none of this applies to them yet.
+
+Tested with two pads (PowerA and Xbox Series X) at 60 fps in a Dynarmic JIT export.
+
 ## Using external controllers on the Steamdeck
 
 In desktop mode ignore your pro controller/xbox contoller external controller and use **Steam Virtual Gamepad 0 as Player 1**. If you have multiple external controllers set **Player 2 to Steam Virtual Gamepad 1**. Steam app must not be closed on desktop mode.
@@ -29,6 +64,7 @@ Use this guide for when you want to configure specific controller settings to be
 ---
 
 #### Steps
+
 1. Launch Eden and wait for it to load.
 2. Navigate to *Emulation > Configure...*
 3. Select **Controls** from the left-hand menu and configure your controller for the way you want it to be in game.
@@ -47,7 +83,7 @@ Use this guide when you want to set up specific controller profiles for specific
 
 - Eden Emulator set up and fully configured
 - Controller Profile Created
-    - See [*Configuring Controller Profiles*](./ControllerProfiles.md) for instructions on how to do this if needed.
+  - See [*Configuring Controller Profiles*](./ControllerProfiles.md) for instructions on how to do this if needed.
 
 ---
 
@@ -58,8 +94,11 @@ Use this guide when you want to set up specific controller profiles for specific
 
     <aside>
 
-    ***NOTE***: You may have to resize the window to see all tabs, or press the arrows by the tabs to see **Input Profiles**.
+   ***NOTE***: You may have to resize the window to see all tabs, or press the arrows by the tabs to see **Input Profiles**.
 
     </aside>
-1. Click **OK** to apply the profile mapping.
-2. Launch the game and confirm that the profile is applied, regardless of what the global configuration is.
+
+3. Click **OK** to apply the profile mapping.
+
+4. Launch the game and confirm that the profile is applied, regardless of what the global configuration is.
+

@@ -34,6 +34,8 @@ struct CipherContext {
     EVP_CIPHER_CTX* encryption_context = nullptr;
     EVP_CIPHER_CTX* decryption_context = nullptr;
     EVP_CIPHER* cipher = nullptr;
+    /// False when no key was supplied; such a cipher never touches data.
+    bool keyed = false;
 };
 
 static inline const std::string GetCipherName(Mode mode, u32 key_size) {
@@ -95,18 +97,17 @@ Crypto::AESCipher<Key>::AESCipher(Key key, Mode mode) : ctx(std::make_unique<Cip
 
     ASSERT(ctx->encryption_context && ctx->decryption_context && ctx->cipher && "OpenSSL cipher context failed init!");
     // now init ciphers
-    // An all-zero key means the key file simply is not present. That is a
-    // normal state - a statically recompiled game export ships its content
-    // already decrypted and never needs one - and XTS rejects such a key
-    // outright, because its two halves must differ. Report it once at info
-    // level rather than asserting: the cipher is never actually used in that
-    // case, and an assert here reads as a failure in a run that is fine.
+    // An all-zero key means the user has not installed the key this cipher needs.
+    // XTS rejects such a key outright, because its two halves must differ, so the
+    // cipher is left unkeyed; callers check for the key and report it missing, and
+    // an unkeyed cipher refuses to transcode rather than crash.
     const bool key_present =
         std::any_of(key.begin(), key.end(), [](u8 b) { return b != 0; });
     if (!key_present) {
         LOG_DEBUG(Crypto, "No key available for this cipher; leaving it uninitialized");
         return;
     }
+    ctx->keyed = true;
     ASSERT(EVP_CipherInit_ex2(ctx->encryption_context, ctx->cipher, key.data(), NULL, 1, NULL));
     ASSERT(EVP_CipherInit_ex2(ctx->decryption_context, ctx->cipher, key.data(), NULL, 0, NULL));
 
@@ -127,6 +128,11 @@ void AESCipher<Key>::Transcode(const u8* src, std::size_t size, u8* dest, Op op)
 
     if (size == 0)
         return;
+    if (!ctx->keyed) {
+        LOG_ERROR(Crypto, "Decryption skipped: the required key is not installed");
+        std::memset(dest, 0, size);
+        return;
+    }
 
     // reset
     ASSERT(EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1));
@@ -177,6 +183,9 @@ void AESCipher<Key>::XTSTranscode(const u8* src, std::size_t size, u8* dest, std
 
 template <typename Key>
 void AESCipher<Key>::SetIV(std::span<const u8> data) {
+    if (!ctx->keyed) {
+        return;
+    }
     const int ret_enc = EVP_CipherInit_ex(ctx->encryption_context, nullptr, nullptr, nullptr, data.data(), -1);
     const int ret_dec = EVP_CipherInit_ex(ctx->decryption_context, nullptr, nullptr, nullptr, data.data(), -1);
     ASSERT(ret_enc == 1 && ret_dec == 1 && "Failed to set IV on OpenSSL contexts");

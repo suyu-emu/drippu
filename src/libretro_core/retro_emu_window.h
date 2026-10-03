@@ -3,7 +3,13 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "core/frontend/emu_window.h"
+
+namespace InputCommon::TasInput {
+class Tas;
+}
 
 namespace LibretroCore {
 
@@ -27,6 +33,19 @@ public:
 
     std::unique_ptr<Core::Frontend::GraphicsContext> CreateSharedContext() const override;
     bool IsShown() const override;
+    void SetTasPlayback(InputCommon::TasInput::Tas* tas);
+    void OnFrameDisplayed() override;
+
+    /// Frames the renderer has composited; the headless frame buffer changes only when this does.
+    u64 FramesDisplayed() const {
+        return frames_displayed.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<u64> frames_displayed{};
+    InputCommon::TasInput::Tas* tas_playback{};
+    u64 tas_completion_generation{};
+    u64 tas_frame_callbacks{};
 };
 
 } // namespace LibretroCore

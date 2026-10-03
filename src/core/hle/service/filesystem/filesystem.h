@@ -7,6 +7,7 @@
 #pragma once
 
 #include <map>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -135,6 +136,11 @@ public:
     // above is called.
     void CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite = true);
 
+    // A standalone export keeps its own NAND for saves but carries no system firmware, which
+    // cannot be redistributed. When that NAND has no system content, CreateFactories reads it
+    // read-only from this installed NAND instead. Call before CreateFactories.
+    void SetSystemContentFallback(std::filesystem::path installed_nand);
+
     void Reset();
 
 private:
@@ -151,6 +157,7 @@ private:
 
     std::unique_ptr<FileSys::SDMCFactory> sdmc_factory;
     std::unique_ptr<FileSys::BISFactory> bis_factory;
+    std::filesystem::path system_content_fallback;
 
     std::unique_ptr<FileSys::ExternalContentProvider> external_provider;
 

@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: jurplel/install-qt-action@v4
         with:
@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - name: Install deps
         run: bash .github/scripts/install-linux-deps.sh
       - name: ccache
@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - name: Install deps
         run: >-
           brew install asc ninja qt@6 openssl ffmpeg glslang molten-vk boost
@@ -271,7 +271,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
@@ -313,7 +313,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - uses: actions/setup-java@v6
         with:
           distribution: microsoft
@@ -387,7 +387,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - name: Install deps
         run: |
           sudo apt-get update
@@ -442,7 +442,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Install Vulkan SDK
         shell: pwsh
@@ -499,7 +499,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - name: Install native deps
         run: |
           sudo apt-get update

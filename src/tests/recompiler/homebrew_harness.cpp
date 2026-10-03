@@ -229,7 +229,7 @@ constexpr u32 kMsrTpidrX0 = 0xD51BD040u;    // MSR TPIDR_EL0, X0
 constexpr u32 kMrsX1Tpidr = 0xD53BD041u;    // MRS X1, TPIDR_EL0
 constexpr u32 kMrsX3Tpidrro = 0xD53BD063u;  // MRS X3, TPIDRRO_EL0
 constexpr u32 kSvc42 = 0xD4000541u;         // SVC #42
-constexpr u32 kBrk0 = 0xD4200000u;          // BRK #0 (unsupported -> unhandled)
+constexpr u32 kUnsupportedInsn = 0xFFFFFFFFu; // deliberately unsupported encoding
 constexpr u32 kMovzX0_7 = 0xD28000E0u;      // MOVZ X0, #7
 constexpr u32 kRetX30 = 0xD65F03C0u;
 
@@ -369,7 +369,7 @@ std::string BuildProbeSource() {
     const std::string t_movz_val2 = TranslateInsn(kMovzX2_0xABCD, kTlsMemPc + 16);
     const std::string t_str2 = TranslateInsn(0xF9000082u, kTlsMemPc + 20); // STR X2,[X4]
     const std::string t_svc = TranslateInsn(kSvc42, kTlsMemPc + 24);
-    const std::string t_brk = TranslateInsn(kBrk0, kUnhandledPc);
+    const std::string t_unhandled = TranslateInsn(kUnsupportedInsn, kUnhandledPc);
     const std::string t_mov7 = TranslateInsn(kMovzX0_7, kPlainPc);
     const std::string t_ret = TranslateInsn(kRetX30, kRetPc);
 
@@ -379,6 +379,7 @@ std::string BuildProbeSource() {
 #include <string.h>
 
 #define RECOMP_HALT_UNHANDLED 2
+#define RECOMP_HALT_BREAKPOINT 3
 #define NO_SVC (~0ULL)
 
 typedef struct GuestContext {
@@ -451,7 +452,7 @@ static void block_tls_mem_svc(GuestContext* c) {
 
 static void block_unhandled(GuestContext* c) {
 )C";
-    src << t_brk;
+    src << t_unhandled;
     src << R"C(}
 
 static void block_plain(GuestContext* c) {

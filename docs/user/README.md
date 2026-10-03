@@ -1,10 +1,8 @@
-# User Handbook
-
-The "FAQ".
+# suyu User Handbook
 
 This handbook is primarily aimed at the end-user - baking useful knowledge for enhancing their emulation experience.
 
-A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md).
+A copy of the public documentation is available from the [suyu docs site](https://suyu-emu.github.io/website/docs).
 
 ## Basics
 
@@ -12,7 +10,7 @@ A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/
 - **[Quickstart](./QuickStart.md)**
 - **[Settings](./Settings.md)**
 - **[Controllers](./Controllers.md)**
-    - **[Controller profiles](./Controllers.md#configuring-controller-profiles)**
+  - **[Controller profiles](./Controllers.md#configuring-controller-profiles)**
 - **[Audio](Audio.md)**
 - **[Graphics](Graphics.md)**
 - **[Installing Mods](./Mods.md)**
@@ -26,6 +24,7 @@ A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/
 - **[Installing Atmosphere Mods](./InstallingAtmosphereMods.md)**
 - **[Installing Updates & DLCs](./InstallingUpdatesDLC.md)**
 - **[Multiplayer](./Multiplayer.md)**
+- **[Exporting a game](./GameExport.md)**
 
 ## 3rd-party Integration
 
@@ -33,10 +32,10 @@ A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/
 - **[Server hosting](./ServerHosting.md)**
 - **[Syncthing Guide](./SyncthingGuide.md)**
 - **[Third Party](./ThirdParty.md)**
-    - **[Obtainium](./ThirdParty.md#configuring-obtainium)**
-    - **[ES-DE](./ThirdParty.md#configuring-es-de)**
-    - **[Mirrors](./ThirdParty.md#mirrors)**
-    - **[GameMode](./ThirdParty.md#configuring-gamemode)**
+  - **[Obtainium](./ThirdParty.md#configuring-obtainium)**
+  - **[ES-DE](./ThirdParty.md#configuring-es-de)**
+  - **[Mirrors](./ThirdParty.md#mirrors)**
+  - **[GameMode](./ThirdParty.md#configuring-gamemode)**
 
 ## Advanced
 
@@ -50,3 +49,4 @@ A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/
 - **[Adding Boolean Settings Toggles](./AddingBooleanToggles.md)**
 - **[Adding Debug Knobs](./AddingDebugKnobs.md)**
 - **[Testing](./Testing.md)**
+

@@ -6,7 +6,7 @@
 
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 #include "common/fs/fs_android.h"
 #endif
 #include "common/fs/path_util.h"
@@ -336,6 +336,15 @@ bool RemoveDirContentsRecursively(const fs::path& path) {
             break;
         }
 
+        // Empty subdirectories before removing them. Use symlink_status so a symlinked
+        // directory is removed as a link instead of deleting its target's contents.
+        if (entry.symlink_status().type() == fs::file_type::directory) {
+            if (!RemoveDirContentsRecursively(entry.path())) {
+                ec = std::make_error_code(std::errc::directory_not_empty);
+                break;
+            }
+        }
+
         fs::remove(entry.path(), ec);
 
         if (ec) {
@@ -343,12 +352,6 @@ bool RemoveDirContentsRecursively(const fs::path& path) {
                       "Failed to remove the filesystem object at path={}, ec_message={}",
                       PathToUTF8String(entry.path()), ec.message());
             break;
-        }
-
-        // TODO (Morph): Remove this when MSVC fixes recursive_directory_iterator.
-        // recursive_directory_iterator throws an exception despite passing in a std::error_code.
-        if (entry.status().type() == fs::file_type::directory) {
-            return RemoveDirContentsRecursively(entry.path());
         }
     }
 
@@ -477,7 +480,7 @@ void IterateDirEntriesRecursively(const std::filesystem::path& path, const DirEn
 
 bool Exists(const fs::path& path) {
     std::error_code ec;
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (Android::IsContentUri(path)) {
         return Android::Exists(path);
     } else {
@@ -490,7 +493,7 @@ bool Exists(const fs::path& path) {
 
 bool IsFile(const fs::path& path) {
     std::error_code ec;
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (Android::IsContentUri(path)) {
         return !Android::IsDirectory(path);
     } else {
@@ -503,7 +506,7 @@ bool IsFile(const fs::path& path) {
 
 bool IsDir(const fs::path& path) {
     std::error_code ec;
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (Android::IsContentUri(path)) {
         return Android::IsDirectory(path);
     } else {
@@ -556,7 +559,7 @@ fs::file_type GetEntryType(const fs::path& path) {
 }
 
 u64 GetSize(const fs::path& path) {
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (Android::IsContentUri(path)) {
         return Android::GetSize(path);
     }

@@ -278,22 +278,22 @@ public:
 
     static bool KeyFileExists(bool title);
 
-    // Call before using the sd seed to attempt to derive it if it doesn't exist. Needs system
-    // save 8*43 and the private file to exist.
-    void DeriveSDSeedLazy();
-
     bool BaseDeriveNecessary() const;
-    void DeriveBase();
-    void DeriveETicket(PartitionDataManager& data, const FileSys::ContentProvider& provider);
     void PopulateTickets();
     void SynthesizeTickets();
-
-    void PopulateFromPartitionData(PartitionDataManager& data);
 
     const std::map<u128, Ticket>& GetCommonTickets() const;
     const std::map<u128, Ticket>& GetPersonalizedTickets() const;
 
     bool AddTicket(const Ticket& ticket);
+
+    /// Adds the tickets kept in a NAND's ticket store (see TicketStoreDir) to the ones in
+    /// memory, so content installed from NSPs in earlier sessions can be decrypted. Each
+    /// directory is read once per process. Returns how many tickets were added.
+    std::size_t LoadInstalledTickets(const std::filesystem::path& nand_dir);
+    /// Tickets added by LoadInstalledTickets, and how many of them gave a title key.
+    std::size_t GetInstalledTicketCount() const;
+    std::size_t GetInstalledTitleKeyCount() const;
 
     void ReloadKeys();
     bool AreKeysLoaded() const;
@@ -308,39 +308,33 @@ private:
     std::map<u128, Ticket> common_tickets;
     std::map<u128, Ticket> personal_tickets;
     bool ticket_databases_loaded = false;
+    std::vector<std::filesystem::path> loaded_ticket_stores;
+    std::size_t installed_ticket_count = 0;
+    std::size_t installed_title_key_count = 0;
 
-    std::array<std::array<u8, 0xB0>, 0x20> encrypted_keyblobs{};
-    std::array<std::array<u8, 0x90>, 0x20> keyblobs{};
-    std::array<u8, 576> eticket_extended_kek{};
     RSAKeyPair<2048> eticket_rsa_keypair{};
 
     bool dev_mode;
     void LoadFromFile(const std::filesystem::path& file_path, bool is_title_keys);
-
-    template <size_t Size>
-    void WriteKeyToFile(KeyCategory category, std::string_view keyname,
-                        const std::array<u8, Size>& key);
-
-    void DeriveGeneralPurposeKeys(std::size_t crypto_revision);
-
-    void DeriveETicketRSAKey();
-
-    void SetKeyWrapped(S128KeyType id, Key128 key, u64 field1 = 0, u64 field2 = 0);
-    void SetKeyWrapped(S256KeyType id, Key256 key, u64 field1 = 0, u64 field2 = 0);
 
     /// Parses the title key section of a ticket.
     std::optional<Key128> ParseTicketTitleKey(const Ticket& ticket);
 };
 
 Key128 GenerateKeyEncryptionKey(Key128 source, Key128 master, Key128 kek_seed, Key128 key_seed);
-Key128 DeriveKeyblobKey(const Key128& sbk, const Key128& tsec, Key128 source);
-Key128 DeriveKeyblobMACKey(const Key128& keyblob_key, const Key128& mac_source);
-Key128 DeriveMasterKey(const std::array<u8, 0x90>& keyblob, const Key128& master_source);
-std::array<u8, 0x90> DecryptKeyblob(const std::array<u8, 0xB0>& encrypted_keyblob, const Key128& key);
 
-std::optional<Key128> DeriveSDSeed();
 Loader::ResultStatus DeriveSDKeys(std::array<Key256, 2>& sd_keys, KeyManager& keys);
 
 std::vector<Ticket> GetTicketblob(const Common::FS::IOFile& ticket_save);
+
+/// Where a NAND directory keeps the tickets of content installed from NSPs:
+/// <nand>/system/tickets/<rights id>.tik.
+std::filesystem::path TicketStoreDir(const std::filesystem::path& nand_dir);
+
+/// Copies a ticket file from an NSP being installed, byte for byte, into the ticket store of
+/// `nand_dir`. Only files that parse as a ticket with a rights ID are kept; an identical copy
+/// is left alone. Returns true when the store holds the ticket afterwards.
+bool StoreInstalledTicket(const std::filesystem::path& nand_dir,
+                          const FileSys::VirtualFile& ticket_file);
 
 } // namespace Core::Crypto

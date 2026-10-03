@@ -594,6 +594,14 @@ struct Values {
 
     SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
+    SwitchableSetting<bool> use_graphics_pipeline_library{
+        linkage,
+#ifdef __ANDROID__
+        false,
+#else
+        true,
+#endif
+        "use_graphics_pipeline_library", Category::RendererExtensions};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
                                                   GpuUnswizzleSize::Large,
@@ -794,6 +802,16 @@ struct Values {
                                         Category::DataStorage};
     Setting<std::string> gamecard_path{linkage, std::string(), "gamecard_path",
                                        Category::DataStorage};
+
+    // Reported application version. Content without control data -- a deconstructed ROM
+    // directory, for instance -- leaves the system with nothing to answer GetDisplayVersion
+    // with, and it falls back to 1.0.0 regardless of which build was actually exported.
+    // Setting these makes a title report what it really is. Zero and empty mean "no
+    // override", which keeps the stock behaviour.
+    Setting<u32> application_version_override{linkage, 0, "application_version_override",
+                                              Category::System};
+    Setting<std::string> application_display_version_override{
+        linkage, std::string(), "application_display_version_override", Category::System};
     Setting<bool> ext_content_from_game_dirs{linkage, true, "ext_content_from_game_dirs",
                                              Category::DataStorage};
     std::vector<std::string> external_content_dirs;

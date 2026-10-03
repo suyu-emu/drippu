@@ -5,13 +5,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <ankerl/unordered_dense.h>
 
 #include "common/assert.h"
 #include "common/fs/fs.h"
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 #include "common/fs/fs_android.h"
 #endif
 #include "common/fs/fs_paths.h"
@@ -165,7 +166,9 @@ public:
 
 private:
     PathManagerImpl() {
+#ifndef SUYU_ANDROID_LIBRETRO
         Reinitialize();
+#endif
     }
 
     ~PathManagerImpl() = default;
@@ -303,12 +306,19 @@ fs::path GetExeDirectory() {
 }
 
 fs::path GetAppDataRoamingDirectory() {
+    // Match Qt and the launch environment, including redirected user profiles.
+    if (const wchar_t* appdata = _wgetenv(L"APPDATA"); appdata && *appdata) {
+        const fs::path configured{appdata};
+        std::error_code ec;
+        if (fs::is_directory(configured, ec)) {
+            return configured;
+        }
+    }
     PWSTR appdata_roaming_path = nullptr;
-
-    SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata_roaming_path);
-
-    auto fs_appdata_roaming_path = fs::path{appdata_roaming_path};
-
+    const HRESULT result =
+        SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata_roaming_path);
+    const fs::path fs_appdata_roaming_path = SUCCEEDED(result) && appdata_roaming_path
+                                               ? fs::path{appdata_roaming_path} : fs::path{};
     CoTaskMemFree(appdata_roaming_path);
 
     if (fs_appdata_roaming_path.empty()) {
@@ -429,7 +439,7 @@ std::vector<std::string> SplitPathComponentsCopy(std::string_view filename) {
 
 std::string SanitizePath(std::string_view path_, DirectorySeparator directory_separator) {
     std::string path(path_);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (Android::IsContentUri(path)) {
         return path;
     }
@@ -464,7 +474,7 @@ std::string GetParentPath(std::string_view path) {
         return std::string(path);
     }
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (path[0] != '/') {
         std::string path_string{path};
         return FS::Android::GetParentDirectory(path_string);

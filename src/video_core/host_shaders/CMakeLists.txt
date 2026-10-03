@@ -91,8 +91,16 @@ else()
     find_program(GLSLANGVALIDATOR "glslangValidator")
 endif()
 
+option(SUYU_DEFER_SHADER_COMPILER_CHECK
+    "Allow configuring CPU/library-only targets without glslangValidator (renderer builds still require it)" OFF)
 if ("${GLSLANGVALIDATOR}" STREQUAL "GLSLANGVALIDATOR-NOTFOUND")
-    message(FATAL_ERROR "Required program `glslangValidator` not found.")
+    if(NOT SUYU_DEFER_SHADER_COMPILER_CHECK)
+        message(FATAL_ERROR "Required program `glslangValidator` not found.")
+    endif()
+    message(WARNING "glslangValidator is missing. Only independent CPU/library targets can build. "
+                    "Host shaders and emulator executables still require the real shader compiler.")
+    # Keep the genuine compilation commands. Never create placeholder shader data.
+    set(GLSLANGVALIDATOR "glslangValidator")
 endif()
 
 set(GLSL_FLAGS "-DUseUniformBlock=1")

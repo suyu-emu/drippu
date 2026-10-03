@@ -84,7 +84,8 @@ public:
                                            this);
 
         if (stream == nullptr) {
-            LOG_CRITICAL(Audio_Sink, "Error opening SDL audio device: {}", SDL_GetError());
+            LOG_WARNING(Audio_Sink, "SDL audio device unavailable ({}); using silent output",
+                        SDL_GetError());
             return;
         }
 
@@ -105,6 +106,15 @@ public:
     ~SDLSinkStream() override {
         LOG_DEBUG(Service_Audio, "Destructing SDL stream {}", name);
         Finalize();
+    }
+
+    void AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) override {
+        // If SDL could not open a device, no callback will drain the queue.
+        // Discard audio as the null sink does so the ADSP cannot block forever.
+        if (stream == nullptr) {
+            return;
+        }
+        SinkStream::AppendBuffer(buffer, samples);
     }
 
     /**

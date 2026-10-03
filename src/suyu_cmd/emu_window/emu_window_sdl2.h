@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <set>
+#include <string>
 #include <utility>
 
 #include "core/frontend/emu_window.h"
@@ -18,6 +20,10 @@ class System;
 /// registered — the running process is a standalone game export, so window
 /// chrome (title/icon) should read as the game, not the suyu dev frontend.
 extern bool g_native_export_mode;
+
+/// Defined in suyu.cpp. True when this executable runs as an exported package (a static
+/// build, or a copy with the exporter's README beside it), whatever its CPU backend.
+extern bool g_export_package;
 
 namespace InputCommon {
 class InputSubsystem;
@@ -38,8 +44,28 @@ public:
     /// Wait for the next event on the main thread.
     void WaitEvent();
 
+    void RefreshWindowStatus();
+
+    /// Hand connected gamepads to player slots; see SuyuCmd::AssignControllers.
+    void AutoAssignControllers();
+
+    /// Replay the TAS script from the user TAS directory instead of waiting for
+    /// a hotkey, and quit once it runs out. Call before the system is run.
+    void EnableTasPlayback();
+
     // Sets the window icon from suyu.bmp
     void SetWindowIcon();
+
+    /// Boot-time shader precompile progress (see LoadDiskResources in suyu.cpp): the title
+    /// bar everywhere, plus a progress bar window on Windows. Main thread only; the
+    /// precompile itself runs on another thread and only reports counts.
+    void ShowBuildProgress(std::size_t built, std::size_t total);
+    void HideBuildProgress();
+
+    /// Pumps window events while the main loop isn't running yet, so the window keeps
+    /// responding. Returns false once the player has asked to close the window; the
+    /// request stays queued for the main loop.
+    bool PumpEventsWhileLoading();
 
 protected:
     /// Called by WaitEvent when a key is pressed or released.
@@ -78,6 +104,20 @@ protected:
     /// Called when a configuration change affects the minimal size of the window
     void OnMinimalClientAreaChangeRequest(std::pair<u32, u32> minimal_size) override;
 
+    /// Called by the renderer after each presented frame. Drives TAS playback,
+    /// which advances one command per displayed frame.
+    void OnFrameDisplayed() override;
+
+    /// Whether --tas asked us to replay a script.
+    bool tas_playback = false;
+
+    /// Whether playback has been started. Set on the first displayed frame.
+    bool tas_started = false;
+
+    /// Last progress seen while running. The driver rewinds its counter to zero
+    /// when the script ends, so the final status cannot report how far it got.
+    std::size_t tas_progress = 0;
+
     /// Is the window still open?
     bool is_open = true;
 
@@ -87,8 +127,23 @@ protected:
     /// Internal SDL2 render window
     SDL_Window* render_window{};
 
+    /// Boot shader precompile progress window (Windows HWND), or null.
+    void* build_progress_window{};
+    u64 last_build_title_ticks = 0;
+
     /// Keeps track of how often to update the title bar during gameplay
     u64 last_time = 0;
+
+    /// Set at startup and whenever a gamepad comes or goes; see AutoAssignControllers.
+    bool gamepad_check_pending = true;
+    /// Further looks for a gamepad SDL lists before the input backend does.
+    static constexpr int kGamepadRetries = 4;
+    int gamepad_retries = kGamepadRetries;
+    /// Pads connected at any point this session ("guid:port").
+    std::set<std::string> pads_seen;
+    /// Assignments reach the game at once but the config file at most every 2 s.
+    bool controls_save_pending = false;
+    u64 last_controls_save = 0;
 
     /// Input subsystem to use with this window.
     InputCommon::InputSubsystem* input_subsystem;

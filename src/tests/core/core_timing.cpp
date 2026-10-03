@@ -34,6 +34,7 @@ std::optional<std::chrono::nanoseconds> HostCallbackTemplate(s64 time,
 
 struct ScopeInit final {
     ScopeInit() {
+        callbacks_ran_flags.reset();
         core_timing.SetMulticore(true);
         core_timing.Initialize([]() {});
     }

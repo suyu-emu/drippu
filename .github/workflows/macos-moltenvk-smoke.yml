@@ -23,7 +23,7 @@ jobs:
           test "$(uname -m)" = "arm64"
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none submodule update --init --recursive --depth=1
       - name: Install deps
         run: >-
           brew install ninja qt@6 openssl ffmpeg glslang boost

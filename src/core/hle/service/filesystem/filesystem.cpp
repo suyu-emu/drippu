@@ -12,6 +12,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/crypto/key_manager.h"
 #include "core/file_sys/bis_factory.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/control_metadata.h"
@@ -696,6 +697,10 @@ FileSys::VirtualDir FileSystemController::GetBCATDirectory(u64 title_id) const {
     return bis_factory->GetBCATDirectory(title_id);
 }
 
+void FileSystemController::SetSystemContentFallback(std::filesystem::path installed_nand) {
+    system_content_fallback = std::move(installed_nand);
+}
+
 void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite) {
     if (overwrite) {
         bis_factory = nullptr;
@@ -719,12 +724,65 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
         vfs.OpenDirectory(Common::FS::GetSuyuPathString(SuyuPath::DumpDir), rw_mode);
 
     if (bis_factory == nullptr) {
+        // Firmware installed into this NAND always wins. Only a NAND with no system content at
+        // all borrows the installed one, and only for reading: installs still land here.
+        FileSys::VirtualDir system_registered;
+        const auto own_registered =
+            nand_directory ? nand_directory->GetDirectoryRelative("system/Contents/registered")
+                           : nullptr;
+        const bool own_is_empty = own_registered == nullptr ||
+                                  (own_registered->GetFiles().empty() &&
+                                   own_registered->GetSubdirectories().empty());
+        if (own_is_empty && !system_content_fallback.empty()) {
+            auto fallback = vfs.OpenDirectory(
+                Common::FS::PathToUTF8String(system_content_fallback / "system" / "Contents" /
+                                             "registered"),
+                FileSys::OpenMode::Read);
+            if (fallback != nullptr &&
+                !(fallback->GetFiles().empty() && fallback->GetSubdirectories().empty())) {
+                LOG_INFO(Service_FS, "No system content in this NAND; reading firmware from {}",
+                         Common::FS::PathToUTF8String(system_content_fallback));
+                system_registered = std::move(fallback);
+            } else {
+                LOG_WARNING(Service_FS,
+                            "No system content in this NAND or in {}; firmware-backed features "
+                            "such as Mii models will be unavailable",
+                            Common::FS::PathToUTF8String(system_content_fallback));
+            }
+        }
+        // The same rule for installed games and updates: an exported game reads the ones
+        // installed in suyu, read-only, and loads the user's own game file with them.
+        FileSys::VirtualDir user_registered;
+        const auto own_user =
+            nand_directory ? nand_directory->GetDirectoryRelative("user/Contents/registered")
+                           : nullptr;
+        const bool own_user_is_empty = own_user == nullptr || (own_user->GetFiles().empty() &&
+                                                               own_user->GetSubdirectories().empty());
+        if (own_user_is_empty && !system_content_fallback.empty()) {
+            auto fallback = vfs.OpenDirectory(
+                Common::FS::PathToUTF8String(system_content_fallback / "user" / "Contents" /
+                                             "registered"),
+                FileSys::OpenMode::Read);
+            if (fallback != nullptr) {
+                LOG_INFO(Service_FS, "Reading installed games and updates from {}",
+                         Common::FS::PathToUTF8String(system_content_fallback));
+                user_registered = std::move(fallback);
+            }
+        }
         bis_factory = std::make_unique<FileSys::BISFactory>(
-            nand_directory, std::move(load_directory), std::move(dump_directory));
+            nand_directory, std::move(load_directory), std::move(dump_directory),
+            std::move(system_registered), std::move(user_registered));
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::SysNAND,
                                        bis_factory->GetSystemNANDContents());
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::UserNAND,
                                        bis_factory->GetUserNANDContents());
+
+        // Tickets of content installed from NSPs, kept by ContentManager::InstallNSP, so
+        // that content can be decrypted again. An exported game reads them, read-only, from
+        // the installed NAND it borrows content from, never from its own package.
+        Core::Crypto::KeyManager::Instance().LoadInstalledTickets(
+            system_content_fallback.empty() ? Common::FS::GetSuyuPath(SuyuPath::NANDDir)
+                                            : system_content_fallback);
     }
 
     if (sdmc_factory == nullptr) {

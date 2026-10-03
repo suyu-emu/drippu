@@ -9,13 +9,13 @@
 #include <regex>
 #include <string>
 
-#include <openssl/err.h>
 #include <openssl/evp.h>
 
 #include "common/fs/path_util.h"
 #include "common/hex_util.h"
 #include "common/string_util.h"
 #include "core/crypto/aes_util.h"
+#include "core/crypto/hmac_sha256.h"
 #include "core/crypto/key_manager.h"
 #include "core/crypto/xts_encryption_layer.h"
 #include "core/file_sys/content_archive.h"
@@ -30,24 +30,12 @@ constexpr u64 NAX_HEADER_PADDING_SIZE = 0x4000;
 template <typename SourceData, typename SourceKey, typename Destination>
 static bool CalculateHMAC256(Destination* out, const SourceKey* key, std::size_t key_length,
                              const SourceData* data, std::size_t data_length) {
-    size_t out_len = 0;
-
-    static EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
-    if (!mac) return false;
-
-    static EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
-    if (!ctx) return false;
-
-    static OSSL_PARAM params[] = {
-        OSSL_PARAM_construct_utf8_string("digest", (char*)"SHA256", 0),
-        OSSL_PARAM_construct_end()
-    };
-
-    if (!EVP_MAC_init(ctx, reinterpret_cast<const unsigned char*>(key), key_length, params))
+    Core::Crypto::HMACSHA256Hash hash{};
+    if (!Core::Crypto::CalculateHMACSHA256(hash, key, key_length, data, data_length)) {
         return false;
-
-    return EVP_MAC_update(ctx, reinterpret_cast<const unsigned char*>(data), data_length) &&
-           EVP_MAC_final(ctx, reinterpret_cast<unsigned char*>(out), &out_len, 32);
+    }
+    std::memcpy(out, hash.data(), hash.size());
+    return true;
 }
 
 NAX::NAX(VirtualFile file_)
@@ -98,7 +86,7 @@ Loader::ResultStatus NAX::Parse(std::string_view path) {
         return Loader::ResultStatus::ErrorIncorrectNAXFileSize;
     }
 
-    keys.DeriveSDSeedLazy();
+    // sd_seed must come from the user's key files; it is not extracted from NAND saves.
     std::array<Core::Crypto::Key256, 2> sd_keys{};
     const auto sd_keys_res = Core::Crypto::DeriveSDKeys(sd_keys, keys);
     if (sd_keys_res != Loader::ResultStatus::Success) {

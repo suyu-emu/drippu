@@ -87,6 +87,8 @@ add_library(
     multi_level_page_table.cpp
     multi_level_page_table.h
     overflow.h
+    package_policy.cpp
+    package_policy.h
     page_table.cpp
     page_table.h
     param_package.cpp
@@ -176,7 +178,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(common PRIVATE linux/gamemode.cpp linux/gamemode.h)
 endif()
 
-if(ANDROID)
+if(ANDROID AND NOT SUYU_ANDROID_LIBRETRO)
     target_sources(
         common
         PUBLIC fs/fs_android.cpp

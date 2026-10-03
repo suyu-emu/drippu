@@ -6,6 +6,9 @@
 
 # Build directory
 /[Bb]uild*/
+
+# Export Game output in a source checkout: generated game code and game data, never committed
+/exports/
 doc-build/
 AppDir/
 uruntime
@@ -90,3 +93,5 @@ vcpkg_installed/
 
 # Python bytecode cache (e.g. from py_compile checks).
 __pycache__/
+# Local, machine-specific CMake presets
+CMakeUserPresets.json

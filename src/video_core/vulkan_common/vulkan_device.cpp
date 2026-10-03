@@ -714,6 +714,18 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
 
+    if (!Settings::values.use_graphics_pipeline_library.GetValue() ||
+        !extensions.pipeline_library ||
+        !features.graphics_pipeline_library.graphicsPipelineLibrary ||
+        !properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking) {
+        RemoveExtensionFeature(extensions.graphics_pipeline_library,
+                               features.graphics_pipeline_library,
+                               VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        RemoveExtension(extensions.pipeline_library, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
+    LOG_INFO(Render_Vulkan, "Graphics pipeline libraries: {}",
+             IsGraphicsPipelineLibrarySupported() ? "enabled" : "unavailable or disabled");
+
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -762,10 +774,15 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     // The wanted format is not supported by hardware, search for alternatives
     const VkFormat* alternatives = GetFormatAlternatives(wanted_format);
     if (alternatives == nullptr) {
+        // Diagnostic: report which feature bits are actually missing, so the
+        // gap can be named instead of guessed at.
+        const auto it = format_properties.find(wanted_format);
+        const VkFormatFeatureFlags have =
+            it == format_properties.end() ? 0 : GetFormatFeatures(it->second, format_type);
         LOG_ERROR(Render_Vulkan,
                   "Format={} with usage={} and type={} has no defined alternatives and host "
-                  "hardware does not support it",
-                  wanted_format, wanted_usage, format_type);
+                  "hardware does not support it (have=0x{:x} missing=0x{:x})",
+                  wanted_format, wanted_usage, format_type, have, wanted_usage & ~have);
         return wanted_format;
     }
 
@@ -1111,6 +1128,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.transform_feedback.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
         SetNext(next, properties.transform_feedback);
+    }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
     }
     if (extensions.maintenance5) {
         properties.maintenance5.sType =
