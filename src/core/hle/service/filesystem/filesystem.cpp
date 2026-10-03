@@ -22,6 +22,7 @@
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/file_sys/sdmc_factory.h"
+#include "core/file_sys/ticket_source.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -697,8 +698,10 @@ FileSys::VirtualDir FileSystemController::GetBCATDirectory(u64 title_id) const {
     return bis_factory->GetBCATDirectory(title_id);
 }
 
-void FileSystemController::SetSystemContentFallback(std::filesystem::path installed_nand) {
+void FileSystemController::SetSystemContentFallback(std::filesystem::path installed_nand,
+                                                   std::filesystem::path package_dir) {
     system_content_fallback = std::move(installed_nand);
+    export_package_dir = std::move(package_dir);
 }
 
 void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite) {
@@ -769,6 +772,9 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
                 user_registered = std::move(fallback);
             }
         }
+        const auto ticket_source = FileSys::SelectTicketSource(
+            Common::FS::GetSuyuPath(SuyuPath::NANDDir), system_content_fallback,
+            export_package_dir, user_registered != nullptr);
         bis_factory = std::make_unique<FileSys::BISFactory>(
             nand_directory, std::move(load_directory), std::move(dump_directory),
             std::move(system_registered), std::move(user_registered));
@@ -778,11 +784,9 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
                                        bis_factory->GetUserNANDContents());
 
         // Tickets of content installed from NSPs, kept by ContentManager::InstallNSP, so
-        // that content can be decrypted again. An exported game reads them, read-only, from
-        // the installed NAND it borrows content from, never from its own package.
-        Core::Crypto::KeyManager::Instance().LoadInstalledTickets(
-            system_content_fallback.empty() ? Common::FS::GetSuyuPath(SuyuPath::NANDDir)
-                                            : system_content_fallback);
+        // that content can be decrypted again. Read from the NAND supplying user content,
+        // including a configured external NAND, but never from inside an export package.
+        Core::Crypto::KeyManager::Instance().LoadInstalledTickets(ticket_source, export_package_dir);
     }
 
     if (sdmc_factory == nullptr) {

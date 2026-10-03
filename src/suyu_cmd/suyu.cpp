@@ -2381,7 +2381,8 @@ int main(int argc, char** argv) {
     Core::System system{};
     system.Initialize();
     if (!installed_nand.empty()) {
-        system.GetFileSystemController().SetSystemContentFallback(installed_nand);
+        system.GetFileSystemController().SetSystemContentFallback(installed_nand,
+                                                                 export_user_root.parent_path());
     }
     LOG_INFO(Frontend, "suyu-cmd: System initialized.");
     if (explicit_content_base) {

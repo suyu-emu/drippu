@@ -289,8 +289,10 @@ public:
 
     /// Adds the tickets kept in a NAND's ticket store (see TicketStoreDir) to the ones in
     /// memory, so content installed from NSPs in earlier sessions can be decrypted. Each
-    /// directory is read once per process. Returns how many tickets were added.
-    std::size_t LoadInstalledTickets(const std::filesystem::path& nand_dir);
+    /// directory is read once per process. For exports, package_dir excludes stores and
+    /// individual ticket paths resolving inside the package. Returns how many tickets were added.
+    std::size_t LoadInstalledTickets(const std::filesystem::path& nand_dir,
+                                     const std::filesystem::path& package_dir = {});
     /// Tickets added by LoadInstalledTickets, and how many of them gave a title key.
     std::size_t GetInstalledTicketCount() const;
     std::size_t GetInstalledTitleKeyCount() const;
