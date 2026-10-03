@@ -116,6 +116,19 @@ struct RecompHostMem {
     u64 address_space_max;
     // Reserved for layout compatibility; ABI 5 never reads this slot.
     const u64* guard_generation;
+    // Page attribute tag layout and values, read out of Common::PageType rather
+    // than restated, so the generated C side cannot drift from this one. The
+    // inline fast path only fires on an exact page_type_memory match, so a
+    // stale tag would inline stores to pages the rasterizer has cached, which
+    // is a silent GPU read of stale memory.
+    u64 page_type_mask;
+    u64 page_type_memory;
+    u64 page_type_debug;
+    u64 page_type_rasterizer_cached;
+    // Guest-memory access counters (see RecompGuestMemCounter in the emitter).
+    // Bumped with relaxed atomics from guest threads, so these are atomic here
+    // too and are read only when the metrics snapshot is taken.
+    std::atomic<u64>* counters;
 };
 
 // This struct is duplicated by hand in the emitter (arm64_to_c.h, RuntimeH's
@@ -136,7 +149,12 @@ static_assert(offsetof(RecompHostMem, page_bits) == 88);
 static_assert(offsetof(RecompHostMem, pointer_mask) == 96);
 static_assert(offsetof(RecompHostMem, address_space_max) == 104);
 static_assert(offsetof(RecompHostMem, guard_generation) == 112);
-static_assert(sizeof(RecompHostMem) == 120);
+static_assert(offsetof(RecompHostMem, page_type_mask) == 120);
+static_assert(offsetof(RecompHostMem, page_type_memory) == 128);
+static_assert(offsetof(RecompHostMem, page_type_debug) == 136);
+static_assert(offsetof(RecompHostMem, page_type_rasterizer_cached) == 144);
+static_assert(offsetof(RecompHostMem, counters) == 152);
+static_assert(sizeof(RecompHostMem) == 160);
 
 // Nothing links these two builds together, so the shared layout is pinned on
 // both sides: the generated runtime asserts the same four offsets against its
@@ -473,6 +491,27 @@ struct RecompCounters {
 };
 
 RecompCounters g_counters;
+
+/// Guest memory accesses resolved by the generated code's page-table fast path,
+/// in GuestMemCounter order.
+///
+/// One contiguous run rather than four named members, because the generated C
+/// reaches them through a bare `uint64_t*`. A struct gives no guarantee its
+/// members are adjacent, so handing one over would interleave the C side's
+/// writes with padding.
+struct GuestMemCounters {
+    std::atomic<u64> slots[suyu::recomp::kRecompGuestMemCounterCount]{
+        std::atomic<u64>{0}, std::atomic<u64>{0}, std::atomic<u64>{0}, std::atomic<u64>{0}};
+
+    static_assert(sizeof(slots) / sizeof(slots[0]) ==
+                  static_cast<std::size_t>(suyu::recomp::kRecompGuestMemCounterCount));
+    static_assert(std::atomic<u64>::is_always_lock_free,
+                  "guest-memory counters are bumped without a lock from guest threads");
+
+    std::atomic<u64>* data() { return slots; }
+};
+
+GuestMemCounters g_guest_mem;
 std::array<std::atomic<u64>, 4> g_current_pcs{};
 std::atomic<int> g_live_instances{0};
 std::mutex g_snapshot_lock;
@@ -874,6 +913,20 @@ RecompLiveStats GetRecompLiveStats() {
     };
 }
 
+RecompGuestMemStats GetRecompGuestMemStats() {
+    using namespace suyu::recomp;
+    return RecompGuestMemStats{
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::FastPathHits)].load(
+            std::memory_order_relaxed),
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::GpuTracked)].load(
+            std::memory_order_relaxed),
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::Debug)].load(
+            std::memory_order_relaxed),
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::Other)].load(
+            std::memory_order_relaxed),
+    };
+}
+
 void SetRecompPrepareCallback(RecompPrepareFn callback) {
     g_recomp_prepare.store(callback, std::memory_order_release);
 }
@@ -904,6 +957,7 @@ struct ArmRecomp::Impl {
         // fields stay null and every access takes the callback path.
         bridge.page_entries = nullptr;
         bridge.guard_generation = nullptr;
+        bridge.counters = g_guest_mem.data();
         ctx.host_mem = &bridge;
     }
 
@@ -1002,6 +1056,16 @@ struct ArmRecomp::Impl {
         bridge.page_bits = view.page_bits;
         bridge.pointer_mask = view.pointer_mask;
         bridge.address_space_max = view.address_space_max;
+        // Derived from PageInfo itself rather than written as literals, for the
+        // reason given on the struct: the C fast path gates on an exact
+        // page_type_memory match, so a tag that drifted from the enum would
+        // stop invalidating rasterizer-cached pages.
+        bridge.page_type_mask =
+            static_cast<u64>((uintptr_t{1} << Common::PageTable::ATTRIBUTE_BITS) - 1);
+        bridge.page_type_memory = static_cast<u64>(Common::PageType::Memory);
+        bridge.page_type_debug = static_cast<u64>(Common::PageType::DebugMemory);
+        bridge.page_type_rasterizer_cached =
+            static_cast<u64>(Common::PageType::RasterizerCachedMemory);
         if (kSlowPathAbove != 0 && kSlowPathAbove < bridge.address_space_max &&
             TotalStaticBlocks() >= kSlowPathAfterBlocks) {
             bridge.address_space_max = kSlowPathAbove;
