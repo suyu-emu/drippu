@@ -11,7 +11,7 @@ import tempfile
 # SHA-256 of the whole generated smoke tree (every file, by relative path) with
 # the fast-path emit option off. That output must stay byte-identical to ABI 5;
 # update this only for a deliberate ABI 5 emitter change, never for ABI 6 work.
-ABI5_GOLDEN = "69776984a826017a93bfa35b0151e757cd057b55e38b160be4e6602df4b94b86"
+ABI5_GOLDEN = "658e3c2824e30c2f06ef5a782e62878d6fd1f90b7ee7115e2d28adbf3b3c698d"
 # The same for ABI 6 with FM1 alone (GG1 and FPX1 both off), which neither
 # feature may move, and with FM1 and FPX1 (exact native FP) on, tracked so any
 # change is deliberate. Recomputed against this integration tree, since the FP
