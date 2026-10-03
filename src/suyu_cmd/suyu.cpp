@@ -24,6 +24,7 @@
 
 #include <fmt/ostream.h>
 #include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 #include <stb_image_write.h>
 #include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_error.h>
@@ -56,6 +57,8 @@
 #include "core/crypto/key_manager.h"
 #include "core/crypto/portable_seal.h"
 #include "core/file_sys/content_archive.h"
+#include "core/file_sys/baked_patch_manifest.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/registered_cache.h"
@@ -846,8 +849,10 @@ static std::filesystem::path RecordedSuyuExecutable(const std::filesystem::path&
 // The installed suyu's NAND: <root>/nand, unless its own settings moved it
 // (Data Storage in qt-config.ini). Keys have no such setting. Like suyu's own
 // reader, any non-empty value counts, whatever its "\default" flag says.
-static std::filesystem::path InstalledNandDirectory(const std::filesystem::path& installed_root,
-                                                    const std::filesystem::path& config_dir) {
+static std::filesystem::path InstalledDataDirectory(const std::filesystem::path& installed_root,
+                                                    const std::filesystem::path& config_dir,
+                                                    const std::string& setting,
+                                                    const char* default_subdir) {
     std::ifstream in(config_dir / "qt-config.ini");
     std::string line;
     bool in_section = false;
@@ -863,7 +868,7 @@ static std::filesystem::path InstalledNandDirectory(const std::filesystem::path&
         if (!in_section) {
             continue;
         }
-        if (line.starts_with("nand_directory=")) {
+        if (line.starts_with(setting + "=")) {
             value = line.substr(line.find('=') + 1);
             if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
                 value = value.substr(1, value.size() - 2);
@@ -871,7 +876,7 @@ static std::filesystem::path InstalledNandDirectory(const std::filesystem::path&
         }
     }
     if (value.empty()) {
-        return installed_root / "nand";
+        return installed_root / default_subdir;
     }
     const std::filesystem::path nand{Common::FS::ToU8String(value)};
     return nand.is_relative() ? installed_root / nand : nand;
@@ -1406,6 +1411,7 @@ int main(int argc, char** argv) {
     // The export carries no system firmware; it reads the installed one, like its keys.
     // Both stay empty when this executable is not an exported package.
     std::filesystem::path installed_nand;
+    std::filesystem::path installed_load;
     std::filesystem::path export_user_root;
     // Logged once logging is up: which recorded locations led back into the package.
     bool ignored_package_suyu = false;
@@ -1514,7 +1520,10 @@ int main(int argc, char** argv) {
             // leave keys pointing into this package; suyu creates it anyway.
             std::filesystem::create_directories(installed_root / "keys", portable_ec);
             FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_root / "keys");
-            installed_nand = InstalledNandDirectory(installed_root, installed_config);
+            installed_load = InstalledDataDirectory(installed_root, installed_config,
+                                                     "load_directory", "load");
+            installed_nand = InstalledDataDirectory(installed_root, installed_config,
+                                                     "nand_directory", "nand");
             // The installed suyu's own NAND setting may not point back in here either.
             if (!Common::PackagePolicy::AcceptInstalledRoot(exe_dir, installed_nand)) {
                 ignored_package_nand = true;
@@ -2295,7 +2304,55 @@ int main(int argc, char** argv) {
 #else
         const auto exe_dir = std::filesystem::path(argv[0]).parent_path();
 #endif
-        const auto local_mods = exe_dir / "mods";
+        auto local_mods = exe_dir / "mods";
+        if (!export_user_root.empty()) {
+            const auto manifest_text = ReadSmallTextFile(exe_dir / "aot_manifest.json");
+            const auto manifest = nlohmann::json::parse(manifest_text, nullptr, false);
+#ifdef SUYU_CMD_STATIC_RECOMP
+            if (!manifest.is_object()) {
+                ReportExportProblem("Missing AOT metadata",
+                                    "The game's aot_manifest.json is missing or damaged. Re-export this game.",
+                                    exe_dir, false, RecordedSuyuExecutable(export_user_root), "", "Open suyu");
+                return 2;
+            }
+#endif
+            if (!manifest.is_discarded() && manifest.contains("baked_patches")) {
+                std::string title;
+                std::ifstream source(export_user_root / "config" / "game-source.ini");
+                for (std::string line; std::getline(source, line);) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.starts_with("title_id=")) title = line.substr(9);
+                }
+                u64 title_id = 0;
+                if (title.size() == 16 && title.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos) {
+                    title_id = FileSys::GetBaseTitleID(std::stoull(title, nullptr, 16));
+                    title = fmt::format("{:016X}", title_id);
+                }
+                const auto digest = [](const std::string& bytes) {
+                    std::array<unsigned char, 32> hash{};
+                    unsigned length = 0;
+                    if (!EVP_Digest(bytes.data(), bytes.size(), hash.data(), &length, EVP_sha256(), nullptr) || length != hash.size()) {
+                        return std::string{};
+                    }
+                    return PortableSeal::ToHex(hash.data(), hash.size());
+                };
+                const auto baked = FileSys::VerifyBakedPatches(manifest, installed_load, exe_dir, title, digest);
+                if (!baked.error.empty()) {
+                    ReportExportProblem("Baked mods changed", baked.error, installed_load, false,
+                                        RecordedSuyuExecutable(export_user_root), "", "Open suyu");
+                    return 2;
+                }
+                local_mods = baked.load_root;
+                auto& disabled = Settings::values.disabled_addons[title_id];
+                disabled.clear();
+                for (const auto& entry : std::filesystem::directory_iterator(local_mods / title)) {
+                    const auto utf8_name = entry.path().filename().u8string();
+                    const std::string name(utf8_name.begin(), utf8_name.end());
+                    if (entry.is_directory() && !baked.mods.contains(name)) disabled.push_back(name);
+                }
+                LOG_INFO(Frontend, "Verified {} baked mod(s) from {}", baked.mods.size(), Common::FS::PathToUTF8String(local_mods));
+            }
+        }
         std::error_code ec;
         std::filesystem::create_directories(local_mods, ec);
         if (std::filesystem::is_directory(local_mods)) {
