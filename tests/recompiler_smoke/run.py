@@ -17,7 +17,7 @@ ABI5_GOLDEN = "69776984a826017a93bfa35b0151e757cd057b55e38b160be4e6602df4b94b86"
 # change is deliberate. Recomputed against this integration tree, since the FP
 # exactness fixes touch the shared emitter and so this text too; GG1's own
 # switch-off contract (DESIGN.md sec 0) guarantees it does not move these.
-FM1_GOLDEN = "21f41478cd2f1ec46113bf621dba22747eef5d792046cb5bce6b467351ae241e"
+FM1_GOLDEN = "c20b4ddc85df697438c0fa25d2d38da45babac1c615b2e97f02ac95a84654b76"
 FPX_GOLDEN = "765e6a60c6fcc05dfa1789eeb1bbf10ffeaede0f5478edea63f194239f8ca74e"
 
 # ABI 6 changes only these files; the block sources must be identical.
