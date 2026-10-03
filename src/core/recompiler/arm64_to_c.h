@@ -6741,6 +6741,9 @@ inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false, int fpx =
    implicit declaration returning int, the returned pointer is truncated to 32
    bits, and the first lookup through the index dereferences garbage - which is
    a crash roughly 20 seconds into boot with nothing in the log to explain it. */
+#if defined(_MSC_VER)
+#include <intrin.h>   /* _InterlockedIncrement64, for the guest-memory counters */
+#endif
 
 /* The memory accessors below are the hottest code in a generated module, and
    leaving them to the compiler's discretion is not worth the risk: without a
@@ -7554,7 +7557,11 @@ uint64_t recomp_cntpct(GuestContext* c){
 static void recomp_bump(GuestContext* c, int slot){
   const RecompHostMem* hm = c->host_mem;
   if(!hm || !hm->counters || slot < 0 || slot >= RECOMP_MEM_SLOT_COUNT) return;
+#if defined(_MSC_VER) && !defined(__clang__)
+  _InterlockedIncrement64((volatile long long*)&hm->counters[slot]);
+#else
   __atomic_fetch_add(&hm->counters[slot], 1, __ATOMIC_RELAXED);
+#endif
 }
 
 static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
