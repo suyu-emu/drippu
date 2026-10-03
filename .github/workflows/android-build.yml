@@ -1,0 +1,66 @@
+name: Build Drippu Android
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: Build Android Release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize submodules
+        run: |
+          git \
+            -c submodule."externals/ownfoil".update=none \
+            -c submodule."externals/nxdumptool".update=none \
+            -c submodule."externals/nxapi".update=none \
+            -c submodule."externals/nx-optimizer".update=none \
+            submodule update --init --recursive --depth=1
+
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: microsoft
+          java-version: '17'
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+
+      - name: Build Drippu Mainline Release
+        working-directory: src/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleMainlineRelease --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p _pkg
+          find src/android -name 'app-mainline-release.apk' -exec cp {} _pkg/ \;
+
+          echo "Generated files:"
+          ls -lah _pkg
+
+      - name: Upload Drippu APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: Drippu-Mainline-Release
+          path: _pkg/app-mainline-release.apk
+          if-no-files-found: error
+          retention-days: 7
