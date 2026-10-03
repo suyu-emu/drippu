@@ -7150,10 +7150,16 @@ inline std::string FastmemHelpersC(std::string abi5, bool guard_gen = false) {
    they decline too and still reach the host callback, in the same order and
    with the same arguments. */
 static RECOMP_INLINE uintptr_t recomp_fm_entry(const GuestContext* c, uint64_t va, unsigned bytes){
+  uintptr_t e;
   if(va >= c->fm_limit) return 0;
   if((va & 0xfffu) > 0x1000u - bytes) return 0;
-  return *(const uintptr_t*)(c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS)
+  e = *(const uintptr_t*)(c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS)
                                             << RECOMP_FM_STRIDE_LOG2)) & RECOMP_FM_PTR_MASK;
+  /* FM1 serves only plain memory pages. Count the hit here; misses fall
+     through to the slow path, which classifies and counts itself. The bump
+     is a no-op when the host provides no counters. */
+  if(e) recomp_bump(c, RECOMP_MEM_FAST_PATH_HITS);
+  return e;
 }
 #define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))
 
@@ -7573,23 +7579,26 @@ static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
   if(va >= hm->address_space_max) return 0;
   raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
                             + (va >> hm->page_bits) * hm->page_entry_stride);
+  /* Tag check first: classify the page before looking at the pointer.
+     Non-Memory pages (Debug, RasterizerCached) commonly have null pointers
+     since they are not directly mapped; they must count as their proper
+     category, not as Other. */
+  tag = raw & (uintptr_t)hm->page_type_mask;
+  if(tag != hm->page_type_memory) {
+    reason = (tag == hm->page_type_rasterizer_cached) ? RECOMP_MEM_GPU_TRACKED
+           : (tag == hm->page_type_debug)            ? RECOMP_MEM_DEBUG
+                                                    : RECOMP_MEM_OTHER;
+    recomp_bump(c, reason);
+    return 0;
+  }
   p = raw & (uintptr_t)hm->pointer_mask;
   if(!p) {
+    /* Memory page with no backing pointer: genuinely unmapped. */
     recomp_bump(c, RECOMP_MEM_OTHER);
     return 0;
   }
-  /* Tag check: only plain Memory pages are served inline. Anything else
-     falls back to the emulator so rasterizer invalidation still happens. */
-  tag = raw & (uintptr_t)hm->page_type_mask;
-  if(tag == hm->page_type_memory) {
-    recomp_bump(c, RECOMP_MEM_FAST_PATH_HITS);
-    return (unsigned char*)(p + (uintptr_t)va);
-  }
-  reason = (tag == hm->page_type_rasterizer_cached) ? RECOMP_MEM_GPU_TRACKED
-         : (tag == hm->page_type_debug)            ? RECOMP_MEM_DEBUG
-                                                  : RECOMP_MEM_OTHER;
-  recomp_bump(c, reason);
-  return 0;
+  recomp_bump(c, RECOMP_MEM_FAST_PATH_HITS);
+  return (unsigned char*)(p + (uintptr_t)va);
 }
 
 /* A multi-byte access whose bytes straddle a page boundary cannot be served
@@ -7612,9 +7621,17 @@ static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t b
   /* The fast-path limit can be below a page boundary (diagnostic slow paths).
      Validate the entire span before reading any entry or backing bytes. */
   if(va >= hm->address_space_max || bytes > hm->address_space_max - va ||
-     bytes > UINT64_C(0x1000000000000) - va) return 0;
+     bytes > UINT64_C(0x1000000000000) - va) {
+    recomp_bump(c, RECOMP_MEM_OTHER);
+    return 0;
+  }
   psz = UINT64_C(1) << hm->page_bits;
-  if(bytes > psz - (va & (psz - 1))) return 0;
+  if(bytes > psz - (va & (psz - 1))) {
+    /* Page-boundary crossing: cannot be served from a single entry.
+       Count it here; recomp_host_ptr would see only the first byte's page. */
+    recomp_bump(c, RECOMP_MEM_OTHER);
+    return 0;
+  }
   return recomp_host_ptr(c, va);
 }
 
