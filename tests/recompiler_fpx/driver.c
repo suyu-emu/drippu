@@ -5,6 +5,7 @@
      fpx     the FPX1 text, ops_fpx.c                        (FPX_HAVE_FPX)
      nokeep  FPX1 without its keep test (negative control)   (FPX_HAVE_FPX)
      nomid   FPX1 without its midpoint test (negative control) (FPX_HAVE_FPX)
+     nofz    FPX1 that ignores FPCR.FZ (negative control)    (FPX_HAVE_FPX)
      hw      the AArch64 host executing the word itself      (FPX_HAVE_HW)
 
    Every case compares the whole of q0, x0, NZCV and the final guest FPSR.
@@ -12,7 +13,7 @@
    usage: driver diff  [options]      compare every candidate with the reference
           driver hash  IMPL [options] print one FNV-1a hash per leg, word and FPCR
           driver check FILE [options] recompute hashes for soft (and fpx) and compare
-          driver control NAME [options]  nokeep | nomid | mxcsr: must find mismatches
+          driver control NAME [options]  nokeep | nomid | nofz | mxcsr: must find mismatches
           driver env   [options]      poisoned host FP mode repaired by the host shim
           driver inhibit [options]    the host kill switch (fpcr bit 32) turns FPX1 off
           driver shadow [options]     the shadow instrumentation build against soft
@@ -36,6 +37,7 @@ extern const FpxOpFn g_ops_soft[];
 extern const FpxOpFn g_ops_fpx[];
 extern const FpxOpFn g_ops_nokeep[];
 extern const FpxOpFn g_ops_nomid[];
+extern const FpxOpFn g_ops_nofz[];
 extern const FpxOpFn g_ops_shadow[];
 /* RECOMP_FPX_PROBE in ops_fpx.c: [1] fast path kept, [2] fell through. */
 unsigned long long g_fpx_probe[3];
@@ -49,14 +51,14 @@ typedef uint64_t (*FpxHwFn)(const uint64_t*, uint64_t*, uint64_t);
 extern const FpxHwFn g_hw[];
 #endif
 
-enum { I_SOFT, I_FPX, I_NOKEEP, I_NOMID, I_SHADOW, I_HW, I_COUNT };
-static const char* const kImplNames[I_COUNT] = {"soft", "fpx", "nokeep", "nomid", "shadow", "hw"};
+enum { I_SOFT, I_FPX, I_NOKEEP, I_NOMID, I_NOFZ, I_SHADOW, I_HW, I_COUNT };
+static const char* const kImplNames[I_COUNT] = {"soft", "fpx", "nokeep", "nomid", "nofz", "shadow", "hw"};
 
 static int ImplAvailable(int impl) {
     switch (impl) {
     case I_SOFT: return 1;
 #ifdef FPX_HAVE_FPX
-    case I_FPX: case I_NOKEEP: case I_NOMID: case I_SHADOW: return 1;
+    case I_FPX: case I_NOKEEP: case I_NOMID: case I_NOFZ: case I_SHADOW: return 1;
 #endif
 #ifdef FPX_HAVE_HW
     case I_HW: return 1;
@@ -89,6 +91,7 @@ static void Run(int impl, unsigned op, const In* in, uint64_t fpcr, uint64_t fs0
     if (impl == I_FPX) fn = g_ops_fpx[op];
     if (impl == I_NOKEEP) fn = g_ops_nokeep[op];
     if (impl == I_NOMID) fn = g_ops_nomid[op];
+    if (impl == I_NOFZ) fn = g_ops_nofz[op];
     if (impl == I_SHADOW) fn = g_ops_shadow[op];
 #endif
     memcpy(c->vreg[0], &in->w[0], 64);
@@ -865,6 +868,7 @@ int main(int argc, char** argv) {
         unsigned long long bad;
         if (!strcmp(name, "nokeep")) { const int c[] = {I_NOKEEP}; bad = Diff(&o, I_SOFT, c, 1, 0, 0, 0); }
         else if (!strcmp(name, "nomid")) { const int c[] = {I_NOMID}; bad = Diff(&o, I_SOFT, c, 1, 0, 0, 0); }
+        else if (!strcmp(name, "nofz")) { const int c[] = {I_NOFZ}; bad = Diff(&o, I_SOFT, c, 1, 0, 0, 0); }
         else if (!strcmp(name, "mxcsr")) { const int c[] = {I_FPX}; bad = Diff(&o, I_SOFT, c, 1, 1, 0, 0); }
         else { fprintf(stderr, "unknown control\n"); return 2; }
         /* The verdict needs every shard's count; run.py adds them up. */

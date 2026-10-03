@@ -18,7 +18,7 @@ ABI5_GOLDEN = "63c1ed5bafc2c68e2b6a53282c304cf1edc2c43d899a73371b49f41de4d1597a"
 # exactness fixes touch the shared emitter and so this text too; GG1's own
 # switch-off contract (DESIGN.md sec 0) guarantees it does not move these.
 FM1_GOLDEN = "371f92332302eb6e3b2d62dc94c6720b1812aeb9af515255c44cff892bca3fc7"
-FPX_GOLDEN = "8e1a4370fb5bcad2c1a7f1ad9b820e98cd269fe1de9d4c3a5eda89ea1183c611"
+FPX_GOLDEN = "e59b462663b60fd4dd9ece6474e02d28f13084314595091569827d3be0c414d8"
 
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}

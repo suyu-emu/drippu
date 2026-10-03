@@ -1,7 +1,7 @@
 // Writes the C the differential driver links: every word of words.h translated
 // by the current emitter into ops_soft.c (the default, ABI 5 text) and
 // ops_fpx.c (FPX1), each with its runtime header; the two negative controls
-// ops_nokeep.c and ops_nomid.c; and hw.c, which runs the same words on an
+// ops_nokeep.c, ops_nomid.c and ops_nofz.c; and hw.c, which runs the same words on an
 // AArch64 host.
 #include <cstdio>
 #include <filesystem>
@@ -99,17 +99,19 @@ int main(int argc, char** argv) {
         !Write(dir / "hw.c", Hw())) {
         return 1;
     }
-    // FPX1, and the two negative controls: the same text with the keep test
-    // reduced to "always" (the D-style build), and without the midpoint test.
+    // FPX1, and the negative controls: the same text with the keep test
+    // reduced to "always" (the D-style build), without the midpoint test, and
+    // with the gate open under FPCR.FZ but the helpers told FZ is clear.
     suyu::recomp::g_emit_fpx = true;
     const std::string fpx = suyu::recomp::RuntimeH();
-    std::string nokeep = fpx, nomid = fpx;
+    std::string nokeep = fpx, nomid = fpx, nofz = fpx;
     const bool edited =
         Replace(nokeep, "#define RECOMP_FPX_BIG32(t) ", "#define RECOMP_FPX_BIG32(t) (1) || ") &&
         Replace(nokeep, "#define RECOMP_FPX_FIN32(t) ", "#define RECOMP_FPX_FIN32(t) (1) || ") &&
         Replace(nokeep, "#define RECOMP_FPX_BIG64(t) ", "#define RECOMP_FPX_BIG64(t) (1) || ") &&
         Replace(nokeep, "#define RECOMP_FPX_FIN64(t) ", "#define RECOMP_FPX_FIN64(t) (1) || ") &&
-        Replace(nomid, "#define RECOMP_FPX_MIDPOINT(s) ", "#define RECOMP_FPX_MIDPOINT(s) (0) && ");
+        Replace(nomid, "#define RECOMP_FPX_MIDPOINT(s) ", "#define RECOMP_FPX_MIDPOINT(s) (0) && ") &&
+        Replace(nofz, "#define RECOMP_FPX_FZ(c) ", "#define RECOMP_FPX_FZ(c) 0u && ");
     // Only the fpx ops count their fast-path hits.
     const std::string probe = "extern unsigned long long g_fpx_probe[3];\n"
                               "#define RECOMP_FPX_PROBE(k) (++g_fpx_probe[k])\n";
@@ -119,7 +121,8 @@ int main(int argc, char** argv) {
         !Write(dir / "fpx_exact.c", "#include \"rt_fpx.h\"\n" + suyu::recomp::FpxExactC()) ||
         !Write(dir / "rt_nokeep.h", nokeep) ||
         !Write(dir / "rt_nomid.h", nomid) || !Ops(dir, "fpx", "rt_fpx.h") ||
-        !Ops(dir, "nokeep", "rt_nokeep.h") || !Ops(dir, "nomid", "rt_nomid.h")) {
+        !Ops(dir, "nokeep", "rt_nokeep.h") || !Ops(dir, "nomid", "rt_nomid.h") ||
+        !Write(dir / "rt_nofz.h", nofz) || !Ops(dir, "nofz", "rt_nofz.h")) {
         return 1;
     }
     // The shadow instrumentation build: exact results always, with the fast
