@@ -23,6 +23,7 @@
 #include "core/arm/recomp/guest_fp_env.h"
 #include "core/arm/recomp/recomp_gap_session.h"
 #include "core/arm/recomp/recomp_diagnostic_sampler.h"
+#include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_thread.h"
