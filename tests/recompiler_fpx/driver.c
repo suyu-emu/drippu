@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "words.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -319,7 +320,7 @@ static void NearPow2Product(uint32_t* A, uint32_t* B) {
 
 /* One lane triple (a, b, z) for a single-precision op. */
 static void Adv32(uint32_t* a, uint32_t* b, uint32_t* z) {
-    const unsigned scenario = (unsigned)(Rnd() % 9);
+    const unsigned scenario = (unsigned)(Rnd() % 11);
     const unsigned sa = Rnd() & 1, sb = Rnd() & 1, sz = Rnd() & 1;
     const int E = (int)(Rnd() % 200) - 100;
     uint32_t A, B;
@@ -384,15 +385,48 @@ static void Adv32(uint32_t* a, uint32_t* b, uint32_t* z) {
         *b = (Rnd() & 1) ? (uint32_t)(sb << 31) : (uint32_t)(sb << 31) | 0x7f800000u;
         *z = Gen32((int)(Rnd() % GEN_KINDS));
         return;
-    default: /* tiny exact sums and differences */
+    case 8: /* tiny exact sums and differences */
         *a = (uint32_t)(sa << 31) | ((uint32_t)Rnd() % 0x01000000u);
         *b = (uint32_t)(sb << 31) | ((uint32_t)Rnd() % 0x01000000u);
         *z = (uint32_t)(sz << 31) | ((uint32_t)Rnd() % 0x01000000u);
         return;
+    case 9: { /* normal operands whose sum or difference lands at, just above or
+                 just below the smallest normal, or in the subnormal range (FZ) */
+        float fx, fd, fy;
+        const uint32_t x = Pack32(0, -126 + (int)(Rnd() % 6), (uint32_t)Rnd());
+        const uint32_t d = (Rnd() & 1) ? 0x00800000u + (uint32_t)(Rnd() % 9) - 4
+                                       : (uint32_t)Rnd() & 0x00ffffffu;
+        uint32_t y;
+        memcpy(&fx, &x, 4); memcpy(&fd, &d, 4);
+        fy = (float)((double)fx - (double)fd); /* x - y is d, or within an ulp of y of it */
+        memcpy(&y, &fy, 4);
+        y &= 0x7fffffffu;
+        *a = (uint32_t)(sa << 31) | x;
+        *b = (uint32_t)(sb << 31) | (y >= 0x00800000u ? y : x);
+        if (Rnd() & 1) { uint32_t t = *a; *a = *b; *b = t; }
+        *z = (uint32_t)(sz << 31) | (Rnd() & 1 ? x : 0x00800000u);
+        return;
+    }
+    default: { /* a*b+z cancelling into the subnormal range or onto the smallest
+                  normal from either side, with normal operands (FZ) */
+        float fa, fb, fz;
+        const int ea = -1 - (int)(Rnd() % 50), ep = -126 + (int)(Rnd() % 6) - 1;
+        *a = Pack32(sa, ea, (uint32_t)Rnd());
+        *b = Pack32(sb, ep - ea, (uint32_t)Rnd());
+        memcpy(&fa, a, 4); memcpy(&fb, b, 4);
+        const double p = (double)fa * (double)fb; /* exact */
+        const unsigned k = (unsigned)(Rnd() % 3);
+        const double d = k == 0 ? 0.0 : ldexp(1.0 + ((double)(Rnd() % 9) - 4) * ldexp(1.0, -23), -126);
+        fz = (float)(-p + (k == 2 ? -d : d));
+        memcpy(z, &fz, 4);
+        if (Rnd() & 1) *z += (uint32_t)(Rnd() % 5) - 2;
+        if ((*z & 0x7f800000u) == 0 && (*z & 0x7fffffu)) *z = (*z & 0x80000000u) | 0x00800000u;
+        return;
+    }
     }
 }
 static void Adv64(uint64_t* a, uint64_t* b, uint64_t* z) {
-    const unsigned scenario = (unsigned)(Rnd() % 6);
+    const unsigned scenario = (unsigned)(Rnd() % 8);
     const unsigned sa = Rnd() & 1, sb = Rnd() & 1, sz = Rnd() & 1;
     const uint64_t m = Rnd() & 0xfffffffffffffULL;
     const int ea = (int)(Rnd() % 400) - 200;
@@ -422,11 +456,44 @@ static void Adv64(uint64_t* a, uint64_t* b, uint64_t* z) {
         *a = Pack64(sa, (int)(Rnd() % 20) - 10, 0);
         *b = Pack64(sb, ea - 53 - (int)((*a >> 52) & 2047) + 1023, 0);
         return;
-    default: /* tiny exact sums */
+    case 5: /* tiny exact sums */
         *a = (uint64_t)sa << 63 | (Rnd() % 0x0020000000000000ULL);
         *b = (uint64_t)sb << 63 | (Rnd() % 0x0020000000000000ULL);
         *z = (uint64_t)sz << 63 | (Rnd() % 0x0020000000000000ULL);
         return;
+    case 6: { /* normal operands whose sum or difference lands around the smallest
+                 normal or in the subnormal range (FZ) */
+        double fx, fd, fy;
+        const uint64_t x = Pack64(0, -1022 + (int)(Rnd() % 6), Rnd());
+        const uint64_t d = (Rnd() & 1) ? 0x0010000000000000ULL + Rnd() % 9 - 4
+                                       : Rnd() & 0x001fffffffffffffULL;
+        uint64_t y;
+        memcpy(&fx, &x, 8); memcpy(&fd, &d, 8);
+        fy = fx - fd; /* x - y is d, or within an ulp of y of it */
+        memcpy(&y, &fy, 8);
+        y &= 0x7fffffffffffffffULL;
+        *a = (uint64_t)sa << 63 | x;
+        *b = (uint64_t)sb << 63 | (y >= 0x0010000000000000ULL ? y : x);
+        if (Rnd() & 1) { const uint64_t t = *a; *a = *b; *b = t; }
+        *z = (uint64_t)sz << 63 | (Rnd() & 1 ? x : 0x0010000000000000ULL);
+        return;
+    }
+    default: { /* a*b+z cancelling into the subnormal range or onto the smallest
+                  normal from either side, with normal operands (FZ) */
+        double fa, fb, fz;
+        const int eb = -1 - (int)(Rnd() % 200), ep = -1022 + (int)(Rnd() % 6) - 1;
+        *a = Pack64(sa, ep - eb, Rnd());
+        *b = Pack64(sb, eb, Rnd());
+        memcpy(&fa, a, 8); memcpy(&fb, b, 8);
+        const unsigned k = (unsigned)(Rnd() % 3);
+        const double d = k == 0 ? 0.0 : ldexp(1.0 + ((double)(Rnd() % 9) - 4) * ldexp(1.0, -52), -1022);
+        fz = -(fa * fb) + (k == 2 ? -d : d);
+        memcpy(z, &fz, 8);
+        if (Rnd() & 1) *z += Rnd() % 5 - 2;
+        if ((*z & 0x7ff0000000000000ULL) == 0 && (*z & 0xfffffffffffffULL))
+            *z = (*z & 0x8000000000000000ULL) | 0x0010000000000000ULL;
+        return;
+    }
     }
 }
 
@@ -476,7 +543,10 @@ static uint64_t L4Fs0(uint32_t x) { return ((x * 0x9E3779B1u) >> 30) ? 0x10 : 0;
 
 /* ---- options and legs ---------------------------------------------------- */
 
-static const uint64_t FPCRS[] = {0, 1u << 24, 1u << 25, 1u << 22, 2u << 22, 3u << 22, (1u << 24) | (1u << 25)};
+/* FZ (bit 24) alone, with DN and with each directed rounding mode. */
+#define FPX_FZ (1u << 24)
+static const uint64_t FPCRS[] = {0, FPX_FZ, 1u << 25, 1u << 22, 2u << 22, 3u << 22, FPX_FZ | (1u << 25),
+                                 FPX_FZ | (1u << 22), FPX_FZ | (2u << 22), FPX_FZ | (3u << 22)};
 #define NFPCR (sizeof FPCRS / sizeof FPCRS[0])
 
 typedef struct {
@@ -537,7 +607,7 @@ static void ForEachCase(const Opts* o, unsigned op, unsigned f, CaseFn fn, void*
                         fn(op, fpcr, 2, &in, variant ? 0x10 : 0, user);
                     }
     }
-    if (o->legs[3] && AdvApplies(op) && (f == 0 || f == 1 || f == 6)) {
+    if (o->legs[3] && AdvApplies(op) && (f == 0 || (FPCRS[f] & FPX_FZ))) {
         Seed(o->seed, word, fpcr, 3);
         for (unsigned long t = 0; t < o->adv; ++t) {
             AdvInput(op, &in);
@@ -558,6 +628,7 @@ typedef struct {
     int ref, cand[I_COUNT], ncand;
     unsigned long long cases[5], bad_v[I_COUNT][5], bad_s[I_COUNT][5];
     unsigned long long hit, miss;   /* fpx probe at FPCR 0 with IXC set, L1 */
+    unsigned long long hit_fz, miss_fz; /* the same at FPCR FZ, L1 and L3 */
     unsigned shown;
     int poison;                     /* 1: poison the host FP mode around every fpx call */
 } DiffState;
@@ -581,6 +652,10 @@ static void DiffCase(unsigned op, uint64_t fpcr, unsigned leg, const In* in, uin
         if (impl == I_FPX && leg == 1 && fpcr == 0 && (fs0 & 0x10)) {
             s->hit += g_fpx_probe[1] - h0;
             s->miss += g_fpx_probe[2] - m0;
+        }
+        if (impl == I_FPX && (leg == 1 || leg == 3) && fpcr == FPX_FZ && (fs0 & 0x10)) {
+            s->hit_fz += g_fpx_probe[1] - h0;
+            s->miss_fz += g_fpx_probe[2] - m0;
         }
 #endif
         const int bv = !SameValue(&ref, &got), bs = ref.fpsr != got.fpsr;
@@ -609,7 +684,7 @@ static void DiffCase(unsigned op, uint64_t fpcr, unsigned leg, const In* in, uin
 /* Returns the total value+FPSR mismatch count over all candidates. */
 static unsigned long long Diff(const Opts* o, int ref, const int* cands, int ncand, int poison,
                                unsigned long long* hits_out, unsigned long long* miss_out) {
-    unsigned long long total_cases = 0, total_bad = 0, hits = 0, misses = 0;
+    unsigned long long total_cases = 0, total_bad = 0, hits = 0, misses = 0, hits_fz = 0, misses_fz = 0;
     unsigned long long leg_cases[5] = {0}, leg_bad_v[I_COUNT][5], leg_bad_s[I_COUNT][5];
     memset(leg_bad_v, 0, sizeof leg_bad_v);
     memset(leg_bad_s, 0, sizeof leg_bad_s);
@@ -639,7 +714,11 @@ static unsigned long long Diff(const Opts* o, int ref, const int* cands, int nca
             printf("%08x %-26s fpx hit %.2f%% (%llu of %llu lane ops, L1 FPCR 0, IXC set)\n",
                    g_fpx_words[op].word, g_fpx_words[op].text, 100.0 * (double)s.hit / (double)(s.hit + s.miss),
                    s.hit, s.hit + s.miss);
-        hits += s.hit; misses += s.miss;
+        if (s.hit_fz + s.miss_fz)
+            printf("%08x %-26s fpx hit FZ %.2f%% (%llu of %llu lane ops, L1+L3 FPCR FZ, IXC set)\n",
+                   g_fpx_words[op].word, g_fpx_words[op].text,
+                   100.0 * (double)s.hit_fz / (double)(s.hit_fz + s.miss_fz), s.hit_fz, s.hit_fz + s.miss_fz);
+        hits += s.hit; misses += s.miss; hits_fz += s.hit_fz; misses_fz += s.miss_fz;
         fflush(stdout);
     }
     for (int k = 0; k < ncand; ++k)
@@ -649,6 +728,8 @@ static unsigned long long Diff(const Opts* o, int ref, const int* cands, int nca
                        kImplNames[cands[k]], kImplNames[ref], leg_cases[leg], leg_bad_v[cands[k]][leg],
                        leg_bad_s[cands[k]][leg]);
     printf("TOTAL cases %llu mismatches %llu\n", total_cases, total_bad);
+    if (hits + misses + hits_fz + misses_fz)
+        printf("HITS fpcr0 %llu %llu fz %llu %llu\n", hits, hits + misses, hits_fz, hits_fz + misses_fz);
     if (hits_out) *hits_out = hits;
     if (miss_out) *miss_out = misses;
     return total_bad;

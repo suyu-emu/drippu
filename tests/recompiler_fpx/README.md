@@ -16,10 +16,10 @@ default ABI 5 text, and `ops_fpx.c`, the same words with the FPX1 fast paths
 (ABI 6 feature bit 2, `recomp_runtime.h`). On an AArch64 host it also writes
 `hw.c`, which executes the same words natively. `fpx_driver` then runs
 identical inputs through each implementation and compares the whole of q0, x0,
-NZCV and the final guest FPSR, for seven FPCR settings (0, FZ, DN, RP, RM, RZ,
-FZ|DN) and start FPSRs with and without IXC. It also reports the FPX1 fast-path
-hit rate per word (lane operations that kept the native result, at FPCR 0 with
-IXC set, L1).
+NZCV and the final guest FPSR, for ten FPCR settings (0, FZ, DN, RP, RM, RZ,
+FZ|DN, FZ|RP, FZ|RM, FZ|RZ) and start FPSRs with and without IXC. It also
+reports the FPX1 fast-path hit rate per word (lane operations that kept the
+native result, with IXC set: at FPCR 0 over L1, and at FPCR FZ over L1 and L3).
 
 Legs:
 
@@ -29,7 +29,10 @@ Legs:
    special values per width, and 64 special integers.
 3. L3, adversarial: products that put a*b+z within 2^-60 of a binary32
    midpoint, exact ties, results around the smallest normal and FLT_MAX+ulp/2,
-   subnormal inputs with normal results, inf*0 and tiny exact sums.
+   subnormal inputs with normal results, inf*0, tiny exact sums, sums and
+   differences of normal operands at, just above and just below the smallest
+   normal, and a*b+z cancelling into the subnormal range or onto the smallest
+   normal (the FZ boundary). Run at FPCR 0 and at every FZ setting.
 4. L4, exhaustive unary: every 2^32 input (`--l4-step 1`) of FSQRT S, FCVT S->D,
    FCVTZS/FCVTZU S->W and SCVTF/UCVTF W->S at FPCR 0 and FZ.
 

@@ -47,7 +47,7 @@ def sharded(driver, args, jobs, log_dir, tag):
 
 def summarize(text, hits):
     """Adds up the per-shard LEG and TOTAL lines of `driver diff` output."""
-    legs, total, bad, lines = {}, 0, 0, []
+    legs, total, bad, lines, hit = {}, 0, 0, [], [0, 0, 0, 0]
     for line in text.splitlines():
         words = line.split()
         if line.startswith("LEG "):
@@ -58,6 +58,9 @@ def summarize(text, hits):
         elif line.startswith("TOTAL "):
             total += int(words[2])
             bad += int(words[4])
+        elif line.startswith("HITS "):
+            for i, at in enumerate((2, 3, 5, 6)):
+                hit[i] += int(words[at])
         elif line.startswith("FPX hit rate") or line.startswith("  ") or line.startswith("     "):
             continue
         elif "fpx hit" in line:
@@ -68,6 +71,9 @@ def summarize(text, hits):
     for key, (cases, value, fpsr) in sorted(legs.items()):
         lines.append(f"LEG {key}: cases {cases} value-mismatch {value} fpsr-mismatch {fpsr}")
     lines.append(f"TOTAL cases {total} mismatches {bad}")
+    for name, kept, ops in (("FPCR 0 (L1)", hit[0], hit[1]), ("FPCR FZ (L1+L3)", hit[2], hit[3])):
+        if ops:
+            lines.append(f"FPX hit rate {name}, IXC set: {100.0 * kept / ops:.2f}% ({kept} of {ops} lane ops)")
     return "".join(line + "\n" for line in lines)
 
 
