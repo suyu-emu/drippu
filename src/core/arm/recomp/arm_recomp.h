@@ -145,6 +145,17 @@ struct RecompLiveStats {
 };
 RecompLiveStats GetRecompLiveStats();
 
+/// Guest-memory access counters, in GuestMemCounter order (see
+/// core/arm/recomp/recomp_image_abi.h). Snapshot of the counters the
+/// generated code bumps through RecompHostMem::counters.
+struct RecompGuestMemStats {
+    u64 fast_path_hits{};
+    u64 gpu_tracked{};
+    u64 debug{};
+    u64 other{};
+};
+RecompGuestMemStats GetRecompGuestMemStats();
+
 // Process-wide monotonically accumulated diagnostic counters. Fields are sampled
 // independently; callers may subtract a stopped-session baseline.
 struct RecompExecutionStats {

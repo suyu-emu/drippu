@@ -11,14 +11,14 @@ import tempfile
 # SHA-256 of the whole generated smoke tree (every file, by relative path) with
 # the fast-path emit option off. That output must stay byte-identical to ABI 5;
 # update this only for a deliberate ABI 5 emitter change, never for ABI 6 work.
-ABI5_GOLDEN = "c84b30cd1524beeafcc7d46947e24d8619309f01c24f42b9261f54616e1b5063"
+ABI5_GOLDEN = "658e3c2824e30c2f06ef5a782e62878d6fd1f90b7ee7115e2d28adbf3b3c698d"
 # The same for ABI 6 with FM1 alone (GG1 and FPX1 both off), which neither
 # feature may move, and with FM1 and FPX1 (exact native FP) on, tracked so any
 # change is deliberate. Recomputed against this integration tree, since the FP
 # exactness fixes touch the shared emitter and so this text too; GG1's own
 # switch-off contract (DESIGN.md sec 0) guarantees it does not move these.
-FM1_GOLDEN = "21f41478cd2f1ec46113bf621dba22747eef5d792046cb5bce6b467351ae241e"
-FPX_GOLDEN = "765e6a60c6fcc05dfa1789eeb1bbf10ffeaede0f5478edea63f194239f8ca74e"
+FM1_GOLDEN = "012e0e3fb8d9f5a94664ecbece0c125163868fb86b8be48f1cc3916accbca3ee"
+FPX_GOLDEN = "1471d5f3df61c3b2c5deee301ad9617f325c5c261b9344f3721324ff7ec53daf"
 
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}

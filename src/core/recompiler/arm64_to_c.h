@@ -6741,6 +6741,9 @@ inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false, int fpx =
    implicit declaration returning int, the returned pointer is truncated to 32
    bits, and the first lookup through the index dereferences garbage - which is
    a crash roughly 20 seconds into boot with nothing in the log to explain it. */
+#if defined(_MSC_VER)
+#include <intrin.h>   /* _InterlockedIncrement64, for the guest-memory counters */
+#endif
 
 /* The memory accessors below are the hottest code in a generated module, and
    leaving them to the compiler's discretion is not worth the risk: without a
@@ -6806,7 +6809,57 @@ typedef struct RecompHostMem {
     /* Reserved layout slot. ABI 5 verifies code on every entry and
        never dereferences this pointer. Hosts must set it to null. */
     const uint64_t* guard_generation;
+    /* Page attribute tag layout, and the tag values themselves, handed over
+       rather than written as literals here. The reason is drift, not brevity:
+       this file is plain C that shares no headers with the emulator, so a
+       literal 3 here would keep compiling after Common::PageType was
+       reordered and would then quietly mis-classify GPU-tracked pages as
+       plain memory. The inline path below only fires when the tag is exactly
+       page_type_memory, so a wrong tag costs correctness, not just a metric.
+
+       The tag check is not redundant with the pointer check. Non-Memory pages
+       store a null pointer *today*, which is the only reason the pointer test
+       alone happens to exclude them; relying on that couples this fast path to
+       a convention maintained somewhere else entirely. */
+    uint64_t page_type_mask;
+    uint64_t page_type_memory;
+    uint64_t page_type_debug;
+    uint64_t page_type_rasterizer_cached;
+    /* Host-owned counters, indexed by RecompGuestMemCounter. Null disables
+       accounting. This is the measurement the ROADMAP's GPU track needs before
+       anything is promoted: it is what shows how much of a recompiled title's
+       memory traffic is GPU-coupled, and therefore whether lifting GPU work
+       into the recompiler is worth attempting at all.
+
+       Counters are incremented from guest threads, so the bumps are relaxed
+       atomics. Deliberately not a function pointer: this sits on the memory
+       fast path, which exists to remove an indirect call. */
+    uint64_t* counters;
 } RecompHostMem;
+
+/* Slot order for RecompHostMem::counters. The two sides pin the same order with
+   static assertions; add to the end only. */
+enum RecompGuestMemCounter {
+    RECOMP_MEM_FAST_PATH_HITS = 0,   /* resolved inline to a plain Memory page */
+    RECOMP_MEM_GPU_TRACKED,          /* fell out: rasterizer-cached page       */
+    RECOMP_MEM_DEBUG,                 /* fell out: debugger-attached page       */
+    RECOMP_MEM_OTHER,                 /* fell out: unmapped, or not resolvable */
+    RECOMP_MEM_SLOT_COUNT
+};
+
+/* Pinned against the same literal the emulator side pins
+   (kRecompGuestMemCounterCount). Growing this enum without growing the
+   emulator's array, or the reverse, then fails to compile on the side that was
+   changed. */
+typedef char recomp_memcounter_count[RECOMP_MEM_SLOT_COUNT == 4 ? 1 : -1];
+
+/* Pinned offsets for the new RecompHostMem fields. Both sides are compiled
+   64-bit only, so these are the only layouts worth pinning. */
+typedef char recomp_bridgemem_ptemask[offsetof(RecompHostMem, page_type_mask) == 120 ? 1 : -1];
+typedef char recomp_bridgemem_ptemem[offsetof(RecompHostMem, page_type_memory) == 128 ? 1 : -1];
+typedef char recomp_bridgemem_ptedbg[offsetof(RecompHostMem, page_type_debug) == 136 ? 1 : -1];
+typedef char recomp_bridgemem_pterast[offsetof(RecompHostMem, page_type_rasterizer_cached) == 144 ? 1 : -1];
+typedef char recomp_bridgemem_counters[offsetof(RecompHostMem, counters) == 152 ? 1 : -1];
 
 typedef struct GuestContext {
     uint64_t x[32]; uint64_t pc; uint8_t n,z,c,v;
@@ -7097,10 +7150,16 @@ inline std::string FastmemHelpersC(std::string abi5, bool guard_gen = false) {
    they decline too and still reach the host callback, in the same order and
    with the same arguments. */
 static RECOMP_INLINE uintptr_t recomp_fm_entry(const GuestContext* c, uint64_t va, unsigned bytes){
+  uintptr_t e;
   if(va >= c->fm_limit) return 0;
   if((va & 0xfffu) > 0x1000u - bytes) return 0;
-  return *(const uintptr_t*)(c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS)
+  e = *(const uintptr_t*)(c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS)
                                             << RECOMP_FM_STRIDE_LOG2)) & RECOMP_FM_PTR_MASK;
+  /* FM1 serves only plain memory pages. Count the hit here; misses fall
+     through to the slow path, which classifies and counts itself. The bump
+     is a no-op when the host provides no counters. */
+  if(e) recomp_bump(c, RECOMP_MEM_FAST_PATH_HITS);
+  return e;
 }
 #define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))
 
@@ -7493,16 +7552,53 @@ uint64_t recomp_cntpct(GuestContext* c){
    Deliberately not inlined into the generated code. Forcing it inline at every
    access site was measured: main.dll went from 100 MB to 222 MB and the race
    phase lost 14%, so whatever the call cost, the instruction cache cost more. */
+/* Relaxed increment of one guest-memory counter. Absent counters are the
+   standalone runtime's case (no host bridge) and the pre-counter image
+   revision, so this must stay a no-op rather than a null dereference.
+
+   The increment is atomic because guest threads share these: a lost update
+   would understate GPU coupling, which is the number this exists to measure.
+   Not a function pointer either - this is the memory fast path, which exists
+   to remove an indirect call. */
+static void recomp_bump(GuestContext* c, int slot){
+  const RecompHostMem* hm = c->host_mem;
+  if(!hm || !hm->counters || slot < 0 || slot >= RECOMP_MEM_SLOT_COUNT) return;
+#if defined(_MSC_VER) && !defined(__clang__)
+  _InterlockedIncrement64((volatile long long*)&hm->counters[slot]);
+#else
+  __atomic_fetch_add(&hm->counters[slot], 1, __ATOMIC_RELAXED);
+#endif
+}
+
 static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
   const RecompHostMem* hm = c->host_mem;
-  uintptr_t raw, p;
+  uintptr_t raw, p, tag;
+  int reason;
   if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
   va &= 0xffffffffffffULL;                 /* AArch64 ignores the top 16 bits */
   if(va >= hm->address_space_max) return 0;
   raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
                             + (va >> hm->page_bits) * hm->page_entry_stride);
+  /* Tag check first: classify the page before looking at the pointer.
+     Non-Memory pages (Debug, RasterizerCached) commonly have null pointers
+     since they are not directly mapped; they must count as their proper
+     category, not as Other. */
+  tag = raw & (uintptr_t)hm->page_type_mask;
+  if(tag != hm->page_type_memory) {
+    reason = (tag == hm->page_type_rasterizer_cached) ? RECOMP_MEM_GPU_TRACKED
+           : (tag == hm->page_type_debug)            ? RECOMP_MEM_DEBUG
+                                                    : RECOMP_MEM_OTHER;
+    recomp_bump(c, reason);
+    return 0;
+  }
   p = raw & (uintptr_t)hm->pointer_mask;
-  return p ? (unsigned char*)(p + (uintptr_t)va) : 0;
+  if(!p) {
+    /* Memory page with no backing pointer: genuinely unmapped. */
+    recomp_bump(c, RECOMP_MEM_OTHER);
+    return 0;
+  }
+  recomp_bump(c, RECOMP_MEM_FAST_PATH_HITS);
+  return (unsigned char*)(p + (uintptr_t)va);
 }
 
 /* A multi-byte access whose bytes straddle a page boundary cannot be served
@@ -7525,9 +7621,17 @@ static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t b
   /* The fast-path limit can be below a page boundary (diagnostic slow paths).
      Validate the entire span before reading any entry or backing bytes. */
   if(va >= hm->address_space_max || bytes > hm->address_space_max - va ||
-     bytes > UINT64_C(0x1000000000000) - va) return 0;
+     bytes > UINT64_C(0x1000000000000) - va) {
+    recomp_bump(c, RECOMP_MEM_OTHER);
+    return 0;
+  }
   psz = UINT64_C(1) << hm->page_bits;
-  if(bytes > psz - (va & (psz - 1))) return 0;
+  if(bytes > psz - (va & (psz - 1))) {
+    /* Page-boundary crossing: cannot be served from a single entry.
+       Count it here; recomp_host_ptr would see only the first byte's page. */
+    recomp_bump(c, RECOMP_MEM_OTHER);
+    return 0;
+  }
   return recomp_host_ptr(c, va);
 }
 
