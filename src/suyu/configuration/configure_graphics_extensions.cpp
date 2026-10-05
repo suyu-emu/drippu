@@ -37,21 +37,25 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
     auto& layout = *ui->populate_target->layout();
     std::map<u32, QWidget*> hold{}; // A map will sort the data for us
 
-    // This branch does not expose a dedicated RendererExtensions category.
-    // Populate from renderer advanced options to keep this page functional.
-    for (auto setting :
-         Settings::values.linkage.by_category[Settings::Category::RendererAdvanced]) {
-        ConfigurationShared::Widget* widget = builder.BuildWidget(setting, apply_funcs);
+    // Populate from the renderer extensions category as well as renderer
+    // advanced. The extensions category holds driver-facing toggles (e.g. the
+    // graphics pipeline library switch) that users need to reach when a driver
+    // misbehaves; leaving it out strands those settings with no UI at all.
+    for (const auto category : {Settings::Category::RendererExtensions,
+                                Settings::Category::RendererAdvanced}) {
+        for (auto setting : Settings::values.linkage.by_category[category]) {
+            ConfigurationShared::Widget* widget = builder.BuildWidget(setting, apply_funcs);
 
-        if (widget == nullptr) {
-            continue;
-        }
-        if (!widget->Valid()) {
-            widget->deleteLater();
-            continue;
-        }
+            if (widget == nullptr) {
+                continue;
+            }
+            if (!widget->Valid()) {
+                widget->deleteLater();
+                continue;
+            }
 
-        hold.emplace(setting->Id(), widget);
+            hold.emplace(setting->Id(), widget);
+        }
     }
 
     for (const auto& [id, widget] : hold) {
