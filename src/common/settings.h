@@ -596,11 +596,13 @@ struct Values {
                                                      Category::RendererHacks};
     SwitchableSetting<bool> use_graphics_pipeline_library{
         linkage,
-#ifdef __ANDROID__
+        // Default off: the pipeline-library reuse path has a confirmed
+        // rendering-corruption issue on some Windows drivers (reported
+        // 2026-10-03, fixed by disabling). Keep it opt-in until the reuse
+        // logic or driver interaction is root-caused. Users who want the
+        // faster pipeline builds can enable it under Settings > Graphics >
+        // Renderer extensions.
         false,
-#else
-        true,
-#endif
         "use_graphics_pipeline_library", Category::RendererExtensions};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,

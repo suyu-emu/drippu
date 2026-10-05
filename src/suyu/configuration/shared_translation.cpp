@@ -244,7 +244,18 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "files internally."));
     INSERT(Settings, use_graphics_pipeline_library, tr("Use graphics pipeline libraries"),
            tr("Builds Vulkan graphics pipelines from reusable parts when supported by the driver. "
-              "Disable this if a driver shows rendering issues. Requires a restart."));
+              "Can reduce shader stutter, but has caused rendering corruption on some drivers. "
+              "Requires a restart."));
+    INSERT(Settings, dyna_state, tr("Extended Dynamic State"),
+           tr("Controls the number of features that can be used in Extended Dynamic State.\n"
+              "Higher states allow for more features and can increase performance, but may cause "
+              "additional graphical issues."));
+    INSERT(Settings, vertex_input_dynamic_state, tr("Vertex Input Dynamic State"),
+           tr("Enables vertex input dynamic state feature for better quality and performance."));
+    INSERT(Settings, sample_shading, tr("Sample Shading"),
+           tr("Allows the fragment shader to execute per sample in a multi-sampled fragment "
+              "instead of once per fragment. Improves graphics quality at the cost of performance.\n"
+              "Higher values improve quality but degrade performance."));
     INSERT(
         Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
         tr("Enable compute pipelines, required by some games.\nThis setting only exists for Intel "
