@@ -23,6 +23,7 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/save_data_controller.h"
 
 #ifdef ENABLE_WEB_SERVICE
 #include "web_service/nextendo_api.h"
