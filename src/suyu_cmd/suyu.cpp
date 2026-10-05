@@ -117,7 +117,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
-#ifdef __unix__
+#ifdef __linux__
 #include "common/linux/gamemode.h"
 #endif
 
@@ -2814,7 +2814,7 @@ int main(int argc, char** argv) {
         exit(0);
     });
 
-#ifdef __unix__
+#ifdef __linux__
     Common::Linux::StartGamemode();
 #endif
 
@@ -2933,7 +2933,7 @@ int main(int argc, char** argv) {
     void(system.Pause());
     system.ShutdownMainProcess();
 
-#ifdef __unix__
+#ifdef __linux__
     Common::Linux::StopGamemode();
 #endif
 

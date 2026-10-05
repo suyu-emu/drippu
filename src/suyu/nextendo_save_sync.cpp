@@ -17,9 +17,11 @@
 #include "common/nextendo_compatible_titles.h"
 #include "common/logging.h"
 #include "common/nextendo_account.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 
 #ifdef ENABLE_WEB_SERVICE
@@ -58,6 +60,27 @@ bool HasLocalContent(const FileSys::VirtualDir& dir) {
         }
     }
     return false;
+}
+
+// Opens the current user's account save for a title through the FS service,
+// the same path guest code takes. Returns null when no save exists yet.
+FileSys::VirtualDir OpenTitleSaveDir(Core::System& system, u64 title_id) {
+    const auto user = system.GetProfileManager().GetUser(
+        static_cast<std::size_t>(Settings::values.current_user.GetValue()));
+    FileSys::SaveDataAttribute attribute{};
+    attribute.program_id = title_id;
+    attribute.type = FileSys::SaveDataType::Account;
+    if (user.has_value()) {
+        attribute.user_id = user->AsU128();
+    }
+    FileSys::VirtualDir dir{};
+    const auto result = system.GetFileSystemController()
+                            .OpenSaveDataController()
+                            ->OpenSaveData(&dir, FileSys::SaveDataSpaceId::User, attribute);
+    if (result.IsError()) {
+        return {};
+    }
+    return dir;
 }
 
 #endif // SUYU_ENABLE_LIBARCHIVE || _WIN32
@@ -224,8 +247,7 @@ void Pull(Core::System& system, u64 title_id, bool force) {
         return;
     }
 
-    auto save_dir = system.GetFileSystemController().GetSaveDataFactory().GetTitleSaveDirectory(
-        title_id);
+    auto save_dir = OpenTitleSaveDir(system, title_id);
     if (!force && HasLocalContent(save_dir)) {
         LOG_INFO(Frontend, "Nextendo save pull {:016X}: local save present -> kept (no overwrite)",
                  title_id);
@@ -259,8 +281,7 @@ std::vector<u8> CaptureForPush(Core::System& system, u64 title_id) {
     if (!IsEligible(title_id)) {
         return {};
     }
-    auto save_dir = system.GetFileSystemController().GetSaveDataFactory().GetTitleSaveDirectory(
-        title_id);
+    auto save_dir = OpenTitleSaveDir(system, title_id);
     if (!save_dir) {
         return {};
     }

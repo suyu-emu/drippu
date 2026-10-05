@@ -161,7 +161,7 @@ void NextendoPopulationDialog::RefreshChart(int tab) {
     if (!updated.empty()) {
         auto dt = QDateTime::fromString(QString::fromStdString(updated), Qt::ISODate);
         if (dt.isValid()) {
-            dt.setTimeZone(QTimeZone::UTC);
+            dt.setTimeZone(QTimeZone::utc());
             const QDateTime local = dt.toLocalTime();
             const qint64 minutes_ago = std::max<qint64>(0, dt.secsTo(QDateTime::currentDateTimeUtc())) / 60;
             const QString when = QLocale::system().toString(local, QStringLiteral("MMM d, h:mm AP"));
