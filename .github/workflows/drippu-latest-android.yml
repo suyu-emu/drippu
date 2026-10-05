@@ -1,0 +1,89 @@
+name: Build latest DRIPPU Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Android build type"
+        required: true
+        default: "RelWithDebInfo"
+        type: choice
+        options:
+          - RelWithDebInfo
+          - Release
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: DRIPPU Android - latest main
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout latest DRIPPU
+        uses: actions/checkout@v7
+        with:
+          repository: suyu-emu/drippu
+          ref: main
+          fetch-depth: 0
+          submodules: false
+          path: drippu
+
+      - name: Initialize submodules
+        working-directory: drippu
+        run: |
+          git -c submodule."externals/ownfoil".update=none \
+              -c submodule."externals/nxdumptool".update=none \
+              -c submodule."externals/nxapi".update=none \
+              -c submodule."externals/nx-optimizer".update=none \
+              submodule update --init --recursive --depth=1
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: microsoft
+          java-version: "17"
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+
+      - name: Show DRIPPU commit
+        id: info
+        working-directory: drippu
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "======================================"
+          echo "Building latest DRIPPU main:"
+          git log -1 --oneline
+          echo "======================================"
+
+      - name: Build Android APK
+        working-directory: drippu
+        shell: bash
+        run: |
+          chmod +x .ci/android/build.sh
+
+          .ci/android/build.sh \
+            -t standard \
+            -b "${{ inputs.build_type }}"
+
+      - name: Show generated artifacts
+        working-directory: drippu
+        run: |
+          echo "Generated files:"
+          find artifacts -maxdepth 1 -type f -print
+          ls -lh artifacts/
+
+      - name: Upload DRIPPU APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: drippu-android-${{ steps.info.outputs.sha }}-${{ inputs.build_type }}
+          path: drippu/artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 14
