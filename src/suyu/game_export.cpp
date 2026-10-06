@@ -2581,7 +2581,9 @@ static std::optional<QJsonObject> BakedPatchManifest(
             return std::nullopt;
         }
         for (const auto& file : directory->GetFiles()) {
-            const auto path = QStringLiteral("exefs/") + QString::fromStdString(file->GetName());
+            // QString, not auto: auto would keep a QStringBuilder that refers to the
+            // temporary from fromStdString after it is destroyed.
+            const QString path = QStringLiteral("exefs/") + QString::fromStdString(file->GetName());
             if (!files.contains(path)) {
                 LOG_ERROR(Frontend, "Cannot bake mod {}: {} does not target this export. Move the selected patches into a dedicated mod folder",
                           name.toStdString(), file->GetName());
