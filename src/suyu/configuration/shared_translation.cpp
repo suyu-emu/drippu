@@ -94,6 +94,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
            tr("Select the CPU execution backend.\n"
               "Dynarmic: portable JIT recompiler (default).\n"
               "NCE: native code execution on compatible ARM64 hosts."));
+    INSERT(Settings, cache_affinity, tr("Prefer the cores with the largest L3 cache"),
+           tr("On CPUs whose L3 caches differ in size, such as Ryzen X3D parts with stacked cache "
+              "on one die, runs the emulator on the cores sharing the largest L3.\nDoes nothing "
+              "when every L3 is the same size or the CPU affinity is already restricted. Applies "
+              "when a game starts."));
 
     // Cpu Debug
 

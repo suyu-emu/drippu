@@ -286,6 +286,8 @@ struct Values {
                                            true,
                                            true,
                                            &use_custom_cpu_ticks};
+    // Confine the process to the cores sharing the largest L3 when the L3s differ in size.
+    Setting<bool> cache_affinity{linkage, true, "cache_affinity", Category::Cpu};
 
     Setting<bool> cpuopt_page_tables{linkage, true, "cpuopt_page_tables", Category::CpuDebug};
     Setting<bool> cpuopt_block_linking{linkage, true, "cpuopt_block_linking", Category::CpuDebug};

@@ -9,6 +9,7 @@ add_executable(tests
     common/catch_starting_listener.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/cpu_cache_affinity.cpp
     common/fibers.cpp
     common/host_memory.cpp
     common/param_package.cpp

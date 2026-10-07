@@ -34,6 +34,7 @@
 #include <SDL3/SDL_misc.h>
 #include <SDL3/SDL_timer.h>
 
+#include "common/cpu_cache_affinity.h"
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
 #include "suyu_cmd/native_status.h"
@@ -2724,6 +2725,8 @@ int main(int argc, char** argv) {
         }
     }
     SuyuCmd::SetNativeLaunchName(app_name_override.value_or(fallback_name));
+    // Before Load creates the emulated CPU threads.
+    Common::ApplyLargestCacheAffinity(Settings::values.cache_affinity.GetValue());
     const Core::SystemResultStatus load_result{
         portable_game ? system.Load(*emu_window, portable_game, load_parameters)
                       : system.Load(*emu_window, filepath, load_parameters)};

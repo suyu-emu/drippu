@@ -38,6 +38,8 @@ add_library(
     common_types.h
     concepts.h
     container_hash.h
+    cpu_cache_affinity.cpp
+    cpu_cache_affinity.h
     demangle.cpp
     demangle.h
     detached_tasks.cpp
