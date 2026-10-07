@@ -37,6 +37,17 @@ elseif(NOT GENERATED_DIR)
   add_executable(smoke_literal_unit literal_unit.cpp "${gaps_source}")
   target_compile_features(smoke_literal_unit PRIVATE cxx_std_20)
   target_include_directories(smoke_literal_unit PRIVATE "${SUYU_SOURCE}/src")
+  # SHL by immediate: the emitted C, under the Hybrid export policy, against
+  # a reference (shl_unit.c). The generator runs at build time.
+  add_executable(smoke_shl_gen shl_gen.cpp "${gaps_source}")
+  target_compile_features(smoke_shl_gen PRIVATE cxx_std_20)
+  target_include_directories(smoke_shl_gen PRIVATE "${SUYU_SOURCE}/src")
+  set(shl_dir "${CMAKE_CURRENT_BINARY_DIR}/shl")
+  add_custom_command(OUTPUT "${shl_dir}/shl_ops.c" "${shl_dir}/recomp_runtime.h"
+      COMMAND smoke_shl_gen "${shl_dir}" DEPENDS smoke_shl_gen)
+  add_executable(smoke_shl_unit shl_unit.c "${shl_dir}/shl_ops.c")
+  target_compile_features(smoke_shl_unit PRIVATE c_std_11)
+  target_include_directories(smoke_shl_unit PRIVATE "${shl_dir}" "${CMAKE_CURRENT_SOURCE_DIR}")
 else()
   file(GLOB generated_sources "${GENERATED_DIR}/src/*.c")
   add_executable(smoke_run run.c ${generated_sources}

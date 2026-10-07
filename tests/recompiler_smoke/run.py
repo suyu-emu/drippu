@@ -195,6 +195,7 @@ def main():
         call([executable(export_build, "smoke_module_name_unit")])
         call([executable(export_build, "smoke_import_resolve_unit")])
         call([executable(export_build, "smoke_literal_unit")])
+        call([executable(export_build, "smoke_shl_unit")])
         check_coverage_loop(root, exporter, build)
         generated = {}
         for name, switches in VARIANTS:

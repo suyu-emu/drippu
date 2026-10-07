@@ -336,9 +336,21 @@ inline bool g_emit_fpx = false;
 // after every fast path too, and recomp_fpx_shadow compares the two.
 inline bool g_emit_fpx_shadow = false;
 
+// Hybrid exports translate the gated forms too. g_translate_all gates only SHL
+// by immediate (vector and scalar D), whose translation is exact
+// (tests/recompiler_smoke shl_unit). Hybrid left it to the JIT on the strength
+// of one measurement from before ABI 6, chaining and the clang-cl build
+// (2.13 ms/frame against 1.95 for one SIMD-heavy block). Measured 2026-10-06,
+// TOTK 1.4.3 Hybrid, in-world, alternating, quiet machine: the fallback made
+// ~290,000 static->JIT transitions per run, all SHL vec imm, at 22.5/23.1 fps;
+// translating it made 0, at 29.5/28.9 (JIT and strict static are ~30). MK8D
+// Hybrid race: 53.6 fps mean over 3 runs against 54.2 over 5, within noise,
+// with 0 transitions against ~55,000. Set this false to restore the old split.
+inline constexpr bool kHybridTranslatesGatedForms = true;
+
 // Strict static exports have no fallback to carry deliberately gated forms.
 inline bool TranslateAllForExport(bool strict_static, bool explicitly_requested) {
-    return strict_static || explicitly_requested;
+    return strict_static || explicitly_requested || kHybridTranslatesGatedForms;
 }
 
 inline const std::unordered_set<u64>* g_chain_blocks = nullptr;
@@ -1863,6 +1875,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                            (opcode == 8 && U) || left || (narrow && !U);
         u32 bits = 8;
         while (bits < 64 && imm >= bits * 2) bits *= 2;
+        // SHL (left, !U) is the one form g_translate_all gates; every export
+        // sets it (kHybridTranslatesGatedForms). The bare emitter keeps it off.
         if (known && (!left || U || g_translate_all) && imm >= 8 &&
             (!scalar || (Q && !narrow && bits == 64)) &&
             (scalar || narrow || bits != 64 || Q) && (!narrow || bits < 64)) {
@@ -3015,11 +3029,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     // SHL by immediate. Bit 29 is U and must stay in the mask: the same opcode
     // with U set is SLI, handled above. immh selects the element width and
     // immh:immb encodes the shift as a bias above it.
-    // Off deliberately, and measured. Enabling this frees the hot block that also
-    // contains MOVI - transitions drop 47% - and costs 2.13 ms/frame against
-    // 1.95. The block is SIMD-heavy and the JIT compiles it better than the
-    // emitted C does, so paying the transition to stay in the JIT is cheaper
-    // than owning the block. Re-measure before flipping this.
+    // The immediate-shift translation above takes every vector SHL first when
+    // g_translate_all is set, so this one is reached by neither policy. Its gate
+    // once kept SHL on the JIT in Hybrid (2.13 ms/frame against 1.95, before
+    // ABI 6); see kHybridTranslatesGatedForms for why exports no longer do.
     const bool kTranslateShiftLeftImmediate = g_translate_all;
     if (kTranslateShiftLeftImmediate && (i & 0xBF80FC00) == 0x0F005400) {
         const u32 Q = (i >> 30) & 1;
