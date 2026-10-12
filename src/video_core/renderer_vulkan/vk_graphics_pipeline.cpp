@@ -718,10 +718,26 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
+            VkFormat vertex_format =
+                MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size());
+            const u32 stride = key.state.vertex_strides[attribute.buffer];
+            // MoltenVK translates attributes crossing a stride into another binding,
+            // which misreads packed RGBA8 weights on Apple M5. If W is unused,
+            // RGB8 preserves XYZ within the original vertex record. Static stride
+            // mode also keeps this format decision in the pipeline cache key.
+            if (device.IsMoltenVK() && !key.state.extended_dynamic_state &&
+                vertex_format == VK_FORMAT_R8G8B8A8_UNORM && stride != 0 &&
+                u64{attribute.offset.Value()} + 3 <= stride &&
+                u64{attribute.offset.Value()} + 4 > stride &&
+                !stage_infos[0].loads.Generic(index, 3) &&
+                device.IsFormatSupported(VK_FORMAT_R8G8B8_UNORM,
+                                         VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT, FormatType::Buffer)) {
+                vertex_format = VK_FORMAT_R8G8B8_UNORM;
+            }
             vertex_attributes.push_back({
                 .location = static_cast<u32>(index),
                 .binding = attribute.buffer,
-                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size()),
+                .format = vertex_format,
                 .offset = attribute.offset,
             });
         }
