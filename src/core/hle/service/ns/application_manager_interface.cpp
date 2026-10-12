@@ -7,8 +7,10 @@
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/hle/kernel/k_event.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/ns/application_manager_interface.h"
 
 #include "core/file_sys/content_archive.h"
@@ -22,6 +24,60 @@
 #include <vector>
 
 namespace Service::NS {
+
+// nn::ns::detail::IAsyncResult, returned by the [20.0.0+] commands that start
+// an asynchronous operation. The guest waits on the returned event, then calls
+// Get; the Result of the Get call itself is the operation's result.
+// https://switchbrew.org/wiki/NS_services#IAsyncResult
+class IAsyncResult final : public ServiceFramework<IAsyncResult> {
+public:
+    explicit IAsyncResult(Core::System& system_)
+        : ServiceFramework{system_, "IAsyncResult"},
+          service_context{system_, "IAsyncResult"} {
+        static const FunctionInfo functions[] = {
+            {0, &IAsyncResult::Get, "Get"},
+            {1, &IAsyncResult::Cancel, "Cancel"},
+            {2, &IAsyncResult::GetErrorContext, "GetErrorContext"},
+        };
+        RegisterHandlers(functions);
+
+        // The operation this object represents has already completed.
+        completion_event = service_context.CreateEvent("IAsyncResult:Completion");
+        completion_event->GetReadableEvent().Signal(system.Kernel());
+    }
+
+    ~IAsyncResult() override {
+        service_context.CloseEvent(completion_event);
+    }
+
+    Kernel::KReadableEvent& ReadableEvent() const {
+        return completion_event->GetReadableEvent();
+    }
+
+private:
+    void Get(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_NS, "called");
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void Cancel(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_NS, "called");
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetErrorContext(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_NS, "called");
+        // Only meaningful after a failed Get; the operation succeeded, so
+        // there is no error context to report.
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    KernelHelpers::ServiceContext service_context;
+    Kernel::KEvent* completion_event{};
+};
 
 IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_)
     : ServiceFramework{system_, "IApplicationManagerInterface"},
@@ -420,7 +476,7 @@ IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_
         {4039, nullptr, "Unknown4039"}, //20.0.0+
         {4040, nullptr, "Unknown4040"}, //20.0.0+
         {4041, nullptr, "Unknown4041"}, //20.0.0+
-        {4042, nullptr, "Unknown4042"}, //20.0.0+
+        {4042, &IApplicationManagerInterface::Unknown4042, "Unknown4042"}, //20.0.0+
         {4043, nullptr, "Unknown4043"}, //20.0.0+
         {4044, nullptr, "Unknown4044"}, //20.0.0+
         {4045, nullptr, "Unknown4045"}, //20.0.0+
@@ -832,15 +888,32 @@ Result IApplicationManagerInterface::Unknown4022(
     R_SUCCEED();
 }
 
-Result IApplicationManagerInterface::Unknown4023(Out<u64> out_result) {
+Result IApplicationManagerInterface::Unknown4023(Out<Unknown4023Output> out_output) {
     LOG_WARNING(Service_NS, "(STUBBED) called.");
-    *out_result = 0;
+    *out_output = {};
     R_SUCCEED();
 }
 
 Result IApplicationManagerInterface::Unknown4053() {
     LOG_WARNING(Service_NS, "(STUBBED) called.");
     R_SUCCEED();
+}
+
+void IApplicationManagerInterface::Unknown4042(HLERequestContext& ctx) {
+    IPC::RequestParser rp{ctx};
+    const auto user_id = rp.PopRaw<Uid>();
+    LOG_INFO(Service_NS, "called, user_id={}", user_id.uuid.RawString());
+
+    // [20.0.0+] Starts a per-user asynchronous operation (believed to refresh
+    // the user's virtual game card state) and returns its IAsyncResult along
+    // with the operation's completion event. There is no server-side state to
+    // synchronize, so the operation completes immediately with success.
+    auto async_result = std::make_shared<IAsyncResult>(system);
+
+    IPC::ResponseBuilder rb{ctx, 2, 1, 1};
+    rb.Push(ResultSuccess);
+    rb.PushCopyObjects(ctx, async_result->ReadableEvent());
+    rb.PushIpcInterface(ctx, std::move(async_result));
 }
 
 void IApplicationManagerInterface::ListApplicationTitle(HLERequestContext& ctx) {

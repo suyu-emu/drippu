@@ -14,6 +14,15 @@
 
 namespace Service::NS {
 
+// Output of Unknown4023. The [20.0.0+] IPC definition for the command returns
+// a 0x58-byte struct, but its layout is not publicly documented.
+struct Unknown4023Output {
+    std::array<u8, 0x58> data{};
+};
+static_assert(sizeof(Unknown4023Output) == 0x58, "Unknown4023Output has incorrect size.");
+static_assert(std::is_trivially_copyable_v<Unknown4023Output>,
+              "Unknown4023Output must be trivially copyable");
+
 class IApplicationManagerInterface final : public ServiceFramework<IApplicationManagerInterface> {
 public:
     explicit IApplicationManagerInterface(Core::System& system_);
@@ -68,8 +77,9 @@ public:
                                   u64 application_id,
                                   InBuffer<BufferAttr_HipcMapAlias> logo_path_buffer);
     Result Unknown4022(OutCopyHandle<Kernel::KReadableEvent> out_event);
-    Result Unknown4023(Out<u64> out_result);
+    Result Unknown4023(Out<Unknown4023Output> out_output);
     Result Unknown4053();
+    void Unknown4042(HLERequestContext& ctx);
 
     Result RequestDownloadApplicationControlDataInBackground(u64 control_source,
                                                              u64 application_id);
