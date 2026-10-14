@@ -4,11 +4,11 @@ This packages already-built suyu/suyu-cmd; it adds no product dependencies. Comp
 
 Run from the repository on Ubuntu24.04 with Docker, Python3, binutils, patchelf, desktop-file-utils, squashfs-tools and Qt6 qmake. Enable authenticated Ubuntu deb-src entries matching installed libraries. Existing _pkg contains suyu,suyu-cmd,LICENSE.txt,THIRD-PARTY-NOTICES.txt,LICENSES. Prefer Linux build SDL_SHARED=OFF SDL_STATIC=ON; existingCPMsourcebundle covers pinnedSDL3. Unownedsharedlibraries failclosed rather than being assigned by filename to an Ubuntu package.
 
-    export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
-    python3 tools/appimage/runtime.py --work-dir _runtime
-    python3 tools/appimage/build.py --package-dir _pkg --work-dir _appimage --runtime-dir _runtime --source-revision "$GITHUB_SHA" --release-name "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY" --qmake qmake6
-    python3 tests/appimage/smoke.py _appimage/suyu-linux-x86_64.AppImage --report _appimage/smoke.json
-    python3 -m unittest discover -s tests/appimage -v
+        export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+        python3 tools/appimage/runtime.py --work-dir _runtime
+        python3 tools/appimage/build.py --package-dir _pkg --work-dir _appimage --runtime-dir _runtime --source-revision "$GITHUB_SHA" --release-name "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY" --qmake qmake6
+        python3 tests/appimage/smoke.py _appimage/suyu-linux-x86_64.AppImage --report _appimage/smoke.json
+        python3 -m unittest discover -s tests/appimage -v
 
 Destinations must be new. Release refs sanitize slashes to hyphens. Tagv0.0.14 emits _appimage/suyu-linux-x86_64.AppImage and _appimage/suyu-v0.0.14-appimage-sources.tar.gz. AppDir and sidecar appimage-provenance.json remain for audit. Source tar topdir is suyu-v0.0.14-dependency-sources; it is separate from existingCPMsourcebundle. No hand-authored source manifest is an input.
 
@@ -45,6 +45,5 @@ paths, occurrences, ancestor archives or source manifests fail the gate.
 CI diagnostic FUSE-free startup may run after a corresponding-source scan fails
 if construction succeeded. That failure still blocks uploads and publication;
 diagnostic startup is not a release qualification waiver.
-
 
 Pinned deployment layout controls: DISABLE_COPYRIGHT_FILES_DEPLOYMENT=1 is supported in linuxdeploy cc7b86472 src/main.cpp114–117 and Qtplugin ce5291e src/main.cpp139–142. This suppresses duplicate tool copyright trees; automatic collector still supplies complete canonical Ubuntu copyright/full common-license texts. Qtplugin src/deployment.h119–151 has no translation-disable flag. The builder validates its optional usr/translations subtree contains only flat regular.qm files, records their hashes, and moves that newlyowned output to _appimage/omitted-qt-translations before releaseinventory. No originalQt/source/license file is deleted or modified; unexpectedfiles/symlinks fail without moving. Omitted optional Qt translations are not releasepayload; product translations embedded in suyu are unaffected. Eight focusedLinux tests pass, including actuallauncherhook and safeoptionaltranslationretention.

@@ -10,7 +10,7 @@ copy of `exefs/subsdk3` (three ASCII characters of a text pattern).
 
 Run (Python 3, standard library only, nothing is downloaded):
 
-    python ultracam_totk143_fix.py <path to UltraCam\exefs>
+        python ultracam_totk143_fix.py <path to UltraCam\exefs>
 
 - It only accepts the exact original UltraCam 3.0 `subsdk3` (SHA-256 checked); any
   other version is refused and left untouched.
