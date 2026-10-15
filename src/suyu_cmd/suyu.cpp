@@ -24,6 +24,7 @@
 
 #include <fmt/ostream.h>
 #include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 #include <stb_image_write.h>
 #include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_error.h>
@@ -33,6 +34,7 @@
 #include <SDL3/SDL_misc.h>
 #include <SDL3/SDL_timer.h>
 
+#include "common/cpu_cache_affinity.h"
 #include "common/detached_tasks.h"
 #include "common/logging/backend.h"
 #include "suyu_cmd/native_status.h"
@@ -47,8 +49,8 @@
 #include "common/string_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_gap_session.h"
+#include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/recomp/recomp_image_features.h"
-#include "core/arm/recomp/recomp_module_binding.h"
 #include "core/core.h"
 #include "core/perf_stats.h"
 #include "core/core_timing.h"
@@ -56,6 +58,8 @@
 #include "core/crypto/key_manager.h"
 #include "core/crypto/portable_seal.h"
 #include "core/file_sys/content_archive.h"
+#include "core/file_sys/baked_patch_manifest.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/registered_cache.h"
@@ -203,6 +207,25 @@ struct SuyuRecompStaticModule {
 };
 #ifdef SUYU_CMD_STATIC_RECOMP
 const SuyuRecompStaticModule* suyu_recomp_static_modules_v4(unsigned* count);
+// Each registered module's build ID (lower-case hex), parallel to the module
+// list, so an image is bound to the loaded module it was built from rather
+// than to a position. Registrations from before it have none; under MSVC (and
+// so in the export build kit, whose host objects are linked against any
+// export's registry) a default that reports none stands in for the missing
+// symbol, and other compilers are told by suyu_cmd/CMakeLists.txt.
+#ifdef _MSC_VER
+const char* const* suyu_recomp_static_build_ids_v1_absent(unsigned* count) {
+    *count = 0;
+    return nullptr;
+}
+#pragma comment(linker, "/alternatename:suyu_recomp_static_build_ids_v1=suyu_recomp_static_build_ids_v1_absent")
+#ifndef SUYU_RECOMP_BUILD_IDS_V1
+#define SUYU_RECOMP_BUILD_IDS_V1 1
+#endif
+#endif
+#ifdef SUYU_RECOMP_BUILD_IDS_V1
+const char* const* suyu_recomp_static_build_ids_v1(unsigned* count);
+#endif
 #ifdef SUYU_RECOMP_GUARD_V2
 int suyu_recomp_static_guard_v2(unsigned version);
 #endif
@@ -827,8 +850,10 @@ static std::filesystem::path RecordedSuyuExecutable(const std::filesystem::path&
 // The installed suyu's NAND: <root>/nand, unless its own settings moved it
 // (Data Storage in qt-config.ini). Keys have no such setting. Like suyu's own
 // reader, any non-empty value counts, whatever its "\default" flag says.
-static std::filesystem::path InstalledNandDirectory(const std::filesystem::path& installed_root,
-                                                    const std::filesystem::path& config_dir) {
+static std::filesystem::path InstalledDataDirectory(const std::filesystem::path& installed_root,
+                                                    const std::filesystem::path& config_dir,
+                                                    const std::string& setting,
+                                                    const char* default_subdir) {
     std::ifstream in(config_dir / "qt-config.ini");
     std::string line;
     bool in_section = false;
@@ -844,7 +869,7 @@ static std::filesystem::path InstalledNandDirectory(const std::filesystem::path&
         if (!in_section) {
             continue;
         }
-        if (line.starts_with("nand_directory=")) {
+        if (line.starts_with(setting + "=")) {
             value = line.substr(line.find('=') + 1);
             if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
                 value = value.substr(1, value.size() - 2);
@@ -852,7 +877,7 @@ static std::filesystem::path InstalledNandDirectory(const std::filesystem::path&
         }
     }
     if (value.empty()) {
-        return installed_root / "nand";
+        return installed_root / default_subdir;
     }
     const std::filesystem::path nand{Common::FS::ToU8String(value)};
     return nand.is_relative() ? installed_root / nand : nand;
@@ -1387,6 +1412,7 @@ int main(int argc, char** argv) {
     // The export carries no system firmware; it reads the installed one, like its keys.
     // Both stay empty when this executable is not an exported package.
     std::filesystem::path installed_nand;
+    std::filesystem::path installed_load;
     std::filesystem::path export_user_root;
     // Logged once logging is up: which recorded locations led back into the package.
     bool ignored_package_suyu = false;
@@ -1495,7 +1521,10 @@ int main(int argc, char** argv) {
             // leave keys pointing into this package; suyu creates it anyway.
             std::filesystem::create_directories(installed_root / "keys", portable_ec);
             FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_root / "keys");
-            installed_nand = InstalledNandDirectory(installed_root, installed_config);
+            installed_load = InstalledDataDirectory(installed_root, installed_config,
+                                                     "load_directory", "load");
+            installed_nand = InstalledDataDirectory(installed_root, installed_config,
+                                                     "nand_directory", "nand");
             // The installed suyu's own NAND setting may not point back in here either.
             if (!Common::PackagePolicy::AcceptInstalledRoot(exe_dir, installed_nand)) {
                 ignored_package_nand = true;
@@ -1887,16 +1916,19 @@ int main(int argc, char** argv) {
         rom_found:;
     }
 
-    // Native recompiled CPU modules, in NSO load order: rtld(0), main(1),
-    // subsdk0-N(2..N+1), sdk(last). Whichever way they arrive, registering any
-    // of them makes ArmRecomp run the game's CPU natively instead of dynarmic.
+    // Native recompiled CPU modules. An export may leave modules out (Hybrid
+    // runs them on the JIT), so each image is bound to the loaded module with
+    // its build ID, never to a position. Whichever way they arrive, registering
+    // any of them makes ArmRecomp run the game's CPU natively instead of dynarmic.
     struct RecompModule {
         Core::RecompBlockFn (*lookup)(u64){};
         void (*set_base)(u64){};
         Core::RecompBlockFn run_slice{};
         unsigned image_abi{};
         unsigned (*guard_v2)(unsigned){};
-        std::string name; // informational, for recomp_gaps.json
+        std::string name;     // export name: rtld, main, subsdk0, sdk
+        std::string build_id; // empty for registrations from before build IDs
+        bool bound{};         // given its loaded module's base
     };
     static std::vector<RecompModule> s_recomp_modules;
     bool recomp_guard_ready = false;
@@ -1935,6 +1967,16 @@ int main(int argc, char** argv) {
     {
         unsigned count = 0;
         const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v4(&count);
+        unsigned build_id_count = 0;
+        const char* const* build_ids = nullptr;
+#ifdef SUYU_RECOMP_BUILD_IDS_V1
+        build_ids = suyu_recomp_static_build_ids_v1(&build_id_count);
+#endif
+        if (!build_ids || build_id_count != count) {
+            build_ids = nullptr;
+            LOG_WARNING(Frontend, "Static recompiled modules carry no build IDs (registration "
+                                  "predates them); binding images by NSO slot name");
+        }
         for (unsigned i = 0; i < count; ++i) {
             if (!mods[i].image_abi) {
                 LOG_CRITICAL(Frontend, "Static image predates correctness ABI 5; re-export all modules");
@@ -1945,9 +1987,11 @@ int main(int argc, char** argv) {
             }
             s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].run_slice,
                                         mods[i].image_abi(), nullptr,
-                                        mods[i].name ? mods[i].name : ""});
-            LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
-                     mods[i].name ? mods[i].name : "?");
+                                        mods[i].name ? mods[i].name : "",
+                                        build_ids && build_ids[i] ? build_ids[i] : ""});
+            LOG_INFO(Frontend, "Static recompiled module [{}] {} build_id={} — ArmRecomp active",
+                     i, mods[i].name ? mods[i].name : "?",
+                     s_recomp_modules.back().build_id.substr(0, 16));
         }
 #ifdef SUYU_RECOMP_GUARD_V2
         recomp_guard_ready = suyu_recomp_static_guard_v2(2) != 0;
@@ -2177,19 +2221,56 @@ int main(int argc, char** argv) {
         Core::SetRecompFpxReady(recomp_fpx != 0);
         LOG_INFO(Frontend, "Recompiled FPX1 native FP: {} (handshake {:#x})",
                  recomp_fpx ? "negotiated" : "not used", recomp_fpx);
-        Core::SetRecompBaseSetter([](size_t index, const char* live_name, u64 base) {
-            const int image = suyu::recomp::FindRecompModuleForLive(
-                s_recomp_modules.size(),
-                [](size_t i) -> std::string_view { return s_recomp_modules[i].name; }, index,
-                live_name ? std::string_view(live_name) : std::string_view{});
-            if (image >= 0 && s_recomp_modules[image].set_base) {
-                s_recomp_modules[image].set_base(base);
-                // Misses in this module are gaps a re-export can close.
-                Core::RecompGaps::NoteImage(base, s_recomp_modules[image].name);
-            } else {
-                LOG_WARNING(Frontend, "No recompiled image for live module '{}' (#{})",
-                            live_name ? live_name : "", index);
+        // Bind each loaded module to the image built from it, by build ID (see
+        // RecompGaps::MatchImage). Never by position: a Hybrid export that
+        // leaves main to the JIT registers [rtld, subsdk0, sdk], and handing
+        // those the bases of loaded modules 0, 1, 2 gave subsdk0's image main's
+        // base and sdk's image multimedia's. A module with no image runs on the
+        // JIT (or, strict, stops there); an image with no module stays unbound.
+        Core::SetRecompBaseSetter([](size_t index, const char* module, const char* build_id,
+                                     u64 base) {
+            std::vector<Core::RecompGaps::ImageIdentity> images;
+            for (const auto& m : s_recomp_modules) {
+                images.push_back({m.name, m.build_id});
             }
+            const std::string_view id = build_id ? build_id : "";
+            const auto image = Core::RecompGaps::MatchImage(images, index, module ? module : "", id);
+            if (!image || !s_recomp_modules[*image].set_base) {
+                LOG_WARNING(Frontend,
+                            "No recompiled image for module '{}' (#{}, build_id={}, base {:#x})",
+                            module ? module : "?", index, id.substr(0, 16), base);
+                return;
+            }
+            auto& m = s_recomp_modules[*image];
+            m.set_base(base);
+            m.bound = true;
+            // Misses in this module are gaps a re-export can close.
+            Core::RecompGaps::NoteImage(base, m.name);
+            LOG_INFO(Frontend, "Recompiled image '{}' bound to module '{}' (#{}, build_id={}, base {:#x})",
+                     m.name, module ? module : "?", index, id.substr(0, 16), base);
+        });
+        // Before the first block: an image left unbound runs with base 0, so its
+        // first module-relative address faults instead of saying why.
+        Core::SetRecompBindCheck([]() -> size_t {
+            std::string unbound;
+            size_t loaded = 0;
+            for (const auto& m : s_recomp_modules) {
+                if (m.bound) {
+                    continue;
+                }
+                const bool module_loaded = Core::RecompGaps::HasLoadedModule(m.build_id, m.name);
+                loaded += module_loaded ? 1 : 0;
+                unbound += fmt::format("{}{} (build_id={}{})", unbound.empty() ? "" : ", ",
+                                       m.name, m.build_id.substr(0, 16),
+                                       module_loaded ? ", its module is loaded" : "");
+            }
+            if (!unbound.empty()) {
+                LOG_WARNING(Frontend,
+                            "Recompiled image(s) not bound to any loaded module, so their code "
+                            "cannot run statically: {}",
+                            unbound);
+            }
+            return loaded;
         });
         // A window running native recompiled code is a standalone game export,
         // not the suyu dev frontend — the window chrome (title/icon) should
@@ -2224,7 +2305,55 @@ int main(int argc, char** argv) {
 #else
         const auto exe_dir = std::filesystem::path(argv[0]).parent_path();
 #endif
-        const auto local_mods = exe_dir / "mods";
+        auto local_mods = exe_dir / "mods";
+        if (!export_user_root.empty()) {
+            const auto manifest_text = ReadSmallTextFile(exe_dir / "aot_manifest.json");
+            const auto manifest = nlohmann::json::parse(manifest_text, nullptr, false);
+#ifdef SUYU_CMD_STATIC_RECOMP
+            if (!manifest.is_object()) {
+                ReportExportProblem("Missing AOT metadata",
+                                    "The game's aot_manifest.json is missing or damaged. Re-export this game.",
+                                    exe_dir, false, RecordedSuyuExecutable(export_user_root), "", "Open suyu");
+                return 2;
+            }
+#endif
+            if (!manifest.is_discarded() && manifest.contains("baked_patches")) {
+                std::string title;
+                std::ifstream source(export_user_root / "config" / "game-source.ini");
+                for (std::string line; std::getline(source, line);) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.starts_with("title_id=")) title = line.substr(9);
+                }
+                u64 title_id = 0;
+                if (title.size() == 16 && title.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos) {
+                    title_id = FileSys::GetBaseTitleID(std::stoull(title, nullptr, 16));
+                    title = fmt::format("{:016X}", title_id);
+                }
+                const auto digest = [](const std::string& bytes) {
+                    std::array<unsigned char, 32> hash{};
+                    unsigned length = 0;
+                    if (!EVP_Digest(bytes.data(), bytes.size(), hash.data(), &length, EVP_sha256(), nullptr) || length != hash.size()) {
+                        return std::string{};
+                    }
+                    return PortableSeal::ToHex(hash.data(), hash.size());
+                };
+                const auto baked = FileSys::VerifyBakedPatches(manifest, installed_load, exe_dir, title, digest);
+                if (!baked.error.empty()) {
+                    ReportExportProblem("Baked mods changed", baked.error, installed_load, false,
+                                        RecordedSuyuExecutable(export_user_root), "", "Open suyu");
+                    return 2;
+                }
+                local_mods = baked.load_root;
+                auto& disabled = Settings::values.disabled_addons[title_id];
+                disabled.clear();
+                for (const auto& entry : std::filesystem::directory_iterator(local_mods / title)) {
+                    const auto utf8_name = entry.path().filename().u8string();
+                    const std::string name(utf8_name.begin(), utf8_name.end());
+                    if (entry.is_directory() && !baked.mods.contains(name)) disabled.push_back(name);
+                }
+                LOG_INFO(Frontend, "Verified {} baked mod(s) from {}", baked.mods.size(), Common::FS::PathToUTF8String(local_mods));
+            }
+        }
         std::error_code ec;
         std::filesystem::create_directories(local_mods, ec);
         if (std::filesystem::is_directory(local_mods)) {
@@ -2310,7 +2439,8 @@ int main(int argc, char** argv) {
     Core::System system{};
     system.Initialize();
     if (!installed_nand.empty()) {
-        system.GetFileSystemController().SetSystemContentFallback(installed_nand);
+        system.GetFileSystemController().SetSystemContentFallback(installed_nand,
+                                                                 export_user_root.parent_path());
     }
     LOG_INFO(Frontend, "suyu-cmd: System initialized.");
     if (explicit_content_base) {
@@ -2595,6 +2725,8 @@ int main(int argc, char** argv) {
         }
     }
     SuyuCmd::SetNativeLaunchName(app_name_override.value_or(fallback_name));
+    // Before Load creates the emulated CPU threads.
+    Common::ApplyLargestCacheAffinity(Settings::values.cache_affinity.GetValue());
     const Core::SystemResultStatus load_result{
         portable_game ? system.Load(*emu_window, portable_game, load_parameters)
                       : system.Load(*emu_window, filepath, load_parameters)};

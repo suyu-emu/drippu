@@ -179,5 +179,18 @@ static const FpxWord g_fpx_words[] = {
     {0x4ee1d820u, "frecpe v0.2d, v1.2d", 'D', 1},
     {0xd53b4400u, "mrs x0, fpcr", 'X', 1},
     {0xd51b4401u, "msr fpcr, x1", 'X', 1},
+    {0x0ea2d420u, "fsub v0.2s, v1.2s, v2.2s", 'S', 2},
+    {0x2e22fc20u, "fdiv v0.2s, v1.2s, v2.2s", 'S', 2},
+    {0x0ea2cc20u, "fmls v0.2s, v1.2s, v2.2s", 'S', 3},
+    {0x0fa21820u, "fmla v0.2s, v1.2s, v2.s[3]", 'S', 3},
+    {0x0f829020u, "fmul v0.2s, v1.2s, v2.s[0]", 'S', 2},
+    {0x4fc25020u, "fmls v0.2d, v1.2d, v2.d[0]", 'D', 3},
+    {0x5fc21820u, "fmla d0, d1, v2.d[1]", 'D', 3},
+    {0x5fc25020u, "fmls d0, d1, v2.d[0]", 'D', 3},
+    {0x2e22d420u, "faddp v0.2s, v1.2s, v2.2s", 'S', 2},
+    {0x6e62d420u, "faddp v0.2d, v1.2d, v2.2d", 'D', 2},
+    {0x2ea2d420u, "fabd v0.2s, v1.2s, v2.2s", 'S', 2},
+    {0x6ee2d420u, "fabd v0.2d, v1.2d, v2.2d", 'D', 2},
+    {0x2ea1f820u, "fsqrt v0.2s, v1.2s", 'S', 1},
 };
 #define FPX_NWORDS (sizeof g_fpx_words / sizeof g_fpx_words[0])

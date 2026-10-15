@@ -2,20 +2,22 @@
 
 Use **File > Export Game...** to turn a game into its own package. On Windows the
 package is a program you can double-click or launch from Steam, without opening suyu's
-window. Each time it starts it reads **your own game file**, which suyu decrypts with
+window. The default **Reference** package reads **your own game file**, which suyu decrypts with
 **the keys you installed** from your own Switch - exactly as when you play the game in
 suyu. Without that file and those keys an export does not run.
 
-> **An export is a local package, not a suyu release, and not a copy of the game.**
-> Official suyu downloads contain no games, keys or firmware. An export contains no game
-> files, keys or firmware either: it records where your game file is. Hybrid and static
-> exports do contain code translated from the game (the **Source** format as C), which
-> only runs inside suyu together with your game file and keys; there is no standalone
-> program. The exporter does not check who owns the game, and nothing about how an
+> **An export is a local package, not a suyu release.**
+> Official suyu downloads contain no games, keys or firmware. Reference exports
+> record where your game file is. Optional **Portable** packages copy encrypted game,
+> update and DLC files into the export, bound to the same console's keys; they still
+> require those keys. Neither package type copies keys or firmware. Hybrid and Static
+> exports include code translated from the game (the **Source** format as C).
+> A Source export alone is not playable; compiled exports use suyu's embedded host
+> with your game content and keys. The exporter does not check who owns the game, and nothing about how an
 > export is made shows that it may be shared. Do not upload exports, or logs and dumps
 > made with them, to suyu's release or support channels.
->
-> **Re-export static and Hybrid packages for v0.0.12.** The code-guard fix is compiled
+> **Re-export static and Hybrid packages.** The code-guard fix, graphics defaults
+> and host fixes are compiled
 > into each game's generated code. Updating suyu alone does not change an existing
 > game executable. Packages made with v0.0.10 or earlier still need regeneration
 > because their older code format is unsupported.

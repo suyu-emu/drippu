@@ -100,6 +100,9 @@ public:
     // Used to prevent expensive copies in NSO loader.
     [[nodiscard]] bool HasNSOPatch(const BuildID& build_id, std::string_view name) const;
 
+    // The enabled patch files in the same order PatchNSO applies them.
+    [[nodiscard]] std::vector<VirtualFile> GetNSOPatches(const BuildID& build_id) const;
+
     // Creates a CheatList object with all
     [[nodiscard]] std::vector<Core::Memory::CheatEntry> CreateCheatList(
         const BuildID& build_id) const;
