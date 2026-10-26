@@ -43,6 +43,9 @@ DECLARE_ENUM_FLAG_OPERATORS(HaltReason);
 enum class Architecture {
     AArch64,
     AArch32,
+    // Switch 2 (Tegra T239, Cortex-A78C, ARMv8.5-A). Same instruction set
+    // family as AArch64; the distinction is only the SoC/GPU/memory model.
+    AArch64Switch2,
 };
 
 /// Generic ARMv8 CPU interface

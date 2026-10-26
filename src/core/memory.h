@@ -26,6 +26,16 @@ struct PageTable;
 namespace Core {
 class System;
 class GPUDirtyMemoryManager;
+
+// Switch 2 (Tegra T239) memory layout helpers. The MMU granularity is the
+// same as Switch 1 (4 KB), so the page table machinery applies unchanged; the
+// differences are the DRAM size and the IO region base.
+namespace Switch2Memory {
+inline constexpr std::uint64_t kPhysicalRamBytes = 12ULL * 1024 * 1024 * 1024;
+inline constexpr std::uint64_t kIoRegionBase = 0x50000000ULL; // Tegra MMIO
+inline constexpr unsigned kPageSize = 4096;
+inline constexpr unsigned kPageBits = 12;
+} // namespace Switch2Memory
 } // namespace Core
 
 namespace Kernel {

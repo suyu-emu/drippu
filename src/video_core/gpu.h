@@ -19,6 +19,18 @@ namespace Core {
 class System;
 } // namespace Core
 
+// Switch 2 (Tegra T239) GPU constants. The Switch 2 GPU is Ampere (SM 8.7),
+// not Maxwell - the existing Maxwell3D/MaxwellCompute/MaxwellDMA engines do not
+// apply. This is a placeholder so the rest of the codebase can branch on the
+// target SoC without hard-coding "T239" everywhere.
+namespace Core::Switch2Gpu {
+inline constexpr const char* kGpuArch = "Ampere (T239, SM 8.7)";
+inline constexpr unsigned kGpuSmMajor = 8;
+inline constexpr unsigned kGpuSmMinor = 7;
+inline constexpr bool kIsAmpere = true;
+inline constexpr bool kIsMaxwell = false;
+} // namespace Core::Switch2Gpu
+
 namespace VideoCore {
 class RendererBase;
 class ShaderNotify;
