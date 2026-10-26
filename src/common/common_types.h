@@ -54,3 +54,53 @@ using GPUVAddr = u64; ///< Represents a pointer in the GPU virtual address space
 
 using u128 = std::array<std::uint64_t, 2>;
 static_assert(sizeof(u128) == 16, "u128 must be 128 bits wide");
+
+// -----------------------------------------------------------------------
+// Switch 2 / "Ounce" target support (Tegra T239, Horizon OS FW 23.0.1).
+//
+// Seeded from four clean-room Switch 2 research repositories:
+//   hffgzktbcc-blip/ounce-core  (Tegra T239, Horizon OS FW 23.0.1 ABI)
+//   0xNikilite/oboromi          (proof-of-concept Switch 2 emulator)
+//   pound-emu/pound             (Switch 1 + 2 emulator)
+//   PHENGOX/Switch2Emu          (experimental C++20 Switch 2 emulator)
+//
+// These are architecture descriptors and ABI constants only. Nothing here
+// runs a game; they exist so the rest of suyu (CPU, memory, loader, GPU)
+// can grow a Switch 2 code path incrementally. The GPU is Ampere (SM 8.7),
+// which is the single largest divergence from Switch 1 (Maxwell) and is
+// why the existing video_core cannot be reused as-is.
+// -----------------------------------------------------------------------
+namespace Switch2 {
+// Silicon
+inline constexpr const char* kSoCName = "NVIDIA Tegra T239";
+inline constexpr const char* kCpuCore = "Cortex-A78C";
+inline constexpr const char* kArmArch = "ARMv8.5-A";
+inline constexpr unsigned kCpuCores = 8;
+
+// Horizon OS
+inline constexpr const char* kHorizonFirmware = "23.0.1";
+inline constexpr unsigned kHorizonFirmwareMajor = 23;
+
+// Memory
+inline constexpr unsigned kPageSize = 4096;
+inline constexpr unsigned kPageBits = 12;
+inline constexpr std::uint64_t kPhysicalRamBytes = 12ULL * 1024 * 1024 * 1024;
+
+// GPU
+inline constexpr const char* kGpuArch = "Ampere (T239, SM 8.7)";
+inline constexpr unsigned kGpuSmMajor = 8;
+inline constexpr unsigned kGpuSmMinor = 7;
+
+// Containers (same family as Switch 1; loader reusable)
+inline constexpr bool kContainersCompatibleWithSwitch1 = true;
+
+// Self-check
+constexpr bool VerifyT239Abi() {
+    if (kPageSize != (1u << kPageBits)) return false;
+    if (kCpuCores == 0) return false;
+    if (kHorizonFirmwareMajor < 23) return false;
+    if (kGpuSmMajor == 0) return false;
+    return true;
+}
+static_assert(VerifyT239Abi(), "Switch 2 ABI constants are inconsistent");
+} // namespace Switch2
