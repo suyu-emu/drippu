@@ -939,6 +939,14 @@ struct Values {
     Setting<std::string> update_extra_sources{linkage, "", "update_extra_sources",
                                               Category::Miscellaneous};
 
+    // Switch 2 (Tegra T239) support. When enabled, the loader and GPU backend
+    // treat loaded binaries as Switch 2 targets instead of Switch 1.
+    Setting<bool> switch2_enabled{linkage, false, "switch2_enabled",
+                                 Category::Miscellaneous};
+    Setting<std::uint64_t> switch2_ram_bytes_override{linkage, 0ULL,
+                                                     "switch2_ram_bytes_override",
+                                                     Category::Miscellaneous};
+
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
                                      Category::WebService};

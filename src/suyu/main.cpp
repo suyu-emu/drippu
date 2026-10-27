@@ -204,6 +204,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "suyu/setup_dialog.h"
 #include "suyu/gamer_environment.h"
 #include "suyu/nintendo_account.h"
+#include "suyu/nextendo_controller.h"
+#include "suyu/nextendo_account_dialog.h"
 #include "suyu/external_decryption_tool.h"
 #include "suyu/mods_browser_dialog.h"
 #include "suyu/steam_integration.h"
@@ -1891,6 +1893,7 @@ void GMainWindow::ConnectMenuEvents() {
 
     // Custom features – Tools
     connect_menu(ui->action_Nintendo_Account, &GMainWindow::OnNintendoAccount);
+    connect_menu(ui->action_Nextendo_Account, &GMainWindow::OnNextendoAccount);
     connect_menu(ui->action_Steam_Integration, &GMainWindow::OnSteamIntegration);
 
     // Help
@@ -6072,6 +6075,8 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         OnOpenUserManual();
                     } else if (action == QStringLiteral("nintendo_account")) {
                         OnNintendoAccount();
+                    } else if (action == QStringLiteral("nextendo_account")) {
+                        OnNextendoAccount();
                     } else if (action == QStringLiteral("steam_integration")) {
                         OnSteamIntegration();
                     } else if (action == QStringLiteral("configure")) {
@@ -7928,6 +7933,21 @@ void GMainWindow::OnNintendoAccount() {
     dialog->move(this->geometry().center() - dialog->rect().center());
     dialog->raise();
     dialog->activateWindow();
+}
+
+void GMainWindow::OnNextendoAccount() {
+    // Enable Nextendo account and services for the emulator. The Nextendo
+    // controller is created lazily on first use and owned by this window so
+    // its friend-poll timer and chat connection survive for the session.
+    if (!nextendo_controller) {
+        if (!system) {
+            return;
+        }
+        nextendo_controller = std::make_unique<NextendoController>(*system, this, this);
+    }
+    auto* dialog = new NextendoAccountDialog(nextendo_controller.get(), *system, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->show();
 }
 
 void GMainWindow::OnSteamIntegration() {

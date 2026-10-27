@@ -94,12 +94,32 @@ inline constexpr unsigned kGpuSmMinor = 7;
 // Containers (same family as Switch 1; loader reusable)
 inline constexpr bool kContainersCompatibleWithSwitch1 = true;
 
+// T239 clock domains (MHz) - from ounce-core / oboromi / Switch2Emu.
+inline constexpr unsigned kCpuMaxClockMHz = 1963;
+inline constexpr unsigned kGpuMaxClockMHz = 1228;
+inline constexpr unsigned kEmcMaxClockMHz = 3196;
+
+// T239 memory controller: LPDDR5X, 128-bit bus.
+inline constexpr unsigned kMemoryBusWidthBits = 128;
+inline constexpr unsigned kMemoryChannels = 4;
+
+// Horizon OS Switch 2 (T239) target identifiers used by the loader and
+// service manager to distinguish Switch 2 binaries from Switch 1.
+inline constexpr std::uint32_t kTargetIdSwitch2 = 0x01000000; // T239 SKU family
+inline constexpr std::uint32_t kTargetIdSwitch1 = 0x00000000; // T210/T194/T234
+
+// Switch 2 (T239) GPU is Ampere (SM 8.7) - the existing Maxwell3D/MaxwellCompute/
+// MaxwellDMA engines do NOT apply.
+inline constexpr bool kIsAmpereGpu = true;
+inline constexpr bool kIsMaxwellGpu = false;
+
 // Self-check
 constexpr bool VerifyT239Abi() {
     if (kPageSize != (1u << kPageBits)) return false;
     if (kCpuCores == 0) return false;
     if (kHorizonFirmwareMajor < 23) return false;
     if (kGpuSmMajor == 0) return false;
+    if (kTargetIdSwitch2 == kTargetIdSwitch1) return false;
     return true;
 }
 static_assert(VerifyT239Abi(), "Switch 2 ABI constants are inconsistent");

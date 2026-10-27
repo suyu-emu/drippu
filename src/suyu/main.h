@@ -73,6 +73,7 @@ class UserManualWidget;
 class GameExportDialog;
 class SteamIntegration;
 class NintendoAccountDialog;
+class NextendoController;
 
 enum class StartGameType {
     Normal, // Can use custom configuration
@@ -472,6 +473,7 @@ private slots:
     void OnLaunchRecompiledBuild(const QString& game_name, const std::string& game_path);
     void OnLaunchStaticBuild(const QString& executable);
     void OnNintendoAccount();
+    void OnNextendoAccount();
     void OnSteamIntegration();
     void OnOpenUserManual();
     void OnDisplayTitleBars(bool);
@@ -572,6 +574,7 @@ private:
     std::unique_ptr<Ui::MainWindow> ui;
 
     std::unique_ptr<Core::System> system;
+    std::unique_ptr<NextendoController> nextendo_controller;
     std::unique_ptr<DiscordRPC::DiscordInterface> discord_rpc;
     std::unique_ptr<PlayTime::PlayTimeManager> play_time_manager;
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
