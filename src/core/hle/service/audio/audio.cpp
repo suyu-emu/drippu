@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"
+#include "core/hle/kernel/svc_results.h"
+#include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/audio/audio.h"
 #include "core/hle/service/audio/audio_controller.h"
 #include "core/hle/service/audio/audio_in_manager.h"

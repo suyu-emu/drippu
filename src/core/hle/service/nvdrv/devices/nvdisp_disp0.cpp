@@ -66,6 +66,9 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     output_fences.reserve(sorted_layers.size());
 
     for (auto& layer : sorted_layers) {
+        const auto handle = nvmap.GetHandle(layer.buffer_handle);
+        const auto* session = handle ? container.GetSession(handle->session_id) : nullptr;
+        const bool native_tiling = session && session->process->UsesPAuthReturns();
         output_layers.emplace_back(Tegra::FramebufferConfig{
             .address = nvmap.GetHandleAddress(layer.buffer_handle),
             .offset = layer.offset,

@@ -12,6 +12,7 @@
 
 namespace Kernel {
 class KReadableEvent;
+class KClientSession;
 }
 
 namespace Service::Capture {
@@ -30,6 +31,7 @@ public:
     ~ISelfController() override;
 
 private:
+    void GetGraphicsSupervisor(HLERequestContext& ctx);
     Result Exit();
     Result LockExit();
     Result UnlockExit();

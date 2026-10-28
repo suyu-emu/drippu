@@ -20,6 +20,7 @@
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
+#include "video_core/native_query_trace.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/query_cache/bank_base.h"
@@ -246,6 +247,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    const bool native_trace = gpu_memory->UsesNativeTiling();
+    const u64 trace_asid = gpu_memory->GetID();
+    if (native_trace) TraceNativeQuery(0, trace_asid, addr, cpu_addr, static_cast<u32>(counter_type), payload, static_cast<u32>(flags));
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -287,6 +291,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
         }
+        if (native_trace) TraceNativeQuery(1, trace_asid, addr, cpu_addr, static_cast<u32>(counter_type), query_base->value, static_cast<u32>(query_base->flags));
         if (!is_synced) [[likely]] {
             impl->pending_unregister.push_back(query_location);
         }
