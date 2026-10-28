@@ -129,6 +129,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #endif
 
 #include <fmt/format.h>
+#include "common/cpu_cache_affinity.h"
 #include "common/detached_tasks.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -799,6 +800,10 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
 }
 
 GMainWindow::~GMainWindow() {
+    // QObject children die after C++ members; join while their owners still live.
+    if (game_list) {
+        game_list->ShutdownPopulate();
+    }
     // will get automatically deleted otherwise
     if (render_window->parent() == nullptr) {
         delete render_window;
@@ -2187,6 +2192,8 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
         nullptr,                                             // Net Connect
     });
 
+    // Before Load creates the emulated CPU threads.
+    Common::ApplyLargestCacheAffinity(Settings::values.cache_affinity.GetValue());
     const Core::SystemResultStatus result{
         system->Load(*render_window, filename.toStdString(), params)};
 
@@ -7579,7 +7586,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
 
     // Kernel module names carry an "nn" prefix that the export directories do
     // not ("nnrtld" against "rtld"), so try both spellings.
-    Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
+    Core::SetRecompBaseSetter([](size_t index, const char* module, const char*, u64 base) {
         // Try the name first - it works for rtld - then fall back to load
         // order. A game's own modules are not named after the files they were
         // exported from: main is named after the game ("cross2_Release.nss"),
@@ -8817,6 +8824,9 @@ void GMainWindow::closeEvent(QCloseEvent* event) {
         event->ignore();
         return;
     }
+
+    // Modal callbacks and queued reloads may still unwind after accepted closure.
+    game_list->ShutdownPopulate();
 
     UpdateUISettings();
     game_list->SaveInterfaceLayout();

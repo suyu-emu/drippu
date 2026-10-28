@@ -102,14 +102,21 @@ bool IsRecompFpxReady();
 /// the static pass are module-relative - the loader picks the real base at run
 /// time - so without this every pointer the guest computes is short by that
 /// base and lands near null.
-/// `index` is the module's position in load order, lowest base first. Names
-/// cannot be relied on to identify a module: a game's main NSO is named after
-/// the game ("cross2_Release.nss"), and its sdk and subsdk modules carry names
-/// like "nnSdk" and "multimedia", none of which match the file names the
-/// exporter used. Load order is the same on every title - rtld, main, the
-/// subsdks, then sdk - so the index is what actually lines up.
-using RecompBaseFn = void (*)(size_t index, const char* module, u64 base);
+/// `index` is the module's position in load order, lowest base first, and
+/// `build_id` its build ID as 64 lower-case hex digits (empty if unknown). The
+/// build ID is what identifies a module: names do not (a game's main NSO is
+/// named after the game, "cross2_Release.nss", its others "nnSdk" and
+/// "multimedia"), and neither does a position among the images, because an
+/// export may leave modules out. See RecompGaps::MatchImage.
+using RecompBaseFn = void (*)(size_t index, const char* module, const char* build_id, u64 base);
 void SetRecompBaseSetter(RecompBaseFn setter);
+
+/// Called once per process after the base setter has seen every loaded module
+/// and before the first block runs. Logs any registered image left without a
+/// base and returns how many of those have their module loaded; a strict run
+/// refuses to start when that is nonzero.
+using RecompBindCheckFn = size_t (*)();
+void SetRecompBindCheck(RecompBindCheckFn check);
 
 // Installed only for a stopped, explicitly prepared static-image session.
 using RecompModules = std::map<u64, std::string>;

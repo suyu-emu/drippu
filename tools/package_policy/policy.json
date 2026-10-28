@@ -1,4 +1,16 @@
 {
+  "appimage": {
+    "approved_directories": [ "usr", "usr/(bin|lib|plugins|apprun-hooks|share)", "usr/lib/x86_64-linux-gnu", "usr/plugins/(platforms|platforminputcontexts|imageformats|iconengines|platformthemes|tls|networkinformation|xcbglintegrations|wayland-shell-integration|wayland-decoration-client|wayland-graphics-integration-client)", "usr/share/(applications|icons|suyu|doc)", "usr/share/icons/hicolor(?:/scalable(?:/apps)?)?", "usr/share/doc/suyu(?:/(LICENSES|packaging-tool-licenses))?", "apprun-hooks" ],
+    "provenance_path": "usr/share/suyu/appimage-provenance.json",
+    "required_files": [ "AppRun", "usr/bin/suyu", "usr/bin/suyu-cmd", "usr/share/applications/suyu.desktop", "usr/share/icons/hicolor/scalable/apps/suyu.svg", "usr/share/doc/suyu/LICENSE.txt", "usr/share/doc/suyu/THIRD-PARTY-NOTICES.txt", "usr/share/suyu/distribution-sources.json" ],
+    "runtime_lock_canonical_sha256": "f9d07b0c80bac3ce8f535f015393050d8bcf13643a86b53674fb141c37b85d0f",
+    "runtime_recipe_sha256": "b7d40189c675205c5ccfa5860cd71a113799cb6d8b7d4fb27f1a5dba2cfeeddc",
+    "runtime_sha256": "430be11c9de8e95aebf55232f432fba189735bf17e018e4654e64808c373b561",
+    "runtime_size": 944448,
+    "runtime_source_url": "https://codeload.github.com/AppImage/type2-runtime/tar.gz/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
+    "schema": "suyu-appimage-v1",
+    "source_delivery_lock_canonical_sha256": "ac5d5aba16fb560bbc75dec23cfcf2807737efe60e183b9acefa553b786d5e06"
+  },
   "approved_exceptions": [ {
     "kinds": [ "source" ],
     "path_regex": "suyu-[^/]+-source/externals/breakpad/src/processor/testdata/(ascii_read_av\\.dmp|ascii_read_av_block_write\\.dmp|ascii_read_av_clobber_write\\.dmp|ascii_read_av_conditional\\.dmp|ascii_read_av_then_jmp\\.dmp|ascii_read_av_xchg_write\\.dmp|ascii_write_av\\.dmp|ascii_write_av_arg_to_call\\.dmp|exec_av_on_stack\\.dmp|linux_divide_by_zero\\.dmp|linux_executable_heap\\.dmp|linux_executable_stack\\.dmp|linux_inline\\.dmp|linux_inside_module_exe_region1\\.dmp|linux_inside_module_exe_region2\\.dmp|linux_jmp_to_0\\.dmp|linux_jmp_to_module_not_exe_region\\.dmp|linux_null_dereference\\.dmp|linux_null_read_av\\.dmp|linux_outside_module\\.dmp|linux_overflow\\.dmp|linux_raise_sigabrt\\.dmp|linux_stack_pointer_in_module\\.dmp|linux_stack_pointer_in_stack\\.dmp|linux_stack_pointer_in_stack_alt_name\\.dmp|linux_stacksmash\\.dmp|linux_write_to_nonwritable_module\\.dmp|linux_write_to_nonwritable_region_math\\.dmp|linux_write_to_outside_module\\.dmp|linux_write_to_outside_module_via_math\\.dmp|linux_write_to_under_4k\\.dmp|microdump\\-arm\\.dmp|microdump\\-arm64\\.dmp|microdump\\-mips32\\.dmp|microdump\\-mips64\\.dmp|microdump\\-multiple\\.dmp|microdump\\-withcrashreason\\.dmp|microdump\\-x86\\.dmp|minidump2\\.dmp|minidump_32bit_crash_addr\\.dmp|minidump_crashpad_annotation\\.dmp|null_read_av\\.dmp|null_write_av\\.dmp|read_av_clobber_write\\.dmp|read_av_conditional\\.dmp|read_av_non_null\\.dmp|stack_exhaustion\\.dmp|thread_name_list\\.dmp|tiny\\-exe\\-fastfail\\.dmp|tiny\\-exe\\-with\\-cet\\-xsave\\.dmp|write_av_non_canonical\\.dmp|write_av_non_null\\.dmp)",
@@ -130,12 +142,13 @@
   "policy_version": "suyu-package-policy-1",
   "release_layouts": {
     "android-apk": [ "AndroidManifest\\.xml", "classes[0-9]*\\.dex", "resources\\.arsc", "res/.+", "lib/arm64-v8a/[^/]+\\.so", "META-INF/.+", "assets/.+", "kotlin/.+", "[^/]+\\.properties", "DebugProbesKt\\.bin", "kotlin-tooling-metadata\\.json", "okhttp3/internal/publicsuffix/(NOTICE|publicsuffixes\\.gz)", "org/commonmark/internal/util/entities\\.properties" ],
-    "dependency-sources": [ "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+-]+\\.(tar\\.gz|tar\\.xz))" ],
+    "dependency-sources": [ "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+~-]+\\.(tar\\.gz|tar\\.xz|tar\\.bz2|dsc|diff\\.gz|asc))" ],
     "libretro-android": [ "suyu_libretro_android\\.so", "LICENSE\\.txt", "LICENSES/[^/]+\\.txt", "THIRD-PARTY-NOTICES\\.txt" ],
     "libretro-linux": [ "suyu_libretro\\.so", "LICENSE\\.txt", "LICENSES/[^/]+\\.txt", "THIRD-PARTY-NOTICES\\.txt" ],
     "libretro-macos": [ "suyu_libretro\\.dylib", "suyu_libretro_libs/[^/]+\\.dylib", "LICENSE\\.txt", "LICENSES/[^/]+\\.txt", "THIRD-PARTY-NOTICES\\.txt" ],
     "libretro-windows": [ "suyu_libretro\\.dll", "LICENSE\\.txt", "LICENSES/[^/]+\\.txt", "THIRD-PARTY-NOTICES\\.txt" ],
     "linux": [ "suyu", "suyu-cmd", "LICENSE\\.txt", "LICENSES/[^/]+\\.txt", "THIRD-PARTY-NOTICES\\.txt" ],
+    "linux-appimage": [ "AppRun", "\\.DirIcon", "suyu\\.(desktop|svg)", "usr/bin/(suyu|suyu-cmd|qt\\.conf)", "usr/lib/(?:x86_64-linux-gnu/)?lib[A-Za-z0-9_+.-]+\\.so(?:\\.[0-9]+)*", "usr/plugins/(platforms|platforminputcontexts|imageformats|iconengines|platformthemes|tls|networkinformation|xcbglintegrations|wayland-shell-integration|wayland-decoration-client|wayland-graphics-integration-client)/lib[A-Za-z0-9_+.-]+\\.so(?:\\.[0-9]+)*", "usr/apprun-hooks/[A-Za-z0-9_.-]+\\.sh", "usr/share/applications/suyu\\.desktop", "usr/share/icons/hicolor/scalable/apps/suyu\\.svg", "usr/share/suyu/(appimage-provenance|distribution-sources)\\.json", "usr/share/doc/suyu/(LICENSE\\.txt|THIRD-PARTY-NOTICES\\.txt)", "usr/share/doc/suyu/LICENSES/[A-Za-z0-9_.+-]+\\.txt", "usr/share/doc/suyu/packaging-tool-licenses/[A-Za-z0-9_.+-]+(?:\\.txt|\\.md)?", "apprun-hooks/[A-Za-z0-9_.-]+\\.sh" ],
     "macos": [ "suyu\\.app/.+", "LICENSE\\.txt", "LICENSES/[^/]+\\.txt", "THIRD-PARTY-NOTICES\\.txt", "__MACOSX/.+" ],
     "source": [ "suyu-[^/]+-source/.+" ],
     "windows": [ "suyu\\.exe", "suyu-cmd\\.exe", "vc_redist\\.x64\\.exe", "[^/]+\\.dll", "LICENSE\\.txt", "LICENSES/[^/]+\\.txt", "THIRD-PARTY-NOTICES\\.txt", "export-build-kit/.+", "(plugins|platforms|styles|imageformats|iconengines|tls|generic|networkinformation|multimedia|translations)/.+" ]
@@ -144,6 +157,10 @@
     "description": "Execution metadata; no raw instruction bytes included.",
     "schema": "suyu-shared-coverage",
     "schema_version": 1
+  },
+  "source_fixture_review": {
+    "canonical_sha256": "837ab6670cf4507427c8dda2e1491b4ddadf863d6654e6085608f55f77c4677d",
+    "file": "source-fixtures.lock.json"
   },
   "user_data_path_patterns": [ "(^|/)nand/user/save(/|$)", "(^|/)user/save(/|$)", "(^|/)cache/shader(/|$)", "(^|/)(qt-config|sdl2-config)\\.ini$", "(^|/)config/custom/[0-9a-f]{16}\\.ini$", "(^|/)profiles\\.dat$", "(^|/)(crash_dumps|dump|log)/", "\\.dmp$" ]
 }

@@ -5,6 +5,7 @@
 
 #include <array>
 #include <filesystem>
+#include <string>
 #include <string_view>
 
 #include "common/common_types.h"
@@ -24,6 +25,12 @@ void BeginSession(u64 title_id, bool strict);
 void NoteModule(u64 base, u64 size, std::string_view name, const std::array<u8, 0x20>& build_id);
 void ForgetModule(u64 base);
 void NoteImage(u64 base, std::string_view image_name);
+/// Build ID (64 lower-case hex digits) of the loaded module containing
+/// `address`, as the loader noted it; empty if no noted module contains it.
+std::string ModuleBuildId(u64 address);
+/// Whether the loader noted a module with this build ID (or, when it is
+/// empty, this NSO name) in the current session.
+bool HasLoadedModule(std::string_view build_id, std::string_view name);
 void RecordMiss(u64 pc);
 void RecordUnimplemented(u32 insn);
 
