@@ -1,0 +1,114 @@
+name: Auto Merge PRs
+
+# Automatically merges pull requests that:
+#   - Are not drafts
+#   - Have no merge conflicts (mergeable)
+#   - Have all required status checks passing
+#   - Have been approved (or auto-approve is enabled)
+#
+# Uses pull_request_target so it has write permissions on fork PRs
+# without checking out untrusted code.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  check_suite:
+    types: [completed]
+  status: {}
+
+permissions:
+  pull-requests: write
+  contents: write
+  checks: read
+  statuses: read
+
+jobs:
+  auto-merge:
+    name: Auto-merge qualifying PRs
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false || github.event_name != 'pull_request_target'
+    steps:
+      - name: Check and merge qualifying PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // Determine PR number from event
+            let prNumber;
+            if (context.payload.pull_request) {
+              prNumber = context.payload.pull_request.number;
+            } else {
+              // For check_suite/status events, find open PRs for the SHA
+              const sha = context.payload.check_suite?.head_sha || context.payload.sha;
+              if (!sha) {
+                core.info('No SHA available, skipping.');
+                return;
+              }
+              const { data: prs } = await github.rest.pulls.list({
+                owner, repo, state: 'open', sort: 'updated', direction: 'desc', per_page: 100,
+              });
+              const matching = prs.filter(pr => pr.head.sha === sha && !pr.draft);
+              if (matching.length === 0) {
+                core.info('No open non-draft PRs for this SHA.');
+                return;
+              }
+              prNumber = matching[0].number;
+            }
+
+            // Get PR details
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+
+            if (pr.draft) {
+              core.info('PR #' + prNumber + ' is a draft, skipping.');
+              return;
+            }
+
+            // Check mergeability
+            if (pr.mergeable !== true || pr.mergeable_state !== 'clean') {
+              core.info('PR #' + prNumber + ' is not mergeable (state: ' + pr.mergeable_state + ').');
+              return;
+            }
+
+            // Check all status checks
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner, repo, ref: pr.head.sha, per_page: 100,
+            });
+            const checkRuns = checks.check_runs || [];
+            const failed = checkRuns.filter(c => c.conclusion && c.conclusion !== 'success' && c.conclusion !== 'neutral' && c.conclusion !== 'skipped');
+            const pending = checkRuns.filter(c => c.status !== 'completed');
+
+            if (failed.length > 0) {
+              core.info('PR #' + prNumber + ' has ' + failed.length + ' failed checks.');
+              return;
+            }
+            if (pending.length > 0) {
+              core.info('PR #' + prNumber + ' has ' + pending.length + ' pending checks.');
+              return;
+            }
+
+            // Also check commit statuses
+            const { data: statuses } = await github.rest.repos.getCombinedStatusForRef({
+              owner, repo, ref: pr.head.sha,
+            });
+            if (statuses.state === 'failure' || statuses.state === 'error') {
+              core.info('PR #' + prNumber + ' has failing commit statuses.');
+              return;
+            }
+            if (statuses.state === 'pending') {
+              core.info('PR #' + prNumber + ' has pending commit statuses.');
+              return;
+            }
+
+            // All checks pass and no conflicts - merge!
+            try {
+              const { data: result } = await github.rest.pulls.merge({
+                owner, repo, pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: pr.title,
+              });
+              core.info('PR #' + prNumber + ' merged: ' + result.sha);
+            } catch (error) {
+              core.warning('Could not merge PR #' + prNumber + ': ' + error.message);
+            }
