@@ -246,6 +246,19 @@ struct MacroEngine {
     ankerl::unordered_dense::map<u32, CacheInfo> macro_cache;
     ankerl::unordered_dense::map<u32, std::vector<u32>> uploaded_macro_code;
     bool is_interpreted;
+    bool native_turing{};
+    bool native_execution_failed{};
+    u32 native_write_offset{};
+    std::array<u32, 0x3000> native_code{};
+    TuringMacroInterpreter native_interpreter;
+
+};
+
+struct NativeMacroContext {
+    MacroEngine engine{true};
+    std::array<u32, 0x80> positions{};
+    MacroEngine compute_engine{true};
+    std::array<u32, 0x80> compute_positions{};
 };
 
 } // namespace Tegra

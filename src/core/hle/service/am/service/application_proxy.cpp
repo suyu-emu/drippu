@@ -122,4 +122,18 @@ Result IApplicationProxy::GetGraphicsScalingParametersFunctions(
     R_SUCCEED();
 }
 
+Result IApplicationProxy::GetPerformanceFunctions(
+    Out<SharedPointer<IPerformanceFunctions>> out_functions) {
+    LOG_DEBUG(Service_AM, "called");
+    *out_functions = std::make_shared<IPerformanceFunctions>(system);
+    R_SUCCEED();
+}
+
+Result IApplicationProxy::GetGraphicsScalingParametersFunctions(
+    Out<SharedPointer<IGraphicsScalingParametersFunctions>> out_functions) {
+    LOG_DEBUG(Service_AM, "called");
+    *out_functions = std::make_shared<IGraphicsScalingParametersFunctions>(system, m_applet);
+    R_SUCCEED();
+}
+
 } // namespace Service::AM
