@@ -48,6 +48,8 @@ public:
     size_t GetID() const {
         return unique_identifier;
     }
+    bool UsesNativeTiling() const { return native_tiling; }
+    void SetNativeSyncpointShim(GPUVAddr address);
 
     /// Binds a renderer to the memory manager.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
@@ -242,6 +244,7 @@ private:
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
+    std::atomic<GPUVAddr> native_syncpoint_shim{};
     mutable std::mutex guard;
 
     static constexpr size_t continuous_bits = 64;

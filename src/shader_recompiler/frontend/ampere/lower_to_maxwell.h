@@ -1168,7 +1168,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
         case 0x220: case 0x820: case 0xa20: case 0xc20: { // FMUL
             const u32 scale = insn.Bits(84, 3);
             if (insn.Bits(76, 1) || (scale != 3 && scale != 4 && scale != 5 && scale != 6) || insn.Bits(81, 3) ||
-                insn.Bits(87, 4) || insn.Bits(91, 1) != (opcode == 0xc20) ||
+                insn.Bits(87, 4) || static_cast<int>(insn.Bits(91, 1)) != (opcode == 0xc20 ? 1 : 0) ||
                 (scale != 4 && (!insn.Bits(80, 1) || insn.Bits(78, 2))))
                 return fail(index, "native FMUL scale/mode");
             const u32 a = operand(0), b = operand(1);
@@ -1177,7 +1177,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             break;
         }
         case 0x221: case 0x421: case 0x621: case 0x821: case 0xa21: case 0xe21: { // FADD
-            if (insn.Bits(81, 10) || insn.Bits(91, 1) != (opcode == 0xe21)) return fail(index, "native FADD mode");
+            if (insn.Bits(81, 10) || static_cast<int>(insn.Bits(91, 1)) != (opcode == 0xe21 ? 1 : 0)) return fail(index, "native FADD mode");
             const u32 a = operand(0), b = operand(insn.Bits(9, 3) == 2 || insn.Bits(9, 3) == 3 || insn.Bits(9, 3) == 7 ? 2 : 1);
             emit(base(0x5c58000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
                 (u64{insn.Bits(78, 2)} << 39) | (u64{insn.Bits(80, 1)} << 44) | (u64{insn.Bits(77, 1)} << 50));

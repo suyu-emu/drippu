@@ -861,7 +861,7 @@ void TextureCache<P>::CommitAsyncFlushes() {
     // This is intentionally passing the value by copy
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         auto& download_ids = uncommitted_downloads;
-        const size_t redundant_images = DeduplicatePendingImageDownloads(download_ids, slot_images);
+        (void)DeduplicatePendingImageDownloads(download_ids, slot_images);
         if (download_ids.empty()) {
             committed_downloads.emplace_back(std::move(uncommitted_downloads));
             uncommitted_downloads.clear();

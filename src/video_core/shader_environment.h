@@ -191,6 +191,8 @@ public:
 
     [[nodiscard]] u32 ReadViewportTransformState() override;
 
+    [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+
     [[nodiscard]] u32 LocalMemorySize() const override;
 
     [[nodiscard]] u32 SharedMemorySize() const override;

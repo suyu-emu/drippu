@@ -23,10 +23,6 @@
 
 namespace Tegra {
 
-bool MemoryManager::IsShuttingDown() const {
-    return system.IsShuttingDown();
-}
-
 using Tegra::Memory::GuestMemoryFlags;
 
 std::atomic<size_t> MemoryManager::unique_identifier_generator{};

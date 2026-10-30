@@ -25,6 +25,16 @@
 
 namespace Tegra::Engines {
 
+static u32 ReadNativeSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
+    const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (cpu_address && dma_pusher.rasterizer->MustFlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
+        dma_pusher.rasterizer->FlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        const u32 value = dma_pusher.memory_manager.Read<u32>(address);
+        return value;
+    }
+    return dma_pusher.memory_manager.Read<u32>(address);
+}
+
 void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
     // Bind the current subchannel to the desired engine id.
     LOG_DEBUG(HW_GPU, "Binding subchannel {} to engine {}", method_call.subchannel, method_call.argument);
@@ -79,7 +89,7 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 }
 
 bool Puller::CanResumeNativeAcquire(DmaPusher& dma_pusher) const {
-    return native_acquire && !dma_pusher.memory_manager.IsShuttingDown() &&
+    return native_acquire &&
            native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address));
 }
 

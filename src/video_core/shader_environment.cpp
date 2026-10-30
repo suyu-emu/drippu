@@ -374,7 +374,7 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
             LOG_WARNING(Shader, "Native shader paused: key={}, offset={:#x}, reason={}, source={}",
                         key, lowered.error_offset, lowered.error, source_path.string());
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes{30};
-            while (!gpu_memory->IsShuttingDown() && std::chrono::steady_clock::now() < deadline) {
+            while (std::chrono::steady_clock::now() < deadline) {
                 if (std::filesystem::exists(override_path)) {
                     std::ifstream file(override_path, std::ios::binary | std::ios::ate);
                     const auto length = file.tellg();
