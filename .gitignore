@@ -95,4 +95,3 @@ vcpkg_installed/
 __pycache__/
 # Local, machine-specific CMake presets
 CMakeUserPresets.json
-_ref_citron_nextendo/
