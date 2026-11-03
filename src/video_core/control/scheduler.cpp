@@ -10,7 +10,6 @@
 
 #include "common/assert.h"
 #include "video_core/control/channel_state.h"
-#include "video_core/native_semaphore.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 
