@@ -806,12 +806,15 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
             if (!configured_path.empty()) {
                 // Relative folders belong to a portable installation; resolve them against the
                 // executable's folder rather than whatever the working directory happens to be.
+                // Portable installations only exist on Windows (GetExeDirectory is Windows-only).
                 std::string dir_path = configured_path;
+#ifdef _WIN32
                 if (!std::filesystem::path{Common::FS::ToU8String(dir_path)}.is_absolute()) {
                     dir_path = Common::FS::PathToUTF8String(
                         Common::FS::GetExeDirectory() /
                         std::filesystem::path{Common::FS::ToU8String(dir_path)});
                 }
+#endif
                 LOG_DEBUG(Service_FS, "Attempting to open directory: {}", dir_path);
                 auto dir = vfs.OpenDirectory(dir_path, FileSys::OpenMode::Read);
                 if (dir != nullptr) {
