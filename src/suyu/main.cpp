@@ -144,7 +144,6 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <DbgHelp.h>
 #include <shlobj.h>
 #include "common/windows/timer_resolution.h"
-#pragma comment(lib, "Dbghelp.lib")
 #endif
 #include "common/cpu_features.h"
 #include "common/settings.h"
@@ -4276,6 +4275,10 @@ void GMainWindow::HideFullscreen() {
             render_window->show();
         }
     }
+    // Leaving fullscreen means the UI is visible.
+    // Keep the mouse cursor visible while using the UI.
+    ShowMouseCursor();
+    mouse_hide_timer.stop();
 }
 
 void GMainWindow::ToggleWindowMode() {
@@ -6660,8 +6663,10 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
     const bool show_debug = (mode == AppMode::Hacker) && !emulation_running;
     [[maybe_unused]] const bool show_partial_debug = false;
 
+#if MICROPROFILE_ENABLED
     if (microProfileDialog)
         microProfileDialog->setVisible(show_debug);
+#endif
     if (waitTreeWidget)
         waitTreeWidget->setVisible(show_debug);
     // The controller view is hidden with the rest of the debug panes but never
@@ -8685,9 +8690,15 @@ void GMainWindow::HideMouseCursor() {
 }
 
 void GMainWindow::ShowMouseCursor() {
-    render_window->unsetCursor();
-    if (emu_thread != nullptr && UISettings::values.hide_mouse) {
+    render_window->setCursor(QCursor(Qt::ArrowCursor));
+
+    // Only auto-hide the cursor while actually in fullscreen gameplay.
+    // In windowed/UI mode (for example after F11), keep it visible.
+    if (emu_thread != nullptr && UISettings::values.hide_mouse &&
+        ui->action_Fullscreen->isChecked()) {
         mouse_hide_timer.start();
+    } else {
+        mouse_hide_timer.stop();
     }
 }
 

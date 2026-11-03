@@ -10,6 +10,8 @@ add_library(suyu_libretro SHARED
 
 target_link_libraries(suyu_libretro PRIVATE common core input_common frontend_common audio_core network)
 target_link_libraries(suyu_libretro PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
+# The Vulkan types of RetroArch's HW render interface (libretro_vulkan.h)
+target_link_libraries(suyu_libretro PRIVATE Vulkan::Headers)
 
 # crueter-ci OpenSSL 4.0.0's static libcrypto.a references poly1305_blocks_sve2
 # with an ADRP relocation (openssl/openssl#31670). LLD rejects that in a shared

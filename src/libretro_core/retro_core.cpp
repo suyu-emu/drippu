@@ -65,7 +65,9 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
+#include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
+#include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/drivers/tas_input.h"
 #include "input_common/main.h"
@@ -76,6 +78,9 @@
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/vulkan_common/vulkan_external.h"
+// After vulkan_external.h, which sets VK_NO_PROTOTYPES: the core types, no platform headers
+#include "libretro_core/libretro_vulkan.h"
 
 namespace {
 
@@ -248,7 +253,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     static const struct retro_variable vars[] = {
         // This headless readback window only implements Vulkan. Advertising
         // other renderers would claim an option that cannot take effect.
-        {"suyu_resolution", "Internal Resolution (reload content); 1x|2x|3x|4x"},
+        {"suyu_resolution", "Internal Resolution (reload content); 1x|0.25x|0.5x|0.75x|2x|3x|4x"},
         {"suyu_scaling_filter", "Window Adapting Filter (reload content); Bilinear|Bicubic|Lanczos|ScaleForce|FSR|NearestNeighbor"},
         {"suyu_anti_aliasing", "Anti-Aliasing (reload content); None|FXAA|SMAA"},
         {"suyu_cpu_accuracy", "CPU Accuracy (reload content); Auto|Accurate|Unsafe"},
@@ -276,6 +281,17 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     // instead of being offered and then failing mid-session.
     uint64_t quirks = RETRO_SERIALIZATION_QUIRK_INCOMPLETE;
     cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &quirks);
+
+    // Four players, each a Pro Controller or nothing; RetroArch lists these per
+    // port under Controls, and None takes a port's input away from the game
+    static const struct retro_controller_description pads[] = {
+        {"Pro Controller", RETRO_DEVICE_JOYPAD},
+        {"None", RETRO_DEVICE_NONE},
+    };
+    static const struct retro_controller_info ports[] = {
+        {pads, 2}, {pads, 2}, {pads, 2}, {pads, 2}, {nullptr, 0},
+    };
+    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) {
@@ -421,7 +437,24 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info) {
     info->timing.sample_rate = 48000.0;
 }
 
-RETRO_API void retro_set_controller_port_device(unsigned /*port*/, unsigned /*device*/) {}
+namespace {
+constexpr unsigned kMaxPlayers = 4;
+// What RetroArch has on each port: RETRO_DEVICE_JOYPAD or RETRO_DEVICE_NONE
+unsigned g_port_device[kMaxPlayers] = {RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD,
+                                       RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD};
+// Players 2-4 the core has connected. Player 1 is connected by suyu's own
+// defaults; the others are not, and connecting all of them at the start
+// would show every game four controllers whether or not anyone holds them.
+// So a player's controller is connected when its port is first used, as
+// plugging one in on the console, and disconnected when the port is set to None.
+bool g_player_connected[kMaxPlayers] = {};
+} // namespace
+
+RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) {
+    if (port < kMaxPlayers) {
+        g_port_device[port] = device == RETRO_DEVICE_NONE ? RETRO_DEVICE_NONE : RETRO_DEVICE_JOYPAD;
+    }
+}
 
 RETRO_API void retro_reset() {
     LOG_WARNING(Frontend, "libretro core: retro_reset() requested but not yet implemented "
@@ -452,7 +485,250 @@ constexpr RetroToVirtual kButtonMap[] = {
     {RETRO_DEVICE_ID_JOYPAD_LEFT, VB::ButtonLeft},
     {RETRO_DEVICE_ID_JOYPAD_RIGHT, VB::ButtonRight},
 };
-bool g_prev_buttons[20] = {};
+bool g_prev_buttons[kMaxPlayers][20] = {};
+
+// The Switch's names for what each RetroPad input does, so RetroArch can show
+// and remap them (without these it hides every input as unbound)
+void SetInputDescriptors() {
+    static const char* const names[][2] = {
+        {"A", nullptr}, {"B", nullptr}, {"X", nullptr}, {"Y", nullptr}, {"L", nullptr},
+        {"R", nullptr}, {"ZL", nullptr}, {"ZR", nullptr}, {"Left Stick Press", nullptr},
+        {"Right Stick Press", nullptr}, {"+", nullptr}, {"-", nullptr}, {"D-Pad Up", nullptr},
+        {"D-Pad Down", nullptr}, {"D-Pad Left", nullptr}, {"D-Pad Right", nullptr},
+    };
+    static_assert(std::size(names) == std::size(kButtonMap));
+    std::vector<retro_input_descriptor> descriptors;
+    for (unsigned port = 0; port < kMaxPlayers; ++port) {
+        for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+            descriptors.push_back({port, RETRO_DEVICE_JOYPAD, 0, kButtonMap[i].retro_id, names[i][0]});
+        }
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+                               RETRO_DEVICE_ID_ANALOG_X, "Left Stick X"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+                               RETRO_DEVICE_ID_ANALOG_Y, "Left Stick Y"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                               RETRO_DEVICE_ID_ANALOG_X, "Right Stick X"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                               RETRO_DEVICE_ID_ANALOG_Y, "Right Stick Y"});
+    }
+    descriptors.push_back({0, 0, 0, 0, nullptr});
+    g_environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, descriptors.data());
+}
+
+// A player's Pro Controller plugged in or pulled out (players 2-4)
+void SetPlayerConnected(unsigned player, bool connected) {
+    if (g_player_connected[player] == connected) {
+        return;
+    }
+    auto* controller = g_system->HIDCore().GetEmulatedControllerByIndex(player);
+    if (!controller) {
+        return;
+    }
+    if (connected) {
+        controller->SetNpadStyleIndex(Core::HID::NpadStyleIndex::Fullkey);
+        controller->Connect();
+    } else {
+        controller->Disconnect();
+    }
+    g_player_connected[player] = connected;
+    LOG_INFO(Frontend, "libretro: player {} {}", player + 1, connected ? "connected" : "disconnected");
+}
+} // namespace
+
+
+// ---------------------------------------------------------------------------
+// Vulkan presentation through the frontend's context (RETRO_HW_CONTEXT_VULKAN).
+//
+// The frontend makes the instance and, through context negotiation v2, the device
+// with the renderer's create info plus what it needs itself; the renderer works on
+// that device (Vulkan::External), takes the frontend's queue lock around its
+// submits and hands each finished frame over as an image, given to the frontend
+// with set_image from retro_run. No frame is read back to the CPU. The game only
+// starts once the device exists, so retro_load_game leaves that to create_device2.
+// Without negotiation v2 the core reads frames back as before.
+// ---------------------------------------------------------------------------
+namespace {
+bool g_vulkan_present = false;     // the frontend took the HW render request
+bool g_start_deferred = false;     // retro_load_game left the start to create_device2
+retro_hw_render_interface_vulkan* g_vulkan = nullptr;
+std::array<retro_vulkan_image, 8> g_vulkan_images{};  // per slot; the frontend keeps the pointer
+bool StartLoadedGame();
+
+retro_hw_render_interface_vulkan* CurrentVulkanInterface() {
+    // Asked every frame: RetroArch rebuilds its video driver behind the core's back
+    // (fullscreen toggle) and frees the interface it handed out before.
+    retro_hw_render_interface* iface = nullptr;
+    if (!g_environ_cb ||
+        !g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &iface) || !iface ||
+        iface->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN) {
+        return nullptr;
+    }
+    return reinterpret_cast<retro_hw_render_interface_vulkan*>(iface);
+}
+
+void UseVulkanInterface(retro_hw_render_interface_vulkan* vulkan) {
+    if (vulkan == g_vulkan) {
+        return;
+    }
+    g_vulkan = vulkan;
+    if (vulkan) {
+        Vulkan::External::SetQueueLock([vulkan] { vulkan->lock_queue(vulkan->handle); },
+                                       [vulkan] { vulkan->unlock_queue(vulkan->handle); });
+    } else {
+        Vulkan::External::SetQueueLock(nullptr, nullptr);
+    }
+}
+
+void OnVulkanContextReset() {
+    UseVulkanInterface(CurrentVulkanInterface());
+}
+
+void OnVulkanContextDestroy() {
+    UseVulkanInterface(nullptr);
+}
+
+const VkApplicationInfo* GetVulkanApplicationInfo() {
+    static const VkApplicationInfo info{
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pNext = nullptr,
+        .pApplicationName = "suyu",
+        .applicationVersion = 0,
+        .pEngineName = "suyu",
+        .engineVersion = 0,
+        .apiVersion = VK_API_VERSION_1_3,
+    };
+    return &info;
+}
+
+// Negotiation v1 cannot pass the renderer's create info to the frontend; only v2 is offered
+bool CreateVulkanDeviceV1(retro_vulkan_context*, VkInstance, VkPhysicalDevice, VkSurfaceKHR,
+                          PFN_vkGetInstanceProcAddr, const char**, unsigned, const char**,
+                          unsigned, const VkPhysicalDeviceFeatures*) {
+    return false;
+}
+
+bool CreateVulkanDevice2(retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu,
+                         VkSurfaceKHR, PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                         retro_vulkan_create_device_wrapper_t create_device_wrapper,
+                         void* opaque) {
+    if (gpu == VK_NULL_HANDLE) {
+        // The frontend leaves the choice to the core: the first device
+        const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+            get_instance_proc_addr(instance, "vkEnumeratePhysicalDevices"));
+        u32 count = 1;
+        if (!enumerate || enumerate(instance, &count, &gpu) < 0 || count == 0) {
+            LOG_CRITICAL(Frontend, "libretro: no Vulkan device to run on");
+            return false;
+        }
+    }
+    auto& external = Vulkan::External::GetContext();
+    external = {};
+    external.get_instance_proc_addr = get_instance_proc_addr;
+    external.instance = instance;
+    external.gpu = gpu;
+    external.create_device = [create_device_wrapper, opaque](VkPhysicalDevice physical,
+                                                             const VkDeviceCreateInfo* info) {
+        return create_device_wrapper(physical, opaque, info);
+    };
+    Vulkan::External::SetActive(true);
+    Vulkan::External::ResetFrames();
+
+    // The game starts here, so that the renderer makes its device through the frontend
+    const bool started = !g_start_deferred || StartLoadedGame();
+    g_start_deferred = false;
+    external.create_device = nullptr;
+    if (!started || external.device == VK_NULL_HANDLE) {
+        Vulkan::External::SetActive(false);
+        return false;
+    }
+    context->gpu = gpu;
+    context->device = external.device;
+    context->queue = external.queue;
+    context->queue_family_index = external.queue_family;
+    context->presentation_queue = external.queue;
+    context->presentation_queue_family_index = external.queue_family;
+    return true;
+}
+
+void DestroyVulkanDevice() {
+    // The frontend destroys the device it made; the renderer is gone by now (retro_unload_game)
+    UseVulkanInterface(nullptr);
+    Vulkan::External::SetActive(false);
+}
+
+// Asks the frontend for a Vulkan context made through negotiation v2. False leaves the
+// core on the read-back path.
+bool RequestVulkanPresent() {
+    retro_hw_render_context_negotiation_interface support{
+        RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 0};
+    if (!g_environ_cb ||
+        !g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT,
+                      &support) ||
+        support.interface_version < 2) {
+        LOG_INFO(Frontend, "libretro: no Vulkan context negotiation v2, frames are read back");
+        return false;
+    }
+    static retro_hw_render_callback hw_render{};
+    hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+    hw_render.version_major = VK_API_VERSION_1_3;
+    hw_render.version_minor = 0;
+    hw_render.context_reset = OnVulkanContextReset;
+    hw_render.context_destroy = OnVulkanContextDestroy;
+    // The renderer cannot move to another device: RetroArch keeps this one when it rebuilds
+    // its video driver (a fullscreen toggle, a driver setting) instead of destroying it
+    // under the running renderer. Its interface is asked for every frame anyway.
+    hw_render.cache_context = true;
+    if (!g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render)) {
+        LOG_INFO(Frontend, "libretro: the frontend has no Vulkan context, frames are read back");
+        return false;
+    }
+    static retro_hw_render_context_negotiation_interface_vulkan negotiation{};
+    negotiation.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+    negotiation.interface_version = 2;
+    negotiation.get_application_info = GetVulkanApplicationInfo;
+    negotiation.create_device = CreateVulkanDeviceV1;
+    negotiation.destroy_device = DestroyVulkanDevice;
+    negotiation.create_instance = nullptr;
+    negotiation.create_device2 = CreateVulkanDevice2;
+    g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, &negotiation);
+    LOG_INFO(Frontend, "libretro: frames are handed to the frontend's Vulkan context");
+    return true;
+}
+
+// retro_run: the newest finished frame to the frontend, or a repeat of the last one
+void PresentVulkanFrame() {
+    auto* vulkan = CurrentVulkanInterface();
+    UseVulkanInterface(vulkan);
+    ++g_perf_frontend_frames;
+    Vulkan::External::Frame frame;
+    if (vulkan && Vulkan::External::Consume(frame)) {
+        auto& image = g_vulkan_images[frame.slot % g_vulkan_images.size()];
+        image = {};
+        image.image_view = frame.view;
+        image.image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        image.create_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = frame.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = frame.format,
+            .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        vulkan->set_image(vulkan->handle, &image, 0, nullptr, vulkan->queue_index);
+        Vulkan::External::MarkShown(frame.slot);
+        ++g_perf_unique_frames;
+        g_have_presented = true;
+        g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, frame.width, frame.height, 0);
+        return;
+    }
+    // Nothing new: the frontend repeats the last image
+    auto& renderer = g_system->Renderer();
+    g_video_cb(g_have_presented ? RETRO_HW_FRAME_BUFFER_VALID : nullptr,
+               renderer.GetHeadlessWidth(), renderer.GetHeadlessHeight(), 0);
+}
 } // namespace
 
 RETRO_API void retro_run() {
@@ -532,26 +808,51 @@ RETRO_API void retro_run() {
         g_input_poll_cb();
     }
 
-    // Bridge libretro input to suyu HID via VirtualGamepad.
+    // Bridge libretro input to suyu HID via VirtualGamepad, a port per player.
     if (g_input_state_cb && g_input_subsystem && g_game_loaded) {
         auto* vgp = g_input_subsystem->GetVirtualGamepad();
         if (vgp) {
-            for (const auto& m : kButtonMap) {
-                const bool pressed = g_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, m.retro_id) != 0;
-                const int idx = static_cast<int>(m.virtual_button);
-                if (pressed != g_prev_buttons[idx]) {
-                    g_prev_buttons[idx] = pressed;
-                    vgp->SetButtonState(0, m.virtual_button, pressed);
+            using VS = InputCommon::VirtualGamepad::VirtualStick;
+            for (unsigned port = 0; port < kMaxPlayers; ++port) {
+                if (g_port_device[port] == RETRO_DEVICE_NONE) {
+                    if (port > 0) {
+                        SetPlayerConnected(port, false);
+                    }
+                    continue;
                 }
+                const auto axis = [port](unsigned index, unsigned id) {
+                    return g_input_state_cb(port, RETRO_DEVICE_ANALOG, index, id) / 32768.0f;
+                };
+                const float lx = axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+                const float ly = -axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+                const float rx = axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+                const float ry = -axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+                bool pressed[std::size(kButtonMap)];
+                bool any = false;
+                for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+                    pressed[i] = g_input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, kButtonMap[i].retro_id) != 0;
+                    any = any || pressed[i];
+                }
+                if (port > 0 && !g_player_connected[port]) {
+                    // Not plugged in until someone uses it: a button, or a stick
+                    // pushed past where a resting stick drifts to
+                    constexpr float kWake = 0.5f;
+                    if (!any && std::abs(lx) < kWake && std::abs(ly) < kWake &&
+                        std::abs(rx) < kWake && std::abs(ry) < kWake) {
+                        continue;
+                    }
+                    SetPlayerConnected(port, true);
+                }
+                for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+                    const int idx = static_cast<int>(kButtonMap[i].virtual_button);
+                    if (pressed[i] != g_prev_buttons[port][idx]) {
+                        g_prev_buttons[port][idx] = pressed[i];
+                        vgp->SetButtonState(port, kButtonMap[i].virtual_button, pressed[i]);
+                    }
+                }
+                vgp->SetStickPosition(port, VS::Left, lx, ly);
+                vgp->SetStickPosition(port, VS::Right, rx, ry);
             }
-            // Left analog stick
-            const float lx = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X) / 32768.0f;
-            const float ly = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y) / -32768.0f;
-            vgp->SetStickPosition(0, InputCommon::VirtualGamepad::VirtualStick::Left, lx, ly);
-            // Right analog stick
-            const float rx = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X) / 32768.0f;
-            const float ry = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y) / -32768.0f;
-            vgp->SetStickPosition(0, InputCommon::VirtualGamepad::VirtualStick::Right, rx, ry);
         }
     }
 
@@ -591,12 +892,28 @@ RETRO_API void retro_run() {
         }
 
         const size_t frames = std::min(kFramesPerCall, pending.size() / 2);
+
+        // Audio out streams (a movie's sound) are played here, a frame's worth
+        // each run, mixed over the renderer's output: playing them is what
+        // releases the game's buffers. With them the frontend gets a full
+        // frame's worth, the renderer's part padded with silence.
+        static std::vector<s16> out;
+        out.assign(kFramesPerCall * 2, 0);
+        std::copy_n(pending.begin(), frames * 2, out.begin());
+        const bool mixed = AudioCore::Sink::LibretroSink::MixOut(out, kFramesPerCall);
+        const size_t send = mixed ? kFramesPerCall : frames;
+        if (send > 0) {
+            g_audio_batch_cb(out.data(), send);
+        }
         if (frames > 0) {
-            g_audio_batch_cb(pending.data(), frames);
             pending.erase(pending.begin(), pending.begin() + static_cast<ptrdiff_t>(frames * 2));
         }
     }
 
+    if (g_video_cb && g_system && g_game_loaded && Vulkan::External::IsActive()) {
+        PresentVulkanFrame();
+        return;
+    }
     if (g_video_cb && g_system && g_game_loaded) {
         auto& renderer = g_system->Renderer();
         if (renderer.IsHeadless()) {
@@ -672,6 +989,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
                      !!g_system, !!g_emu_window, !!game, game ? !!game->path : false);
         return false;
     }
+
+    SetInputDescriptors();
 
     g_game_path = game->path;
     // need_fullpath makes content availability the core's responsibility. Avoid
@@ -792,7 +1111,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
             const std::string v(var.value);
             auto res = Settings::ResolutionSetup::Res1X;
-            if (v == "2x") res = Settings::ResolutionSetup::Res2X;
+            // Below 1x for a GPU that cannot keep up at the game's own resolution
+            if (v == "0.25x") res = Settings::ResolutionSetup::Res1_4X;
+            else if (v == "0.5x") res = Settings::ResolutionSetup::Res1_2X;
+            else if (v == "0.75x") res = Settings::ResolutionSetup::Res3_4X;
+            else if (v == "2x") res = Settings::ResolutionSetup::Res2X;
             else if (v == "3x") res = Settings::ResolutionSetup::Res3X;
             else if (v == "4x") res = Settings::ResolutionSetup::Res4X;
             Settings::values.resolution_setup.SetValue(res);
@@ -920,6 +1243,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         g_tas_playback = true;
     }
 
+    // With the frontend's Vulkan context the game starts in create_device2, where the renderer
+    // can make its device through the frontend; otherwise here, reading frames back
+    g_vulkan_present = RequestVulkanPresent();
+    if (g_vulkan_present) {
+        g_start_deferred = true;
+        return true;
+    }
+    return StartLoadedGame();
+}
+
+namespace {
+bool StartLoadedGame() {
     Service::AM::FrontendAppletParameters load_parameters{};
     load_parameters.applet_id = Service::AM::AppletId::Application;
 
@@ -972,6 +1307,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     LOG_INFO(Frontend, "libretro core: game loaded and running");
     return true;
 }
+} // namespace
 
 RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retro_game_info* /*info*/,
                                        size_t /*num_info*/) {
@@ -981,6 +1317,13 @@ RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retr
 RETRO_API void retro_unload_game() {
     g_sample_perf = false;
     g_have_presented = false;
+    g_start_deferred = false;
+    if (g_vulkan) {
+        // The frontend repeats the last image; take it back and let the frontend finish with
+        // it before the renderer that owns it goes
+        g_vulkan->set_image(g_vulkan->handle, nullptr, 0, nullptr, g_vulkan->queue_index);
+        g_vulkan->wait_sync_index(g_vulkan->handle);
+    }
     if (g_system && g_game_loaded) {
         g_system->ShutdownMainProcess();
     }
@@ -996,6 +1339,11 @@ RETRO_API void retro_unload_game() {
     }
     g_tas_playback = false;
     g_game_loaded = false;
+    // The next title starts with only player 1, and every button up
+    std::fill(std::begin(g_player_connected), std::end(g_player_connected), false);
+    for (auto& buttons : g_prev_buttons) {
+        std::fill(std::begin(buttons), std::end(buttons), false);
+    }
     g_game_path.clear();
     if (g_explicit_provider) {
         g_system->RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
