@@ -62,7 +62,6 @@ private:
     std::string name;
     u64 title_id{};
     bool override_update;
-    bool standalone{true};
 
     Modules modules;
 };
