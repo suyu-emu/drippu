@@ -24,9 +24,7 @@ namespace Service::Nvidia::Devices {
 /// implement the ioctl interface.
 class nvdevice {
 public:
-    enum class Type { Other, GpuChannel, GpuTsg, GpuAddressSpace };
-    explicit nvdevice(Core::System& system_, Type type_ = Type::Other) : system{system_}, type{type_} {}
-    Type GetType() const { return type; }
+    explicit nvdevice(Core::System& system_) : system{system_} {}
     virtual ~nvdevice() = default;
 
     /**
@@ -79,8 +77,6 @@ public:
 
 protected:
     Core::System& system;
-private:
-    const Type type;
 };
 
 } // namespace Service::Nvidia::Devices

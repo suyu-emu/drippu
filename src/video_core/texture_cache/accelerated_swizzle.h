@@ -20,7 +20,6 @@ struct BlockLinearSwizzle2DParams {
     u32 x_shift;
     u32 block_height;
     u32 block_height_mask;
-    u32 native_tiling;
 };
 
 struct BlockLinearSwizzle3DParams {
@@ -34,7 +33,6 @@ struct BlockLinearSwizzle3DParams {
     u32 block_height_mask;
     u32 block_depth;
     u32 block_depth_mask;
-    u32 native_tiling;
 };
 
 [[nodiscard]] BlockLinearSwizzle2DParams MakeBlockLinearSwizzle2DParams(

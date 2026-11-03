@@ -2072,8 +2072,7 @@ Result KPageTableBase::SetMemoryAttribute(KProcessAddress addr, size_t size, KMe
     constexpr KMemoryAttribute AttributeTestMask =
         ~(KMemoryAttribute::SetMask | KMemoryAttribute::DeviceShared);
     const KMemoryState state_test_mask =
-        (True(mask & (KMemoryAttribute::Uncached | KMemoryAttribute::GpuAccessible))
-             ? KMemoryState::FlagCanChangeAttribute
+        (True(mask & KMemoryAttribute::Uncached) ? KMemoryState::FlagCanChangeAttribute
                                                  : KMemoryState::None) |
         (True(mask & KMemoryAttribute::PermissionLocked) ? KMemoryState::FlagCanPermissionLock
                                                          : KMemoryState::None);

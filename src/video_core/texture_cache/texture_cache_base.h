@@ -27,7 +27,6 @@
 #include <ranges>
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
-#include "video_core/texture_cache/pending_download.h"
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
@@ -464,7 +463,11 @@ private:
         size_t size;
     };
 
-    using PendingDownload = PendingImageDownload<Image>;
+    struct PendingDownload {
+        bool is_swizzle;
+        size_t async_buffer_id;
+        Common::SlotId object_id;
+    };
 
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageMapView> slot_map_views;

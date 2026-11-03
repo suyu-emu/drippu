@@ -131,8 +131,6 @@ public:
     }
 
     void DispatchCalls();
-    [[nodiscard]] bool HasPendingNativeAcquire() const { return puller.HasPendingNativeAcquire(); }
-    [[nodiscard]] bool CanResumeNativeAcquire() { return !HasFailedNativeWork() && puller.CanResumeNativeAcquire(*this); }
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
@@ -144,10 +142,8 @@ public:
 private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
-    bool HasFailedNativeWork() const;
     bool Step();
-    size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
-    size_t command_resume_offset{};
+    void ProcessCommands(std::span<const CommandHeader> commands);
 
     void SetState(const CommandHeader& command_header);
 

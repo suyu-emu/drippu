@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include <array>
-#include <vector>
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/service.h"
 #include "hid_core/hid_types.h"
@@ -175,10 +173,6 @@ private:
     Result IsVibrationPermitted(Out<bool> out_is_permitted);
     Result SendVibrationValues(
         ClientAppletResourceUserId aruid,
-        InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
-        InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values);
-    Result SendNativeVibrationValues(
-        u16 flags, AppletResourceUserId aruid,
         InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
         InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values);
     Result SendVibrationGcErmCommand(Core::HID::VibrationDeviceHandle vibration_device_handle,
