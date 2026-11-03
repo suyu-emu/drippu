@@ -46,7 +46,7 @@ void ShaderCache::SyncGuestHost() {
 ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : device_memory{device_memory_} {}
 
-bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
+bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) {
     auto& dirty{maxwell3d->dirty.flags};
     if (!dirty[VideoCommon::Dirty::Shaders]) {
         return last_shaders_valid;
@@ -54,7 +54,6 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     dirty[VideoCommon::Dirty::Shaders] = false;
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
-    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram; ++index) {
         if (!maxwell3d->regs.IsShaderConfigEnabled(index)) {
             unique_hashes[index] = 0;
@@ -76,8 +75,8 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
         const ShaderInfo* shader_info{TryGet(*cpu_shader_addr)};
         if (!shader_info) {
-            const u32 start_address{native ? 0 : shader_config.offset};
-            GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
+            const u32 start_address{shader_config.offset};
+            GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, base_addr, start_address};
             shader_info = TryMakeShaderInfo(env, *cpu_shader_addr);
             if (!shader_info) {
                 last_shaders_valid = false;
@@ -89,13 +88,6 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     }
     last_shaders_valid = true;
     return true;
-} catch (const Shader::Exception& error) {
-    auto& native = maxwell3d->GetNativeMacroEngine();
-    if (!native.native_turing) throw;
-    native.native_execution_failed = true;
-    last_shaders_valid = false;
-    LOG_ERROR(HW_GPU, "Native graphics shader rejected: {}", error.what());
-    return false;
 }
 
 const ShaderInfo* ShaderCache::ComputeShader() {
@@ -118,19 +110,14 @@ void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
                                           const std::array<u64, NUM_PROGRAMS>& unique_hashes) {
     size_t env_index{};
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
-    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     for (size_t index = 0; index < NUM_PROGRAMS; ++index) {
         if (unique_hashes[index] == 0) {
             continue;
         }
         const auto program{static_cast<Tegra::Engines::Maxwell3D::Regs::ShaderType>(index)};
         auto& env{result.envs[index]};
-        const auto& config = maxwell3d->regs.pipelines[index];
-        const u32 start_address{native ? 0 : config.offset};
-        const GPUVAddr address = native
-            ? (static_cast<u64>(config.reserved[0] & 0xff) << 32) | config.reserved[1]
-            : base_addr;
-        env = GraphicsEnvironment{*maxwell3d, *gpu_memory, program, address, start_address};
+        const u32 start_address{maxwell3d->regs.pipelines[index].offset};
+        env = GraphicsEnvironment{*maxwell3d, *gpu_memory, program, base_addr, start_address};
         env.SetCachedSize(shader_infos[index]->size_bytes);
         result.env_ptrs[env_index++] = &env;
     }
@@ -276,7 +263,7 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->unique_hash = env.CalculateHash();
         info->size_bytes = env.ReadSizeBytes();
     }
-    const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
+    const size_t size_bytes{info->size_bytes};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);
     return result;

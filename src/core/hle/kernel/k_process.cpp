@@ -1266,7 +1266,6 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
 
     // Assign remaining properties.
     m_ideal_core_id = metadata.GetMainThreadCore();
-    m_uses_pauth_returns = metadata.UsesExtendedAcid();
 
     // Set up emulation context.
     this->InitializeInterfaces(kernel);

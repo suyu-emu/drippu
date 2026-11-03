@@ -7,7 +7,6 @@
 #include <array>
 #include <atomic>
 #include <mutex>
-#include <optional>
 
 #include "common/common_types.h"
 #include "core/hle/service/nvdrv/nvdata.h"
@@ -39,8 +38,6 @@ enum class ChannelType : u32 {
  */
 class SyncpointManager final {
 public:
-    std::optional<u32> ReadAllocatedSyncpoint(u32 id);
-
     explicit SyncpointManager(Tegra::Host1x::Host1x& host1x);
     ~SyncpointManager();
 
