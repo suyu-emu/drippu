@@ -609,6 +609,7 @@ def scan_appimage(scanner, path, runtime_hash, runtime_size, source_revision):
                 tool, snapshot, offset, ['-cat', '-no-wildcards', name], min(size + 1, APPIMAGE_FILE_LIMIT)))
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired) as error:
         scanner.add('appimage', path.name, 'AppImage inspection failed: ' + type(error).__name__)
+        return None
 
 
 def appimage_runtime_lock(rules):

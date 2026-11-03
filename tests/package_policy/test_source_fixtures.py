@@ -1,8 +1,5 @@
 """Exact source-fixture treatment cannot admit altered or forbidden payloads."""
-import copy
-import hashlib
 import io
-import json
 from pathlib import Path
 import sys
 import tarfile
