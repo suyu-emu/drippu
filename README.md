@@ -9,7 +9,7 @@
 </h1>
 
 <h4 align="center">
-Nintendo Switch emulator and native recompiler — the experimental edition of suyu, built on the shared Eden/yuzu lineage.
+Nintendo Switch emulator and native recompiler ΓÇö the experimental edition of suyu, built on the shared Eden/yuzu lineage.
 </h4>
 
 <p align="center">
@@ -24,14 +24,14 @@ Nintendo Switch emulator and native recompiler — the experimental edition of s
 >
 > This is where the project more deeply explores some emulator, recompiler, UI, and platform work that may change quickly and significantly. Expect rough edges and evolving behavior.
 >
-> drippu shares suyu’s codebase and history (itself based on yuzu). Binary and internal target names may still say `suyu` in places for now, but the product presents as **drippu** and will do for the foreseeable future.
+> drippu shares suyuΓÇÖs codebase and history (itself based on yuzu). Binary and internal target names may still say `suyu` in places for now, but the product presents as **drippu** and will do for the foreseeable future.
 
 ## About
 
 drippu is a Nintendo Switch emulator and AArch64 native recompiler written in C++. It can run decrypted Switch titles using either:
 
-- **HLE/emulation mode** — full hardware-level emulation via the drippu core (GPU, CPU, audio, services)
-- **Recompiler mode** — ahead-of-time static recompilation of Switch AArch64 game code to native x86-64 executables, bundled with drippu's HLE backend
+- **HLE/emulation mode** ΓÇö full hardware-level emulation via the drippu core (GPU, CPU, audio, services)
+- **Recompiler mode** ΓÇö ahead-of-time static recompilation of Switch AArch64 game code to native x86-64 executables, bundled with drippu's HLE backend
 
 Part of the suyu project and based on [Eden](https://git.eden-emu.dev/eden-emu/eden), drippu is a space for experimental UI, recompiler, and platform work.
 
@@ -55,7 +55,7 @@ The drippu Emulator also falls under the exemptions stated in Section 1201(f) of
 
 Any aggressive DMCA claims or takedown notices against projects that explicitly disclaim piracy support, require user-provided keys, and limit functionality to interoperability (such as drippu) could constitute overreach or misuse of the DMCA.
 
-As derived from §512(f), if Nintendo (or an affiliated entity) knowingly materially misrepresents that a project like drippu is infringing (or circumvents TPMs) when it does not, especially if they fail to consider fair use, interoperability exemptions under §1201(f), or the fact that the emulator requires user-provided keys and does not itself contain proprietary Nintendo code, they can be made liable for any Damages against drippu.
+As derived from ┬º512(f), if Nintendo (or an affiliated entity) knowingly materially misrepresents that a project like drippu is infringing (or circumvents TPMs) when it does not, especially if they fail to consider fair use, interoperability exemptions under ┬º1201(f), or the fact that the emulator requires user-provided keys and does not itself contain proprietary Nintendo code, they can be made liable for any Damages against drippu.
 
 ## Building
 

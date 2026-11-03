@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_funcs.h"
+#include "common/common_types.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/lz4_compression.h"
@@ -25,6 +26,16 @@
 #include "core/loader/nso.h"
 #include "core/loader/nextendo_s3_patches.h"
 #include "core/memory.h"
+
+// Switch 2 (Tegra T239) target detection. The T239 SoC uses the same NSO
+// container format as Switch 1, but carries a distinct target id in the
+// ACID/program header. This helper is used by the loader to select the
+// correct memory layout and GPU backend without a separate "switch2" file.
+namespace {
+constexpr bool IsSwitch2Target(std::uint32_t target_id) {
+    return target_id == ::Switch2::kTargetIdSwitch2;
+}
+} // namespace
 
 #ifdef HAS_NCE
 #include "core/arm/nce/patcher.h"

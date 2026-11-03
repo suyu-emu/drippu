@@ -132,6 +132,7 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
         {210, C<&IHidServer::EndPermitVibrationSession>, "EndPermitVibrationSession"},
         {211, C<&IHidServer::IsVibrationDeviceMounted>, "IsVibrationDeviceMounted"},
         {212, C<&IHidServer::SendVibrationValueInBool>, "SendVibrationValueInBool"},
+        {214, C<&IHidServer::SendNativeVibrationValues>, "SendNativeVibrationValues"},
         {300, C<&IHidServer::ActivateConsoleSixAxisSensor>, "ActivateConsoleSixAxisSensor"},
         {301, C<&IHidServer::StartConsoleSixAxisSensor>, "StartConsoleSixAxisSensor"},
         {302, C<&IHidServer::StopConsoleSixAxisSensor>, "StopConsoleSixAxisSensor"},
@@ -245,7 +246,11 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
     RegisterHandlers(functions);
 }
 
-IHidServer::~IHidServer() = default;
+IHidServer::~IHidServer() {
+    for (const auto& registration : native_input_memories) {
+        registration.memory->Close(kernel);
+    }
+}
 
 Result IHidServer::CreateAppletResource(OutInterface<IAppletResource> out_applet_resource,
                                         ClientAppletResourceUserId aruid) {
@@ -982,6 +987,17 @@ Result IHidServer::SendVibrationValues(
     }
 
     R_SUCCEED();
+}
+
+Result IHidServer::SendNativeVibrationValues(
+    u16 flags, AppletResourceUserId aruid,
+    InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
+    InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values) {
+    static u32 diagnostic_batches{};
+    if (diagnostic_batches++ < 8) LOG_INFO(Service_HID, "Native vibration batch flags={:#x}, aruid={}, handles={}, values={}",
+             flags, aruid.pid, vibration_handles.size(), vibration_values.size());
+    R_UNLESS(flags == 0 || flags == 2, IPC::ResultNotSupported);
+    R_RETURN(SendVibrationValues(ClientAppletResourceUserId{aruid.pid}, vibration_handles, vibration_values));
 }
 
 Result IHidServer::SendVibrationGcErmCommand(

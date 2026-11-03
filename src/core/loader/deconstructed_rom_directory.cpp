@@ -14,6 +14,7 @@
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/romfs.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -130,10 +131,14 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
     : AppLoader(directory->GetFile("main"))
     , dir(std::move(directory))
     , override_update(override_update_)
+    , standalone(false)
 {}
 
 FileType AppLoader_DeconstructedRomDirectory::IdentifyType(const FileSys::VirtualFile& dir_file) {
-    if (FileSys::IsDirectoryExeFS(dir_file->GetContainingDirectory())) {
+    const auto directory = dir_file->GetContainingDirectory();
+    if (dir_file->GetName() == "main" && directory &&
+        AppLoader_NSO::IdentifyType(dir_file) == FileType::NSO &&
+        FileSys::IsDirectoryExeFS(directory)) {
         return FileType::DeconstructedRomDirectory;
     }
 
@@ -185,11 +190,11 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     }
     metadata.Print();
 
-    // Enable NCE only for applications with 39-bit address space.
+    // Extended ACID programs currently require the Dynarmic compatibility path.
     const bool is_39bit =
         metadata.GetAddressSpaceType() == FileSys::ProgramAddressSpaceType::Is39Bit;
     const bool is_application = metadata.GetPoolPartition() == FileSys::PoolPartition::Application;
-    Settings::SetNceEnabled(is_39bit);
+    Settings::SetNceEnabled(is_39bit && !metadata.UsesExtendedAcid());
 
     const std::array static_modules = {"rtld",    "main",    "subsdk0", "subsdk1", "subsdk2",
                                        "subsdk3", "subsdk4", "subsdk5", "subsdk6", "subsdk7",

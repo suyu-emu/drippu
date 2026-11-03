@@ -230,6 +230,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Callbacks
     config.callbacks = std::addressof(*m_cb);
+    config.enable_pauth_returns = m_cb->m_process && m_cb->m_process->UsesPAuthReturns();
 
     // Memory
     if (page_table) {

@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <cstdlib>
+#include <fstream>
 #include <mutex>
 
 #include <fmt/format.h>
@@ -14,12 +16,14 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "shader_recompiler/exception.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/native_query_trace.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -900,6 +904,12 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
+    if (gpu_memory->UsesNativeTiling()) {
+        u32 first_word{};
+        if (memory.size() >= sizeof(first_word)) std::memcpy(&first_word, memory.data(), sizeof(first_word));
+        VideoCommon::TraceNativeQuery(11, gpu_memory->GetID(), address, cpu_addr.value_or(0),
+            0, first_word, static_cast<u32>(copy_size));
+    }
     if (!cpu_addr) [[unlikely]] {
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
@@ -927,6 +937,12 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
+    static u32 display_trace_count{};
+    if (std::getenv("EDEN_NATIVE_FRAME_CAPTURE") && display_trace_count++ < 64) {
+        LOG_INFO(HW_GPU, "Native display source: address={:#x}, offset={:#x}, dimensions={}x{}, stride={}, accelerated={}, mask={:#x}",
+                 framebuffer_addr, config.offset, config.width, config.height, pixel_stride,
+                 image_view != nullptr, config.layer_stack_mask);
+    }
     if (!image_view) {
         return {};
     }

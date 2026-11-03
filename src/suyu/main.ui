@@ -248,6 +248,7 @@
     <addaction name="menuTAS"/>
     <addaction name="separator"/>
     <addaction name="action_Nintendo_Account"/>
+    <addaction name="action_Nextendo_Account"/>
     <addaction name="action_Steam_Integration"/>
    </widget>
    <widget class="QMenu" name="menu_Help">
@@ -598,6 +599,11 @@
   <action name="action_Nintendo_Account">
    <property name="text">
     <string>&amp;Nintendo Account...</string>
+   </property>
+  </action>
+  <action name="action_Nextendo_Account">
+   <property name="text">
+    <string>&amp;Nextendo Account...</string>
    </property>
   </action>
   <action name="action_Steam_Integration">
