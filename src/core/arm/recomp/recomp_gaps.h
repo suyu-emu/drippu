@@ -26,11 +26,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Core::RecompGaps {
@@ -126,6 +128,75 @@ bool BuildIdMatches(std::string_view a, std::string_view b);
 /// A module name with any directories removed and only [A-Za-z0-9._-] kept.
 std::string SanitizeName(std::string_view name);
 
+/// What a recompiled image says about the module it was built from: its export
+/// name ("rtld", "main", "subsdk0", "sdk") and that module's build ID, which is
+/// empty for registrations that predate build IDs.
+struct ImageIdentity {
+    std::string name;
+    std::string build_id;
+};
+
+/// The image that belongs to a loaded module, or nullopt for none. `load_index`
+/// is the module's position in load order, `module_name` the kernel's name for
+/// it ("nnrtld", "multimedia", "nnSdk") and `module_build_id` its build ID.
+///
+/// When any image carries a build ID, the build ID alone decides: an export
+/// may omit modules (Hybrid runs them on the JIT), so an image's position in
+/// the registration says nothing about which loaded module it belongs to.
+/// Registrations without build IDs fall back to the NSO slot: the module's own
+/// name (without the kernel's "nn" prefix, ignoring case), then the slot its
+/// load position implies (rtld, main, subsdk0..9, sdk).
+std::optional<std::size_t> MatchImage(const std::vector<ImageIdentity>& images,
+                                      std::size_t load_index, std::string_view module_name,
+                                      std::string_view module_build_id);
+
+/// Bytes ModuleNameFromRodata may look at: the newer header plus the path struct.
+inline constexpr std::size_t kRodataModuleNameBytes = 12 + 8 + 0x200;
+
+/// The kernel's name for a module ("nnrtld", "EX-King.nss"): the module path
+/// at the start of its read-only segment with any directories removed, or
+/// empty when the segment starts with neither layout. Older SDKs start rodata
+/// with {u32 0, s32 length, char path[length]}; newer ones (TOTK 1.4.3) put
+/// {u32 1, u32 end of path, u32} in front of that same struct. `size` may be
+/// smaller than kRodataModuleNameBytes.
+std::string ModuleNameFromRodata(const std::uint8_t* rodata, std::size_t size);
+
+/// One byte of guest memory at an absolute address (0 where unmapped).
+using GuestRead8 = std::function<std::uint8_t(std::uint64_t)>;
+
+/// Absolute address of a loaded module's MOD0 header, or 0 when it has none.
+/// The module's second word (base + 4) is MOD0's offset from the base. Older
+/// SDKs (TOTK 1.0.0) put MOD0 right after it, at +8; newer ones (TOTK 1.4.3
+/// main, subsdk0 and sdk) put it deep in rodata, megabytes in, where a scan
+/// of the first pages never reaches. That scan stays as the fallback for a
+/// module whose word at +4 does not lead to the magic.
+std::uint64_t FindMod0(std::uint64_t module_base, const GuestRead8& read8);
+
+/// One .dynsym entry (Elf64_Sym) with its .dynstr name.
+struct DynSymbol {
+    std::string name;
+    std::uint64_t value = 0;
+    bool defined = false; ///< st_shndx != SHN_UNDEF
+    bool weak = false;    ///< STB_WEAK
+};
+DynSymbol ReadDynSymbol(std::uint64_t symtab_va, std::uint64_t strtab_va, std::uint32_t index,
+                        const GuestRead8& read8);
+
+/// Adds every defined, named .dynsym symbol of the module at `module_base` to
+/// `out` as name -> absolute address; a name already present is kept. .dynsym
+/// and .dynstr are back to back, so the gap between them is the entry count.
+void IndexModuleExports(std::uint64_t module_base, std::uint64_t symtab_va,
+                        std::uint64_t strtab_va, const GuestRead8& read8,
+                        std::unordered_map<std::string, std::uint64_t>& out);
+
+/// What an import slot holds when no loaded module exports its symbol: 0 for
+/// a weak one, as the ABI and the guest's rtld have it, else `trap`. A weak
+/// import that some module does define resolves to that definition instead,
+/// exactly like a strong one.
+inline std::uint64_t UndefinedImportValue(bool weak, std::uint64_t trap) {
+    return weak ? 0 : trap;
+}
+
 std::string Serialize(const GapData& data);
 std::optional<GapData> Parse(std::string_view json, std::string* error = nullptr);
 /// Adds `from` into `into`: run counts and hits add, offsets and opcodes dedupe.
@@ -170,6 +241,11 @@ public:
     void ForgetModule(std::uint64_t base);
     /// The module at `base` runs from a recompiled image named `image_name`.
     void NoteImage(std::uint64_t base, std::string_view image_name);
+    /// Build ID of the noted module containing `address`; empty if none.
+    std::string BuildIdAt(std::uint64_t address) const;
+    /// Whether a noted module has this build ID or, when `build_id` is empty,
+    /// this name (ignoring case).
+    bool HasModule(std::string_view build_id, std::string_view name) const;
     void RecordMiss(std::uint64_t pc);
     void RecordUnimplemented(std::uint32_t insn);
     /// This run as a one-run GapData.

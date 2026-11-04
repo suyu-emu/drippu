@@ -82,6 +82,22 @@ block is counted on entry; a budget decrement to zero parks the next PC without
 executing another block. This suite checks generated-code behavior, not full
 emulator integration or title compatibility.
 
+## Image binding
+
+`smoke_binding_unit` checks `RecompGaps::MatchImage`, which suyu-cmd uses to
+give each loaded module its recompiled image: by build ID, so a Hybrid
+registration that leaves a module out (here main) still binds every other
+image to its own module, the omitted module gets none, and an image whose
+module is not loaded stays unbound. Registrations without build IDs bind by
+NSO slot name instead. Images were once bound by position, which this fails.
+
+## Literal loads
+
+`smoke_literal_unit` translates LDR and LDRSW (literal) for GPRs and Q
+registers and checks that each reads from `g_module_base` plus the module
+offset, like ADR/ADRP. The suite above runs at base 0, where a missing base
+goes unnoticed; TOTK main faulted on exactly that.
+
 ## Coverage loop (recomp_gaps.json)
 
 `smoke_gaps_unit` checks `core/arm/recomp/recomp_gaps.cpp` on its own: the

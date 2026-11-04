@@ -18,12 +18,13 @@ ABI5_GOLDEN = "658e3c2824e30c2f06ef5a782e62878d6fd1f90b7ee7115e2d28adbf3b3c698d"
 # exactness fixes touch the shared emitter and so this text too; GG1's own
 # switch-off contract (DESIGN.md sec 0) guarantees it does not move these.
 FM1_GOLDEN = "012e0e3fb8d9f5a94664ecbece0c125163868fb86b8be48f1cc3916accbca3ee"
-FPX_GOLDEN = "1471d5f3df61c3b2c5deee301ad9617f325c5c261b9344f3721324ff7ec53daf"
+FPX_GOLDEN = "1232d12969cc129b586c0691caae41713fa19a2d918be0e89be3891ed66800f5"
 
 # ABI 6 changes only these files; the block sources must be identical.
 ABI6_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}
 # FPX1 on top of FM1 changes only these: the smoke code has no FP instructions.
-FPX_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.h"}
+# The runtime C gains the out-of-line exact FP bodies (recomp_fpe_*).
+FPX_CHANGED = {"CMakeLists.txt", "recomp_export.c", "recomp_runtime.c", "recomp_runtime.h"}
 # GG1 (the generation code guard) changes the block units as well, never the
 # dispatch table (src/recompiled_<module>.c) or the file set.
 GG1_CHANGED = ABI6_CHANGED | {"recompiled_smoke_0.c", "recompiled_second_0.c"}
@@ -190,6 +191,11 @@ def main():
         export_build = build("export")
         exporter = executable(export_build, "smoke_export")
         call([executable(export_build, "smoke_gaps_unit")])
+        call([executable(export_build, "smoke_binding_unit")])
+        call([executable(export_build, "smoke_module_name_unit")])
+        call([executable(export_build, "smoke_import_resolve_unit")])
+        call([executable(export_build, "smoke_literal_unit")])
+        call([executable(export_build, "smoke_shl_unit")])
         check_coverage_loop(root, exporter, build)
         generated = {}
         for name, switches in VARIANTS:

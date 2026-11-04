@@ -447,10 +447,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         return nso;
     }
 
-    auto patch_dirs = load_dir->GetSubdirectories();
-    std::sort(patch_dirs.begin(), patch_dirs.end(),
-              [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
-    const auto patches = CollectPatches(patch_dirs, build_id);
+    const auto patches = GetNSOPatches(header.build_id);
 
     auto out = nso;
     for (const auto& patch_file : patches) {
@@ -479,22 +476,26 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 }
 
 bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name) const {
+    LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}",
+             Common::HexToString(build_id_), name);
+    return !GetNSOPatches(build_id_).empty();
+}
+
+std::vector<VirtualFile> PatchManager::GetNSOPatches(const BuildID& build_id_) const {
     const auto build_id_raw = Common::HexToString(build_id_);
     const auto build_id = build_id_raw.substr(0, build_id_raw.find_last_not_of('0') + 1);
-
-    LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}", build_id, name);
 
     const auto load_dir = fs_controller.GetModificationLoadRoot(title_id);
     if (load_dir == nullptr) {
         LOG_ERROR(Loader, "Cannot load mods for invalid title_id={:016X}", title_id);
-        return false;
+        return {};
     }
 
     auto patch_dirs = load_dir->GetSubdirectories();
     std::sort(patch_dirs.begin(), patch_dirs.end(),
               [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
 
-    return !CollectPatches(patch_dirs, build_id).empty();
+    return CollectPatches(patch_dirs, build_id);
 }
 
 std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildID& build_id_) const {

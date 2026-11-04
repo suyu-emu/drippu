@@ -718,10 +718,26 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
+            VkFormat vertex_format =
+                MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size());
+            const u32 stride = key.state.vertex_strides[attribute.buffer];
+            // MoltenVK translates attributes crossing a stride into another binding,
+            // which misreads packed RGBA8 weights on Apple M5. If W is unused,
+            // RGB8 preserves XYZ within the original vertex record. Static stride
+            // mode also keeps this format decision in the pipeline cache key.
+            if (device.IsMoltenVK() && !key.state.extended_dynamic_state &&
+                vertex_format == VK_FORMAT_R8G8B8A8_UNORM && stride != 0 &&
+                u64{attribute.offset.Value()} + 3 <= stride &&
+                u64{attribute.offset.Value()} + 4 > stride &&
+                !stage_infos[0].loads.Generic(index, 3) &&
+                device.IsFormatSupported(VK_FORMAT_R8G8B8_UNORM,
+                                         VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT, FormatType::Buffer)) {
+                vertex_format = VK_FORMAT_R8G8B8_UNORM;
+            }
             vertex_attributes.push_back({
                 .location = static_cast<u32>(index),
                 .binding = attribute.buffer,
-                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size()),
+                .format = vertex_format,
                 .offset = attribute.offset,
             });
         }
@@ -1216,27 +1232,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                     cache_key.pipeline.unique_hashes = {};
                     cache_key.variant = static_cast<u32>(fragment_has_color0_output) |
                                         (Settings::values.sample_shading.GetValue() << 1);
-                    auto& state = cache_key.pipeline.state;
-                    // Fragment output consumes blend, multisample, and render-pass state.
-                    // Preserve flags that determine the serialized state size.
-                    constexpr u32 output_bits = (1U << 0) | (1U << 2) | (1U << 3) |
-                                                (1U << 4) | (1U << 5) | (3U << 20) |
-                                                (0xFU << 28);
-                    constexpr u32 render_pass_and_alpha = (1U << 5) | (0x1FU << 6) |
-                                                          (3U << 15);
-                    state.raw1 &= output_bits;
-                    state.raw2 &= render_pass_and_alpha;
-                    state.alpha_test_ref = 0;
-                    state.point_size = 0;
-                    state.viewport_swizzles.fill(0);
-                    state.attribute_types = 0;
-                    state.dynamic_state.raw1 &= (0xFU << 6) | (1U << 10);
-                    state.dynamic_state.raw2 = 0;
-                    for (auto& attribute : state.attributes) {
-                        attribute.raw = 0;
-                    }
-                    state.binding_divisors.fill(0);
-                    state.vertex_strides.fill(0);
+                    // Keep the full fixed state for fragment-output library reuse. Reducing
+                    // it to blend/render-pass state corrupts rendering on NVIDIA (580.159.03).
+                    // The other three library parts still use their narrower state keys.
                 }
                 const auto part_start = time_pipeline ? std::chrono::steady_clock::now()
                                                       : std::chrono::steady_clock::time_point{};

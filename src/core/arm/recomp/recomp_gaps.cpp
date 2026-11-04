@@ -539,6 +539,167 @@ std::string SanitizeName(std::string_view name) {
     return out;
 }
 
+std::optional<std::size_t> MatchImage(const std::vector<ImageIdentity>& images,
+                                      std::size_t load_index, std::string_view module_name,
+                                      std::string_view module_build_id) {
+    const bool by_build_id = std::any_of(images.begin(), images.end(), [](const auto& image) {
+        return !NormalizeBuildId(image.build_id).empty();
+    });
+    if (by_build_id) {
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            if (BuildIdMatches(images[i].build_id, module_build_id)) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+    const auto by_name = [&images](std::string_view name) -> std::optional<std::size_t> {
+        for (std::size_t i = 0; i < images.size(); ++i) {
+            const std::string_view image = images[i].name;
+            if (image.size() == name.size() &&
+                std::equal(image.begin(), image.end(), name.begin(), [](char a, char b) {
+                    const auto lower = [](char c) {
+                        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+                    };
+                    return lower(a) == lower(b);
+                })) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    };
+    if (auto i = by_name(module_name)) {
+        return i;
+    }
+    if (module_name.size() > 2 && (module_name[0] == 'n' || module_name[0] == 'N') &&
+        (module_name[1] == 'n' || module_name[1] == 'N')) {
+        if (auto i = by_name(module_name.substr(2))) {
+            return i;
+        }
+    }
+    static constexpr std::string_view kSlots[] = {
+        "rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3", "subsdk4",
+        "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9", "sdk",
+    };
+    if (load_index < std::size(kSlots)) {
+        return by_name(kSlots[load_index]);
+    }
+    return std::nullopt;
+}
+
+std::string ModuleNameFromRodata(const std::uint8_t* rodata, std::size_t size) {
+    constexpr std::size_t kPathMax = 0x200;
+    const auto word = [&](std::size_t at) -> std::optional<std::uint32_t> {
+        if (at + 4 > size) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint32_t>(rodata[at]) | (std::uint32_t{rodata[at + 1]} << 8) |
+               (std::uint32_t{rodata[at + 2]} << 16) | (std::uint32_t{rodata[at + 3]} << 24);
+    };
+    // {u32 0, s32 length, char path[length]} at `at`, ending by `limit`.
+    const auto path_at = [&](std::size_t at, std::size_t limit) -> std::string {
+        const auto zero = word(at);
+        const auto length = word(at + 4);
+        if (!zero || !length || *zero != 0 || *length == 0 || *length > 0x7fffffffu ||
+            at + 8 + *length > limit) {
+            return {};
+        }
+        const std::size_t start = at + 8;
+        std::size_t end = start + (std::min<std::size_t>)({*length, kPathMax - 1, size - start});
+        end = static_cast<std::size_t>(std::find(rodata + start, rodata + end, '\0') - rodata);
+        std::size_t name = start;
+        for (std::size_t i = start; i < end; ++i) {
+            if (rodata[i] == '/' || rodata[i] == '\\') {
+                name = i + 1;
+            }
+        }
+        return std::string(reinterpret_cast<const char*>(rodata) + name, end - name);
+    };
+    const auto first = word(0);
+    if (!first) {
+        return {};
+    }
+    if (*first == 0) {
+        return path_at(0, std::numeric_limits<std::size_t>::max());
+    }
+    // The newer header's second word is where the path struct after it ends.
+    const auto path_end = word(4);
+    if (*first == 1 && path_end && word(8)) {
+        return path_at(12, *path_end);
+    }
+    return {};
+}
+
+namespace {
+
+std::uint64_t ReadLe(const GuestRead8& read8, std::uint64_t va, int bytes) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < bytes; ++i) {
+        v |= std::uint64_t{read8(va + i)} << (8 * i);
+    }
+    return v;
+}
+
+} // namespace
+
+std::uint64_t FindMod0(std::uint64_t module_base, const GuestRead8& read8) {
+    constexpr std::uint64_t kMagic = 0x30444F4Du; // "MOD0"
+    const std::uint64_t pointed = module_base + ReadLe(read8, module_base + 4, 4);
+    if (ReadLe(read8, pointed, 4) == kMagic) {
+        return pointed;
+    }
+    for (std::uint64_t off = 0; off < 0x4000; off += 4) {
+        if (ReadLe(read8, module_base + off, 4) == kMagic) {
+            return module_base + off;
+        }
+    }
+    return 0;
+}
+
+DynSymbol ReadDynSymbol(std::uint64_t symtab_va, std::uint64_t strtab_va, std::uint32_t index,
+                        const GuestRead8& read8) {
+    // Elf64_Sym: st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8)
+    // st_size(8) = 24 bytes.
+    DynSymbol s;
+    if (!symtab_va) {
+        return s;
+    }
+    const std::uint64_t sym_va = symtab_va + std::uint64_t{index} * 24;
+    const std::uint64_t name_off = ReadLe(read8, sym_va, 4);
+    s.weak = (read8(sym_va + 4) >> 4) == 2; // binding is st_info's high nibble
+    s.defined = ReadLe(read8, sym_va + 6, 2) != 0; // SHN_UNDEF == 0
+    s.value = ReadLe(read8, sym_va + 8, 8);
+    if (strtab_va) {
+        for (std::uint64_t i = 0; i < 512; ++i) {
+            const auto c = read8(strtab_va + name_off + i);
+            if (!c) {
+                break;
+            }
+            s.name.push_back(static_cast<char>(c));
+        }
+    }
+    return s;
+}
+
+void IndexModuleExports(std::uint64_t module_base, std::uint64_t symtab_va,
+                        std::uint64_t strtab_va, const GuestRead8& read8,
+                        std::unordered_map<std::string, std::uint64_t>& out) {
+    if (!symtab_va || !strtab_va) {
+        return;
+    }
+    std::uint32_t max_index = 8192;
+    if (strtab_va > symtab_va) {
+        max_index = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>)((strtab_va - symtab_va) / 24, 65536));
+    }
+    for (std::uint32_t i = 1; i < max_index; ++i) { // 0 is the null symbol
+        const auto sym = ReadDynSymbol(symtab_va, strtab_va, i, read8);
+        if (sym.defined && !sym.name.empty()) {
+            out.emplace(sym.name, module_base + sym.value);
+        }
+    }
+}
+
 std::string Serialize(const GapData& d) {
     std::string o = "{\n";
     o += "  \"schema\": \"" + std::string{kSchemaName} + "\",\n";
@@ -1197,6 +1358,34 @@ void SessionRecorder::NoteImage(std::uint64_t base, std::string_view image_name)
             it->second.name = SanitizeName(image_name);
         }
     }
+}
+
+std::string SessionRecorder::BuildIdAt(std::uint64_t address) const {
+    std::scoped_lock lk{lock};
+    auto it = loaded.upper_bound(address);
+    if (it == loaded.begin()) {
+        return {};
+    }
+    --it;
+    return address - it->first < it->second.size ? it->second.build_id : std::string{};
+}
+
+bool SessionRecorder::HasModule(std::string_view build_id, std::string_view name) const {
+    std::scoped_lock lk{lock};
+    const std::string wanted = NormalizeBuildId(build_id);
+    const std::string wanted_name = SanitizeName(name);
+    const auto lower = [](char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    return std::any_of(loaded.begin(), loaded.end(), [&](const auto& entry) {
+        const Module& m = entry.second;
+        if (!build_id.empty()) {
+            return !wanted.empty() && m.build_id == wanted;
+        }
+        return !wanted_name.empty() && m.name.size() == wanted_name.size() &&
+               std::equal(m.name.begin(), m.name.end(), wanted_name.begin(),
+                          [&](char a, char b) { return lower(a) == lower(b); });
+    });
 }
 
 void SessionRecorder::RecordMiss(std::uint64_t pc) {

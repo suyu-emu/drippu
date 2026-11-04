@@ -57,7 +57,7 @@ int main(void){unsigned index,kind,rn,rd;uint64_t bits,fpcr,status;
     if(result.unhandled) return 5;
     if(!suyu::recomp::TranslateAllForExport(true,false) ||
        !suyu::recomp::TranslateAllForExport(true,true) ||
-       suyu::recomp::TranslateAllForExport(false,false) ||
+       !suyu::recomp::TranslateAllForExport(false,false) ||
        !suyu::recomp::TranslateAllForExport(false,true)) return 6;
     return 0;
 }

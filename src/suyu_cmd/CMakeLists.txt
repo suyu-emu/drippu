@@ -190,6 +190,14 @@ if (SUYU_CMD OR YUZU_CMD)
             if (EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_guard_v2.h")
                 target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_GUARD_V2=1)
             endif()
+            # Registries that list each module's build ID. (MSVC builds always
+            # reference it, with a linker default for registries without one.)
+            file(READ "${SUYU_CMD_RECOMP_DIR}/recomp_registration.c" _recomp_registration)
+            string(FIND "${_recomp_registration}" "suyu_recomp_static_build_ids_v1"
+                   _recomp_has_build_ids)
+            if (NOT _recomp_has_build_ids EQUAL -1)
+                target_compile_definitions(suyu-cmd-static PRIVATE SUYU_RECOMP_BUILD_IDS_V1=1)
+            endif()
             if (_recomp_bundle_abi STREQUAL "6")
                 if (NOT EXISTS "${SUYU_CMD_RECOMP_DIR}/recomp_fastmem_v1.h")
                     message(FATAL_ERROR "ABI 6 modules need a registry with the fastmem "

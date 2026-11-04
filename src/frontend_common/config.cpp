@@ -24,6 +24,38 @@
 
 namespace FS = Common::FS;
 
+namespace {
+
+// Directories inside the executable's folder are stored relative to it, so a portable
+// installation keeps working after being moved or copied instead of pointing at its old place.
+// Portable installations only exist on Windows (GetExeDirectory is Windows-only), so other
+// platforms store and read paths unchanged.
+std::string ToStoredPath(const std::string& value) {
+#ifndef _WIN32
+    return value;
+#else
+    const std::filesystem::path absolute = std::filesystem::path{FS::ToU8String(value)};
+    std::error_code ec;
+    const auto relative = std::filesystem::relative(absolute, FS::GetExeDirectory(), ec);
+    if (ec || relative.empty() || relative.is_absolute() || relative.begin()->string() == "..") {
+        return value;
+    }
+    return FS::ToUTF8String(relative.generic_u8string());
+#endif
+}
+
+std::filesystem::path ResolveStoredPath(const std::string& value) {
+    const std::filesystem::path stored = std::filesystem::path{FS::ToU8String(value)};
+#ifdef _WIN32
+    if (!value.empty() && !stored.is_absolute()) {
+        return FS::GetExeDirectory() / stored;
+    }
+#endif
+    return stored;
+}
+
+} // Anonymous namespace
+
 Config::Config(const ConfigType config_type)
     : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
 
@@ -275,7 +307,7 @@ void Config::ReadDataStorageValues() {
     using namespace Common::FS;
 
     const auto setPath = [this](const SuyuPath& path, const char* setting) {
-        SetSuyuPath(path, ReadStringSetting(std::string(setting)));
+        SetSuyuPath(path, ResolveStoredPath(ReadStringSetting(std::string(setting))));
     };
 
     setPath(SuyuPath::NANDDir, "nand_directory");
@@ -288,7 +320,7 @@ void Config::ReadDataStorageValues() {
     if (save_dir_setting.empty()) {
         SetSuyuPath(SuyuPath::SaveDir, GetSuyuPathString(SuyuPath::NANDDir));
     } else {
-        SetSuyuPath(SuyuPath::SaveDir, save_dir_setting);
+        SetSuyuPath(SuyuPath::SaveDir, ResolveStoredPath(save_dir_setting));
     }
 
     ReadCategory(Settings::Category::DataStorage);
@@ -374,7 +406,7 @@ void Config::ReadScreenshotValues() {
 
     ReadCategory(Settings::Category::Screenshots);
     FS::SetSuyuPath(FS::SuyuPath::ScreenshotsDir,
-                    ReadStringSetting(std::string("screenshot_path")));
+                    ResolveStoredPath(ReadStringSetting(std::string("screenshot_path"))));
 
     EndGroup();
 }
@@ -572,8 +604,8 @@ void Config::SaveDataStorageValues() {
     using namespace Common::FS;
 
     const auto writePath = [this](const char* setting, const SuyuPath& path) {
-        WriteStringSetting(std::string(setting), FS::GetSuyuPathString(path),
-                           std::make_optional(FS::GetSuyuPathString(path)));
+        WriteStringSetting(std::string(setting), ToStoredPath(FS::GetSuyuPathString(path)),
+                           std::make_optional(ToStoredPath(FS::GetSuyuPathString(path))));
     };
 
     writePath("nand_directory", SuyuPath::NANDDir);
@@ -588,7 +620,7 @@ void Config::SaveDataStorageValues() {
         WriteStringSetting(std::string("save_directory"), std::string(""),
                            std::make_optional(std::string("")));
     } else {
-        WriteStringSetting(std::string("save_directory"), save_path,
+        WriteStringSetting(std::string("save_directory"), ToStoredPath(save_path),
                            std::make_optional(std::string("")));
     }
 
@@ -673,7 +705,7 @@ void Config::SaveScreenshotValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Screenshots));
 
     WriteStringSetting(std::string("screenshot_path"),
-                       FS::GetSuyuPathString(FS::SuyuPath::ScreenshotsDir));
+                       ToStoredPath(FS::GetSuyuPathString(FS::SuyuPath::ScreenshotsDir)));
     WriteCategory(Settings::Category::Screenshots);
 
     EndGroup();

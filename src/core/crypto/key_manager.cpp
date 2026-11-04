@@ -28,6 +28,7 @@
 #include "core/crypto/partition_data_manager.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/file_sys/ticket_source.h"
 #include "core/loader/loader.h"
 
 namespace Core::Crypto {
@@ -830,11 +831,17 @@ bool StoreInstalledTicket(const std::filesystem::path& nand_dir,
     return true;
 }
 
-std::size_t KeyManager::LoadInstalledTickets(const std::filesystem::path& nand_dir) {
+std::size_t KeyManager::LoadInstalledTickets(const std::filesystem::path& nand_dir,
+                                            const std::filesystem::path& package_dir) {
     if (nand_dir.empty()) {
         return 0;
     }
     const auto dir = TicketStoreDir(nand_dir).lexically_normal();
+    if (!FileSys::CanReadInstalledTicketPath(dir, package_dir)) {
+        LOG_WARNING(Crypto, "Ignoring ticket store inside export package: {}",
+                    Common::FS::PathToUTF8String(dir));
+        return 0;
+    }
     if (std::find(loaded_ticket_stores.begin(), loaded_ticket_stores.end(), dir) !=
         loaded_ticket_stores.end()) {
         return 0;
@@ -853,6 +860,11 @@ std::size_t KeyManager::LoadInstalledTickets(const std::filesystem::path& nand_d
         std::error_code file_ec;
         if (!it->is_regular_file(file_ec) ||
             Common::ToLower(Common::FS::PathToUTF8String(path.extension())) != ".tik") {
+            continue;
+        }
+        if (!FileSys::CanReadInstalledTicketPath(path, package_dir)) {
+            LOG_WARNING(Crypto, "Ignoring ticket inside export package: {}",
+                        Common::FS::PathToUTF8String(path));
             continue;
         }
         const auto bytes = ReadSmallFile(path);

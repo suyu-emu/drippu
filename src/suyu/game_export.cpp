@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "suyu/game_export.h"
+#include "suyu/nso_patch_baking.h"
 #include "suyu/steam_integration.h"
 #include "suyu/wikipedia_cover.h"
 
@@ -75,6 +76,7 @@
 #include "common/common_types.h"
 #include "common/fs/path_util.h"
 #include "common/package_policy.h"
+#include "common/scope_exit.h"
 #include "common/scm_rev.h"
 #include "common/hex_util.h"
 #include "common/lz4_compression.h"
@@ -1009,6 +1011,18 @@ static bool ReadCachedFallbackPolicy(const QByteArray& manifest, bool requested,
     }
     cached_modules = std::move(modules);
     return true;
+}
+
+// SUYU_AOT_JIT_MODULES=main,sdk leaves the named modules to the JIT in a Hybrid
+// export without recompiling them. A module whose code links past the 2 GB
+// image limit (TOTK's main) can't be in the image at all.
+static QStringList RequestedJitModules() {
+    QStringList names;
+    for (const auto& name : qEnvironmentVariable("SUYU_AOT_JIT_MODULES")
+                                .split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        names.append(name.trimmed());
+    }
+    return names;
 }
 
 static bool WritePortableVersionOverride(const QString& config_path, u32 app_version,
@@ -2415,7 +2429,10 @@ static std::vector<u64> CollectExportedSymbolAddresses(const NsoAnalysisResult& 
 
 /// Parse and analyze a single NSO file using the VFS.
 static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFile& nso_file,
-                                                        bool full_scan) {
+                                                        bool full_scan,
+                                                        const FileSys::PatchManager& patch_manager,
+                                                        bool& patch_failed) {
+    patch_failed = false;
     if (!nso_file || nso_file->GetSize() < sizeof(Loader::NSOHeader)) {
         return std::nullopt;
     }
@@ -2457,7 +2474,6 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     }
 
     result.text_bytes = text_data;
-    result.entry_vaddr = static_cast<u64>(result.text_vaddr) + FindNsoEntryOffset(result.text_bytes);
 
     // Read and decompress .rodata segment (segment 1)
     {
@@ -2479,7 +2495,31 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
         result.data_bytes = std::move(seg);
     }
 
-    // Analyze ARM64 basic blocks in the .text segment
+    if (patch_manager.HasNSOPatch(header.build_id, nso_file->GetName())) {
+        std::array<std::vector<u8>, 3> segments{
+            std::move(result.text_bytes), std::move(result.rodata_bytes), std::move(result.data_bytes)};
+        const bool patched = SuyuExport::BakeNsoPatches(
+            {reinterpret_cast<const u8*>(&header), sizeof(header)},
+            {header.segments[0].location, header.segments[1].location, header.segments[2].location},
+            segments, header.segments[2].bss_size,
+            [&](const std::vector<u8>& image) {
+                const bool dump_nso = Settings::values.dump_nso.GetValue();
+                Settings::values.dump_nso.SetValue(false);
+                SCOPE_EXIT { Settings::values.dump_nso.SetValue(dump_nso); };
+                return patch_manager.PatchNSO(image, nso_file->GetName());
+            });
+        if (!patched) {
+            patch_failed = true;
+            LOG_ERROR(Frontend, "Cannot bake NSO patches for {}: invalid patched image", nso_file->GetName());
+            return std::nullopt;
+        }
+        result.text_bytes = std::move(segments[0]);
+        result.rodata_bytes = std::move(segments[1]);
+        result.data_bytes = std::move(segments[2]);
+    }
+    result.entry_vaddr = static_cast<u64>(result.text_vaddr) + FindNsoEntryOffset(result.text_bytes);
+
+    // Analyze ARM64 basic blocks in the patched .text segment
     result.blocks = AnalyzeArm64BasicBlocks(
         std::span<const u8>{result.text_bytes.data(), result.text_bytes.size()},
         header.segments[0].location, full_scan);
@@ -2491,6 +2531,73 @@ static std::optional<NsoAnalysisResult> AnalyzeNsoFile(const FileSys::VirtualFil
     }
 
     return result;
+}
+
+// Record only the files selected by the runtime patch manager for these build IDs.
+// Patch files outside LayeredExeFS still contribute explicitly to the cache key.
+static std::optional<QJsonObject> BakedPatchManifest(
+    const std::vector<FileSys::VirtualFile>& modules, const FileSys::PatchManager& manager) {
+    std::map<QString, std::map<QString, QJsonObject>> selected;
+    std::map<QString, FileSys::VirtualDir> selected_directories;
+    for (const auto& module : modules) {
+        Loader::NSOHeader header{};
+        if (module->ReadObject(&header) != sizeof(header) ||
+            header.magic != Common::MakeMagic('N', 'S', 'O', '0')) continue;
+        for (const auto& patch : manager.GetNSOPatches(header.build_id)) {
+            const auto exefs = patch->GetContainingDirectory();
+            const auto mod = exefs->GetParentDirectory();
+            selected_directories[QString::fromStdString(mod->GetName())] = exefs;
+            // A patch-only export must not advertise a folder whose other payloads
+            // replace modules or install runtime hooks when the launcher enables it.
+            for (const auto& file : exefs->GetFiles()) {
+                if (file->GetExtension() != "ips" && file->GetExtension() != "pchtxt") {
+                    LOG_ERROR(Frontend, "Cannot bake mod {}: patch-only exports do not support {}",
+                              mod->GetName(), file->GetName());
+                    return std::nullopt;
+                }
+            }
+            if (patch->GetSize() > (16u << 20)) {
+                LOG_ERROR(Frontend, "Cannot bake mod {}: patch {} exceeds the 16 MiB limit",
+                          mod->GetName(), patch->GetName());
+                return std::nullopt;
+            }
+            const auto bytes = patch->ReadAllBytes();
+            if (bytes.size() != patch->GetSize()) return std::nullopt;
+            const auto digest = QCryptographicHash::hash(
+                QByteArrayView(reinterpret_cast<const char*>(bytes.data()),
+                               static_cast<qsizetype>(bytes.size())), QCryptographicHash::Sha256).toHex();
+            const QString path = QStringLiteral("exefs/") + QString::fromStdString(patch->GetName());
+            selected[QString::fromStdString(mod->GetName())][path] = QJsonObject{
+                {QStringLiteral("path"), path}, {QStringLiteral("sha256"), QString::fromLatin1(digest)},
+                {QStringLiteral("size"), static_cast<qint64>(bytes.size())},
+                {QStringLiteral("target_build_id"), BuildIdToHex(header.build_id).toUpper()}};
+        }
+    }
+    QJsonArray mods;
+    for (const auto& [name, files] : selected) {
+        const auto& directory = selected_directories.at(name);
+        if (!directory->GetSubdirectories().empty()) {
+            LOG_ERROR(Frontend, "Cannot bake mod {}: use a dedicated patch-only ExeFS folder", name.toStdString());
+            return std::nullopt;
+        }
+        for (const auto& file : directory->GetFiles()) {
+            // QString, not auto: auto would keep a QStringBuilder that refers to the
+            // temporary from fromStdString after it is destroyed.
+            const QString path = QStringLiteral("exefs/") + QString::fromStdString(file->GetName());
+            if (!files.contains(path)) {
+                LOG_ERROR(Frontend, "Cannot bake mod {}: {} does not target this export. Move the selected patches into a dedicated mod folder",
+                          name.toStdString(), file->GetName());
+                return std::nullopt;
+            }
+        }
+        QJsonArray entries;
+        for (const auto& [path, entry] : files) entries.append(entry);
+        mods.append(QJsonObject{{QStringLiteral("name"), name}, {QStringLiteral("files"), entries}});
+    }
+    const auto fingerprint = mods.isEmpty() ? QByteArray{} : QCryptographicHash::hash(
+        QJsonDocument(mods).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256).toHex();
+    return QJsonObject{{QStringLiteral("schema"), 1}, {QStringLiteral("mods"), mods},
+                       {QStringLiteral("fingerprint"), QString::fromLatin1(fingerprint)}};
 }
 
 /// Attempt to get the ExeFS VirtualDir from a ROM file using the VFS infrastructure.
@@ -3398,6 +3505,23 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         LOG_ERROR(Frontend, "Could not fingerprint the effective ExeFS for AOT export");
         return {};
     }
+    const FileSys::PatchManager patch_manager{
+        FileSys::GetBaseTitleID(SelectedProgramId()), system_.GetFileSystemController(),
+        system_.GetContentProvider()};
+    std::vector<FileSys::VirtualFile> patch_modules;
+    if (source_exefs) {
+        patch_modules = source_exefs->GetFiles();
+    } else {
+        static const auto patch_vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+        QDirIterator it(exefs_dir, QDir::Files | QDir::NoDotAndDotDot);
+        while (it.hasNext()) {
+            auto file = patch_vfs->OpenFile(it.next().toStdString(), FileSys::OpenMode::Read);
+            if (file) patch_modules.push_back(std::move(file));
+        }
+    }
+    const auto baked_patches = BakedPatchManifest(patch_modules, patch_manager);
+    if (!baked_patches) return {};
+    const QString patch_fingerprint = baked_patches->value(QStringLiteral("fingerprint")).toString();
 
     // blockmaps/, ir/ and code/ are debugging material for a codegen stage that
     // no longer exists: nothing in suyu or in the generated project reads any of
@@ -3515,7 +3639,11 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !suyu::recomp::g_emit_fastmem ||
                 contents.contains(QStringLiteral("\"image_features\": %1,").arg(image_features));
             const bool same_correctness_revision = contents.contains(
-                QStringLiteral("\"correctness_revision\": \"20260927-hybrid-guard-control-units-v3\","));
+                QStringLiteral("\"correctness_revision\": \"20261010-graphics-safe-defaults-r3\","));
+            const auto cached_manifest = QJsonDocument::fromJson(manifest_bytes).object();
+            const bool same_patches = cached_manifest.value(QStringLiteral("baked_patches"))
+                                          .toObject().value(QStringLiteral("fingerprint")).toString() ==
+                                      patch_fingerprint;
             const bool same_translate_all = contents.contains(
                 QStringLiteral("\"translate_all\": ") +
                 (translate_all ? QStringLiteral("true,") : QStringLiteral("false,")));
@@ -3530,10 +3658,14 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 (coverage_fingerprint.isEmpty() &&
                  !contents.contains(QStringLiteral("\"coverage_fingerprint\"")));
             QStringList cached_fallback_modules;
-            const bool same_fallback_policy = ReadCachedFallbackPolicy(
+            bool same_fallback_policy = ReadCachedFallbackPolicy(
                 manifest_bytes, fallback_enabled, cached_fallback_modules);
+            for (const auto& name : RequestedJitModules()) {
+                same_fallback_policy =
+                    same_fallback_policy && cached_fallback_modules.contains(name);
+            }
             if (same_scan && same_backend && same_image_abi && same_image_features &&
-                same_correctness_revision && same_coverage &&
+                same_correctness_revision && same_coverage && same_patches &&
                 same_translate_all && same_source && same_fallback_policy &&
                 has_recompiled_project && has_required_launcher) {
                 last_fallback_modules = std::move(cached_fallback_modules);
@@ -3616,7 +3748,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                             static_cast<double>(module_results.size()) / nso_files.size(),
                             tr("Reading %1...").arg(QString::fromStdString(nso_file->GetName())));
                 const auto t_file_start = std::chrono::steady_clock::now();
-                auto result = AnalyzeNsoFile(nso_file, full_scan);
+                bool patch_failed = false;
+                auto result = AnalyzeNsoFile(nso_file, full_scan, patch_manager, patch_failed);
+                if (patch_failed) return {};
                 const auto t_file_end = std::chrono::steady_clock::now();
                 LOG_INFO(Frontend, "AOT diag: AnalyzeNsoFile({}) took {} ms, size={}",
                          nso_file->GetName(),
@@ -3664,7 +3798,9 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
             it.next();
             auto nso_file = vfs->OpenFile(it.filePath().toStdString(), FileSys::OpenMode::Read);
             if (nso_file) {
-                auto result = AnalyzeNsoFile(nso_file, full_scan);
+                bool patch_failed = false;
+                auto result = AnalyzeNsoFile(nso_file, full_scan, patch_manager, patch_failed);
+                if (patch_failed) return {};
                 if (result.has_value()) {
                     module_results.push_back(std::move(*result));
                 }
@@ -3759,6 +3895,18 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         lifted_code_bytes += mod.text_bytes.size();
         const QString mod_dir = recomp_root + QDir::separator() + mod.name;
         QDir().mkpath(mod_dir);
+        if (fallback_enabled && RequestedJitModules().contains(mod.name)) {
+            QFile stub(mod_dir + QDir::separator() + QStringLiteral("CMakeLists.txt"));
+            if (stub.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream o(&stub);
+                o << "# Module " << mod.name << " left to dynarmic JIT (SUYU_AOT_JIT_MODULES).\n"
+                     "message(STATUS \"[fallback] " << mod.name << " uses dynarmic\")\n";
+            }
+            fallback_modules.append(mod.name);
+            LOG_WARNING(Frontend, "Module {} left to dynarmic JIT by SUYU_AOT_JIT_MODULES",
+                        mod.name.toStdString());
+            continue;
+        }
 
         std::vector<u64> exported_roots = CollectExportedSymbolAddresses(mod);
         {
@@ -3921,7 +4069,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (top_cmake.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream o(&top_cmake);
             o << "cmake_minimum_required(VERSION 3.13)\n"
-                 "project(" << game_name << "_recompiled C)\n\n"
+                 "project(suyu_recompiled LANGUAGES C)\n\n"
                  "# Add each recompiled module as a subdirectory.\n"
                  "# Each module builds its own 'recompiled' exe and 'recompiled_image' shared lib.\n";
             for (const auto& m : recomp_module_dirs) {
@@ -4037,6 +4185,23 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                     o << "  recomp_image_guard_v2_" << m << "(ready?2:0);\n";
                 }
                 o << "  return ready;\n}\n";
+                // Each module's build ID, parallel to s_modules: the host binds
+                // an image to the loaded module with that ID, since an export
+                // may leave modules out and positions then stop lining up.
+                o << "\nconst char* const* suyu_recomp_static_build_ids_v1(unsigned* count);\n"
+                     "static const char* const s_build_ids[] = {\n";
+                for (const auto& m : ordered) {
+                    const auto mod = std::find_if(
+                        module_results.cbegin(), module_results.cend(),
+                        [&](const NsoAnalysisResult& r) { return r.name == m; });
+                    o << "    \"" << (mod != module_results.cend() ? mod->build_id_hex : QString{})
+                      << "\",\n";
+                }
+                o << "};\n"
+                     "const char* const* suyu_recomp_static_build_ids_v1(unsigned* count) {\n"
+                     "    *count = (unsigned)(sizeof(s_build_ids) / sizeof(s_build_ids[0]));\n"
+                     "    return s_build_ids;\n"
+                     "}\n";
                 if (suyu::recomp::g_emit_fastmem) {
                     // ABI 6: every module must report FM1 and accept the host's
                     // page-table layout and context offsets.
@@ -4898,6 +5063,12 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         return {};
     }
 
+    const auto current_patches = BakedPatchManifest(patch_modules, patch_manager);
+    if (!current_patches || *current_patches != *baked_patches) {
+        LOG_ERROR(Frontend, "Enabled NSO patches changed during export; re-export with unchanged mods");
+        return {};
+    }
+
     // Write the final fallback outcome, including compile-time module failures.
     last_fallback_modules = fallback_modules;
     QJsonArray fallback_array;
@@ -4915,7 +5086,11 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (suyu::recomp::g_emit_fastmem) {
             out << "  \"image_features\": " << image_features << ",\n";
         }
-        out << "  \"correctness_revision\": \"20260927-hybrid-guard-control-units-v3\",\n";
+        out << "  \"correctness_revision\": \"20261010-graphics-safe-defaults-r3\",\n";
+        if (!patch_fingerprint.isEmpty()) {
+            out << "  \"baked_patches\": " << QString::fromUtf8(
+                QJsonDocument(*baked_patches).toJson(QJsonDocument::Compact)) << ",\n";
+        }
         out << "  \"source_exefs_sha256\": \"" << source_hash << "\",\n";
         out << "  \"translate_all\": " << (translate_all ? "true" : "false") << ",\n";
         out << "  \"requested_backend\": \"" << requested_backend_name << "\",\n";
