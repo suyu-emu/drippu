@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import ctypes
+import errno
 import importlib.util
 import json
 import mmap
@@ -39,6 +40,8 @@ def lock_directory(path):
             try:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+                    raise ValueError(f"Another Drippu export is using {path}.") from exc
                 raise ValueError(f"Cannot lock {path} for this export: {exc}") from exc
             yield
         return
@@ -193,6 +196,7 @@ def validate_product(product, target, require_romfs=False):
         raise ValueError("The exported bundle has no runnable executable.")
     if target == "mac-app":
         return binary
+    return None
 
 
 def publish(product, destination):

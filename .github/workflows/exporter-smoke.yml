@@ -13,6 +13,21 @@ on:
   workflow_call:
 
 jobs:
+  apple-export-worker:
+    name: Apple export worker (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test package selection, validation, and publication
+        run: python -B -m unittest discover -s tests/nxnative_export -v
+
   exporter-smoke:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

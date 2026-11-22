@@ -7,11 +7,10 @@ import json
 import plistlib
 import sys
 import tempfile
-import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
+from unittest import TestCase, main, mock, skipUnless
 
 WORKER = Path(__file__).resolve().parents[2] / "dist/nxnative/export.py"
 spec = importlib.util.spec_from_file_location("nxnative_export", WORKER)
@@ -19,8 +18,8 @@ worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
 
 
-@unittest.skipUnless(sys.platform in ("darwin", "win32"), "Apple export build host")
-class ExportTest(unittest.TestCase):
+@skipUnless(sys.platform in ("darwin", "win32"), "Apple export build host")
+class ExportTest(TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -113,7 +112,7 @@ class ExportTest(unittest.TestCase):
         self.nx.check_metal.assert_not_called()
         self.nx.cli.assert_not_called()
 
-    @unittest.skipUnless(sys.platform == "darwin", "Mac export checks")
+    @skipUnless(sys.platform == "darwin", "Mac export checks")
     def test_storage_checked_before_and_after_build_confirmation(self):
         with mock.patch.object(worker.shutil, "disk_usage", return_value=SimpleNamespace(free=9)):
             with self.assertRaisesRegex(ValueError, "10 bytes.*Choose an export folder"):
@@ -151,7 +150,7 @@ class ExportTest(unittest.TestCase):
         (extraction / "ExeFS/main").unlink()
         self.assertEqual(cached(), 0)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Mac launcher")
+    @skipUnless(sys.platform == "darwin", "Mac launcher")
     def test_launcher_check_failure_prevents_publication(self):
         self.args.target = "mac-app"
         def pack_launcher(argv):
@@ -197,7 +196,7 @@ class ExportTest(unittest.TestCase):
             self.run_worker(windows_driver=slim)
         self.assertFalse(list(self.args.output.glob("*.ipa")))
 
-    @unittest.skipUnless(sys.platform == "win32", "Windows volume fallback")
+    @skipUnless(sys.platform == "win32", "Windows volume fallback")
     def test_copy_when_hard_links_are_unavailable(self):
         inputs = self.root / "inputs"
         inputs.mkdir()
@@ -266,4 +265,4 @@ class ExportTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()
