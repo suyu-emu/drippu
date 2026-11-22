@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "suyu/game_export.h"
+#ifdef Q_OS_MACOS
+#include "suyu/nxnative_export.h"
+#endif
 #include "suyu/nso_patch_baking.h"
 #include "suyu/steam_integration.h"
 #include "suyu/wikipedia_cover.h"
@@ -435,6 +438,23 @@ void GameExportDialog::SetupUi() {
     platform_combo->setCurrentIndex(1);
 #endif
     plat_row->addWidget(platform_combo);
+#ifdef Q_OS_MACOS
+    auto* nxnative = new QPushButton(tr("Build with NxNative…"), this);
+    plat_row->addWidget(nxnative);
+    connect(nxnative, &QPushButton::clicked, this, [this] {
+        if (export_in_progress) {
+            return;
+        }
+        if (rom_path_edit->text().isEmpty()) {
+            OnSelectFromLibrary();
+        }
+        if (!rom_path_edit->text().isEmpty()) {
+            const auto keys = Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir) / "prod.keys";
+            ShowNxNativeExport(this, rom_path_edit->text(), SelectedProgramId(),
+                               output_path_edit->text(), FromFsPath(keys));
+        }
+    });
+#endif
     layout->addLayout(plat_row);
 
     // CPU backend used by the exported comparison build.
