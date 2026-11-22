@@ -78,7 +78,7 @@
 	url = https://github.com/DarkMatterCore/nxdumptool.git
 [submodule "externals/Prelude-Nro"]
 	path = externals/Prelude-Nro
-	url = https://github.com/NextendoNetwork/Prelude-Nro.git
+	url = https://git.nextendo.network/NextendoNetwork/Prelude-Nextendo.git
 [submodule "externals/nxapi"]
 	path = externals/nxapi
 	url = https://github.com/samuelthomas2774/nxapi.git
