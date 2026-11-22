@@ -436,6 +436,21 @@ target_sources(suyu
         ${THEMES}
 )
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(nxnative_resources
+        "${PROJECT_SOURCE_DIR}/dist/nxnative/export.py"
+        "${PROJECT_SOURCE_DIR}/dist/macos/nxnative/setup.md")
+    set_source_files_properties(${nxnative_resources} PROPERTIES
+        MACOSX_PACKAGE_LOCATION Resources/nxnative)
+    target_sources(suyu PRIVATE ${nxnative_resources})
+elseif (WIN32)
+    target_sources(suyu PRIVATE "${PROJECT_SOURCE_DIR}/dist/nxnative/windows.qrc")
+endif()
+
+if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_sources(suyu PRIVATE nxnative_export.cpp nxnative_export.h)
+endif()
+
 if (APPLE)
     set(MACOSX_ICON "../../dist/suyu.icns")
     set_source_files_properties(${MACOSX_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)

@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/nxnative">
+        <file>export.py</file>
+        <file alias="setup.md">windows.md</file>
+    </qresource>
+</RCC>
