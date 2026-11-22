@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Mac export dialog worker. Stdout carries NxNative's JSON lines and two Drippu events."""
+"""Apple game export dialog worker. Stdout carries NxNative's JSON lines and two Drippu events."""
 import argparse
 import contextlib
 import ctypes
-import fcntl
+import importlib.util
 import json
 import os
 import platform
 import plistlib
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+WINDOWS_RELEASE = "1.5.0"
 REVISION = "692c8047a940c581d6dade58829a2a754f0ca00b"
 
 
@@ -25,6 +27,20 @@ def event(kind, **fields):
 
 @contextlib.contextmanager
 def lock_directory(path):
+    if os.name == "nt":
+        import msvcrt
+
+        # Closing the handle releases the byte-range lock, including on cancellation.
+        with (path / ".drippu-export.lock").open("a+b") as lock:
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise ValueError(f"Cannot lock {path} for this export: {exc}") from exc
+            yield
+        return
+
+    import fcntl
     fd = os.open(path, os.O_RDONLY)
     try:
         try:
@@ -49,7 +65,18 @@ def stage_inputs(files, folder):
             link = folder / f"{i}-{source.stem}{source.suffix.upper()}"
             while link.exists():
                 link = link.with_name("_" + link.name)
-        link.symlink_to(source)
+        if os.name == "nt":
+            # No Developer Mode or administrator rights required. Do not hard-link a
+            # read-only file: clearing its read-only attribute on cleanup changes the source.
+            try:
+                if not os.access(source, os.W_OK):
+                    raise PermissionError("read-only package")
+                os.link(source, link)
+            except OSError:
+                event("say", msg=f"Copying {source.name} into the temporary build folder…")
+                shutil.copyfile(source, link)
+        else:
+            link.symlink_to(source)
         staged.append(link)
     return staged
 
@@ -71,7 +98,7 @@ def platform_evidence(notes, version, display, target):
     return "Device test status for this version is unconfirmed. See the upstream game notes if available."
 
 
-def validate_product(product, target):
+def validate_product(product, target, require_romfs=False):
     if target == "ios":
         with zipfile.ZipFile(product) as archive:
             plists = [n for n in archive.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", n)]
@@ -79,7 +106,14 @@ def validate_product(product, target):
                 raise ValueError("The IPA has no unique application bundle.")
             info = plistlib.loads(archive.read(plists[0]))
             executable = info["CFBundleExecutable"]
-            valid = archive.getinfo(plists[0].rsplit("/", 1)[0] + "/" + executable).file_size > 0
+            prefix = plists[0].rsplit("/", 1)[0] + "/"
+            valid = archive.getinfo(prefix + executable).file_size > 0
+            if require_romfs and not any(
+                (entry.filename == prefix + "romfs.img" and entry.file_size > 0)
+                or (entry.filename.startswith(prefix + "romfs/") and not entry.is_dir())
+                for entry in archive.infolist()
+            ):
+                raise ValueError("The single-game IPA is missing its bundled RomFS.")
     else:
         contents = product / "Contents"
         info = plistlib.loads((contents / "Info.plist").read_bytes())
@@ -92,22 +126,30 @@ def validate_product(product, target):
 def publish(product, destination):
     # Atomic same-volume commit, even if another process created the destination
     # during the build. os.rename would replace an existing IPA on macOS.
+    if os.name == "nt":
+        os.rename(product, destination)  # MoveFileEx without REPLACE_EXISTING
+        return
     rename = ctypes.CDLL(None, use_errno=True).renamex_np
     if rename(os.fsencode(product), os.fsencode(destination), 4):  # Darwin RENAME_EXCL
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err), str(destination))
 
 
-def build(args, nx, game):
+def build(args, nx, game, windows_driver=None, staging=None):
     repo = args.checkout
     env = nx.tool_env()
     nx.check_native_python()
     nx.check_prereqs(env, repo / "dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate", args.target == "mac-app")
-    nx.check_metal(sys.executable, repo, env)
+    if windows_driver is None:
+        nx.check_metal(sys.executable, repo, env)
     if not args.keys.is_file():
         raise ValueError("Select the prod.keys file for these packages.")
     args.output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".drippu-nx-", dir=args.output) as tmp:
+    # On Windows the dialog owns the staging directory and can clean it even if
+    # the complete worker/tool process tree is terminated.
+    scratch = contextlib.nullcontext(staging) if staging else tempfile.TemporaryDirectory(
+        prefix=".drippu-nx-", dir=args.output)
+    with scratch as tmp:
         inputs = Path(tmp) / "inputs"
         inputs.mkdir()
         staged = stage_inputs(args.files, inputs)
@@ -125,7 +167,8 @@ def build(args, nx, game):
         builds = profile.builds() if profile else {}
         registered = version in builds
         name = profile.get("name", title_id) if profile else args.files[0].stem
-        safe_name = re.sub(r"[/:\x00-\x1f]", "_", name).strip(" .")[:64] or title_id
+        invalid = r'[<>:"/\\|?*\x00-\x1f]' if windows_driver else r"[/:\x00-\x1f]"
+        safe_name = re.sub(invalid, "_", name).strip(" .")[:64] or title_id
         ext = ".ipa" if args.target == "ios" else ".app"
         filename = f"{safe_name} [{title_id}] [{version}]{ext}"
         destination = args.output / filename
@@ -148,22 +191,87 @@ def build(args, nx, game):
         with lock_directory(repo), lock_directory(work):
             # The packer writes an unknown title's survey beside the input packages,
             # even with --work-dir. Keep its logs after the input links are removed.
-            survey = work / "survey"
-            survey.mkdir(exist_ok=True)
-            (inputs / f"{title_id}_survey").symlink_to(survey, target_is_directory=True)
-            rc = nx.cli([str(inputs), "--keys", str(args.keys), "--title-id", title_id,
-                         "--package", version, "--platform", args.target, "--progress", "json",
-                         "--work-dir", str(work), "--out", str(product)])
+            command = [str(inputs), "--keys", str(args.keys), "--title-id", title_id,
+                       "--package", version, "--platform", args.target, "--progress", "json",
+                       "--work-dir", str(work), "--out", str(product)]
+            survey_path = inputs / f"{title_id}_survey"
+            if windows_driver is None:
+                survey = work / "survey"
+                survey.mkdir(exist_ok=True)
+                survey_path.symlink_to(survey, target_is_directory=True)
+                rc = nx.cli(command)
+            else:
+                # NX2Apple's one-game IPA includes the RomFS in the application.
+                try:
+                    rc = windows_driver(command + ["--romfs", "bundle"])
+                finally:
+                    if (survey_path / "logs").is_dir():
+                        shutil.copytree(survey_path / "logs", work / "survey/logs", dirs_exist_ok=True)
             if rc:
                 return rc
-            validate_product(product, args.target)
+            validate_product(product, args.target, require_romfs=windows_driver is not None)
             publish(product, destination)
         event("drippu_product", path=str(destination))
     return 0
 
 
+def windows_environment(installation):
+    package = installation / "_internal/nspb_qt"
+    version_file = package / "app_update.py"
+    marker = f"APP_VERSION = '{WINDOWS_RELEASE}'"
+    if (not version_file.is_file() or marker not in version_file.read_text(encoding="utf-8").splitlines()
+            or not (installation / "engine/scripts/build_ipa_from_nsp.py").is_file()):
+        raise ValueError(f"Select the extracted NX2Apple Windows {WINDOWS_RELEASE} release folder. See Setup.")
+    # Import only the pure Python package, never the frozen launcher's _internal
+    # directory. Its Qt and Python DLLs may belong to a different interpreter.
+    spec = importlib.util.spec_from_file_location("nspb_qt", package / "__init__.py",
+                                                  submodule_search_locations=[str(package)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    from nspb_qt import platform_util
+    from nspb_qt.win import shim
+
+    # shim.build_env also consults the process environment to locate the release's
+    # bundled Windows binaries. The actual driver runs in a separate interpreter.
+    os.environ["NSPB_REPO"] = str(installation / "engine")
+    env = platform_util.child_env({"DM_FULL_ROMFS": "1"})
+    return shim.build_env(env, python_exe=sys.executable)
+
+
+def windows_build(args):
+    if args.target != "ios":
+        raise ValueError("The NX2Apple Windows driver builds iPhone and iPad IPAs.")
+    if sys.version_info < (3, 12) or sys.maxsize <= 2**32 or platform.machine().lower() not in ("amd64", "x86_64"):
+        raise ValueError("Select an x64 Python 3.12 or later with the NX2Apple build packages.")
+    if not args.windows_prepared:
+        env = windows_environment(args.checkout)
+        # Start in the official shim environment so sitecustomize also applies
+        # to this interpreter, the extractor, and compiler subprocesses.
+        return subprocess.call([sys.executable, "-u", "-P", __file__, "--windows-prepared", *sys.argv[1:]],
+                               env=env, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+    from nspb_qt.win import driver
+
+    args.checkout = args.checkout / "engine"
+    nx = driver.load_upstream(args.checkout)
+    driver.patch(nx, args.checkout)
+    sys.path.insert(0, str(args.checkout / "dm/games"))
+    import game
+
+    def run_driver(command):
+        return subprocess.call([sys.executable, "-u", "-P", "-m", "nspb_qt.win.driver", *command],
+                               stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr, cwd=args.checkout)
+
+    try:
+        return build(args, nx, game, windows_driver=run_driver, staging=args.staging)
+    except nx.BuildError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--staging", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--windows-prepared", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--checkout", required=True, type=Path)
     parser.add_argument("--keys", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -171,13 +279,17 @@ def main():
     parser.add_argument("--title", type=lambda s: int(s, 16))
     parser.add_argument("files", nargs="+", type=Path)
     args = parser.parse_args()
+    args.checkout = args.checkout.expanduser().resolve()
+    args.output = args.output.expanduser().resolve()
+    args.keys = args.keys.expanduser().resolve()
+    if os.name == "nt":
+        if args.staging and not args.windows_prepared and sys.stdin.readline().strip() != "start":
+            return 1
+        return windows_build(args)
     if sys.version_info < (3, 12) or platform.machine() != "arm64":
         raise ValueError("Choose an arm64 Python 3.12 or later with the NxNative dependencies.")
     if tuple(map(int, platform.mac_ver()[0].split(".")[:2])) < (26, 6):
         raise ValueError("This NxNative revision requires macOS 26.6 or later.")
-    args.checkout = args.checkout.expanduser().resolve()
-    args.output = args.output.expanduser().resolve()
-    args.keys = args.keys.expanduser().resolve()
     head = subprocess.run(["/usr/bin/git", "-C", str(args.checkout), "rev-parse", "HEAD"],
                           capture_output=True, text=True, check=False)
     if head.returncode or head.stdout.strip() != REVISION:

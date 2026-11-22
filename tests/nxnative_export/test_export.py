@@ -13,13 +13,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-WORKER = Path(__file__).resolve().parents[2] / "dist/macos/nxnative/export.py"
+WORKER = Path(__file__).resolve().parents[2] / "dist/nxnative/export.py"
 spec = importlib.util.spec_from_file_location("nxnative_export", WORKER)
 worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
 
 
-@unittest.skipUnless(sys.platform == "darwin", "macOS artifact publication")
+@unittest.skipUnless(sys.platform in ("darwin", "win32"), "Apple export build host")
 class ExportTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -65,6 +65,7 @@ class ExportTest(unittest.TestCase):
             with zipfile.ZipFile(product, "w") as archive:
                 archive.writestr("Payload/Fixture.app/Info.plist", info)
                 archive.writestr("Payload/Fixture.app/fixture", b"fixture executable")
+                archive.writestr("Payload/Fixture.app/romfs.img", b"fixture RomFS")
         else:
             exe = product / "Contents/MacOS/fixture"
             exe.parent.mkdir(parents=True)
@@ -73,16 +74,21 @@ class ExportTest(unittest.TestCase):
             (product / "Contents/Info.plist").write_bytes(info)
         return 0
 
-    def run_worker(self, reply="build\n"):
+    def run_worker(self, reply="build\n", windows_driver=None):
         log = io.StringIO()
         with contextlib.redirect_stdout(log), mock.patch.object(sys, "stdin", io.StringIO(reply)):
-            rc = worker.build(self.args, self.nx, self.games)
+            if sys.platform == "win32" and windows_driver is None:
+                windows_driver = self.nx.cli
+            rc = worker.build(self.args, self.nx, self.games, windows_driver=windows_driver)
         events = [json.loads(line) for line in log.getvalue().splitlines()]
         self.assertEqual(list(self.args.output.glob(".drippu-nx-*")), [])
         return rc, events
 
     def test_platform_specific_evidence_and_artifacts(self):
-        for target, evidence in [("ios", "iPhone"), ("mac-app", "unconfirmed")]:
+        targets = [("ios", "iPhone")]
+        if sys.platform == "darwin":
+            targets.append(("mac-app", "unconfirmed"))
+        for target, evidence in targets:
             with self.subTest(target=target):
                 self.args.target = target
                 rc, events = self.run_worker()
@@ -95,6 +101,45 @@ class ExportTest(unittest.TestCase):
                 _, repeated = self.run_worker()
                 self.assertNotEqual(repeated[-1]["path"], str(artifact))
                 self.assertTrue(artifact.exists())
+
+    def test_windows_one_game_route(self):
+        def windows_pack(argv):
+            self.assertEqual(argv[-2:], ["--romfs", "bundle"])
+            return self.pack(argv)
+
+        rc, events = self.run_worker(windows_driver=windows_pack)
+        self.assertEqual(rc, 0)
+        self.assertEqual(events[-1]["ev"], "drippu_product")
+        self.nx.check_metal.assert_not_called()
+        self.nx.cli.assert_not_called()
+
+    def test_windows_rejects_slim_ipa(self):
+        def slim(argv):
+            product = Path(argv[argv.index("--out") + 1])
+            with zipfile.ZipFile(product, "w") as ipa:
+                ipa.writestr("Payload/Test.app/Info.plist", plistlib.dumps({"CFBundleExecutable": "game"}))
+                ipa.writestr("Payload/Test.app/game", b"fixture executable")
+                ipa.writestr("Payload/Test.app/romfs.id", b"external game data")
+            return 0
+
+        with self.assertRaisesRegex(ValueError, "bundled RomFS"):
+            self.run_worker(windows_driver=slim)
+        self.assertFalse(list(self.args.output.glob("*.ipa")))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows volume fallback")
+    def test_copy_when_hard_links_are_unavailable(self):
+        inputs = self.root / "inputs"
+        inputs.mkdir()
+        with mock.patch.object(worker.os, "link", side_effect=OSError("different volumes")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                staged = worker.stage_inputs(self.args.files, inputs)
+        self.assertEqual([p.read_bytes() for p in staged], [b"base", b"update"])
+        staged[0].write_bytes(b"test copy")
+        self.assertEqual(self.args.files[0].read_bytes(), b"base")
+
+    def test_windows_rejects_wrong_release_before_launch(self):
+        with self.assertRaisesRegex(ValueError, "NX2Apple Windows"):
+            worker.windows_environment(self.root)
 
     def test_decline_after_check(self):
         rc, events = self.run_worker("")

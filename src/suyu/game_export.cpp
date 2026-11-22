@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "suyu/game_export.h"
-#ifdef Q_OS_MACOS
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
 #include "suyu/nxnative_export.h"
 #endif
 #include "suyu/nso_patch_baking.h"
@@ -438,8 +438,12 @@ void GameExportDialog::SetupUi() {
     platform_combo->setCurrentIndex(1);
 #endif
     plat_row->addWidget(platform_combo);
-#ifdef Q_OS_MACOS
+#if defined(Q_OS_MACOS) || defined(Q_OS_WIN)
+#ifdef Q_OS_WIN
+    auto* nxnative = new QPushButton(tr("Build iPhone/iPad IPA with NX2Apple…"), this);
+#else
     auto* nxnative = new QPushButton(tr("Build with NxNative…"), this);
+#endif
     plat_row->addWidget(nxnative);
     connect(nxnative, &QPushButton::clicked, this, [this] {
         if (export_in_progress) {

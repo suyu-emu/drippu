@@ -5,6 +5,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QDialog>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -23,19 +24,75 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#ifdef Q_OS_WIN
+#include <memory>
+#include <QTemporaryDir>
+#include <QTemporaryFile>
+#include <windows.h>
+#endif
+
 namespace {
 
 QString ResourcePath(const QString& filename) {
+#ifdef Q_OS_WIN
+    return QStringLiteral(":/nxnative/") + filename;
+#else
     return QDir(QApplication::applicationDirPath()).absoluteFilePath(
         QStringLiteral("../Resources/nxnative/") + filename);
+#endif
 }
+
+#ifdef Q_OS_WIN
+// The worker waits on stdin until it belongs to the job. Every compiler it then
+// starts inherits the job, including when the user closes Drippu during a build.
+class BuildJob {
+public:
+    bool Attach(qint64 pid) {
+        Reset();
+        handle = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!handle || !SetInformationJobObject(handle, JobObjectExtendedLimitInformation,
+                                                 &limits, sizeof(limits))) {
+            Reset();
+            return false;
+        }
+        const auto child = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE,
+                                       static_cast<DWORD>(pid));
+        const bool attached = child && AssignProcessToJobObject(handle, child);
+        if (child) {
+            CloseHandle(child);
+        }
+        if (!attached) {
+            Reset();
+        }
+        return attached;
+    }
+
+    void Reset() {
+        if (handle) {
+            CloseHandle(handle);
+            handle = nullptr;
+        }
+    }
+
+    ~BuildJob() { Reset(); }
+
+private:
+    HANDLE handle{};
+};
+#endif
 
 class NxNativeDialog final : public QDialog {
 public:
     NxNativeDialog(QWidget* parent, const QString& game, quint64 title_id, const QString& output_dir,
                    const QString& keys_file)
         : QDialog(parent), base_path(game), program_id(title_id) {
+#ifdef Q_OS_WIN
+        setWindowTitle(tr("Build iPhone/iPad IPA with NX2Apple"));
+#else
         setWindowTitle(tr("Build with NxNative"));
+#endif
         resize(700, 550);
         auto* layout = new QVBoxLayout(this);
         auto* options = new QWidget(this);
@@ -47,7 +104,9 @@ public:
         base->setTextFormat(Qt::PlainText);
         form->addRow(tr("Base game"), base);
         target = new QComboBox(this);
+#ifdef Q_OS_MACOS
         target->addItem(tr("Mac app (.app)"), QStringLiteral("mac-app"));
+#endif
         target->addItem(tr("iPhone / iPad app (.ipa, unsigned)"), QStringLiteral("ios"));
         form->addRow(tr("Build for"), target);
 
@@ -90,6 +149,14 @@ public:
             return edit;
         };
         const QSettings previous;
+#ifdef Q_OS_WIN
+        checkout = path_row(tr("NX2Apple release folder"), previous.value("nxnative/checkout").toString(), true);
+        const auto nx_python = QDir(qEnvironmentVariable("LOCALAPPDATA"))
+                                   .filePath(QStringLiteral("NS Port Builder/venv/Scripts/python.exe"));
+        const auto default_python = QFileInfo(nx_python).isFile() ? nx_python
+            : QStandardPaths::findExecutable(QStringLiteral("python.exe"));
+        python = path_row(tr("Python executable"), previous.value("nxnative/python", default_python).toString(), false);
+#else
         checkout = path_row(tr("NxNative checkout"), previous.value("nxnative/checkout").toString(), true);
         python = path_row(tr("Python executable"), previous.value("nxnative/python",
                           QStandardPaths::findExecutable(QStringLiteral("python3"))).toString(), false);
@@ -99,6 +166,7 @@ public:
                 python->setText(venv);
             }
         });
+#endif
         keys = path_row(tr("Console keys"), previous.value("nxnative/keys", keys_file).toString(), false);
         output = path_row(tr("Export folder"), output_dir, true);
 
@@ -106,7 +174,11 @@ public:
         auto* setup = new QPushButton(tr("Setup…"), this);
         notes = new QPushButton(tr("Upstream game notes…"), this);
         notes->setEnabled(false);
+#ifdef Q_OS_WIN
+        reveal = new QPushButton(tr("Open export folder"), this);
+#else
         reveal = new QPushButton(tr("Show in Finder"), this);
+#endif
         reveal->setEnabled(false);
         buttons->addWidget(setup);
         buttons->addWidget(notes);
@@ -114,13 +186,17 @@ public:
         buttons->addStretch();
         layout->addLayout(buttons);
         connect(setup, &QPushButton::clicked, this, [this] {
-            ShowDocument(tr("NxNative setup"), ResourcePath(QStringLiteral("setup.md")));
+            ShowDocument(tr("Build setup"), ResourcePath(QStringLiteral("setup.md")));
         });
         connect(notes, &QPushButton::clicked, this, [this] {
             ShowDocument(tr("Upstream game notes"), notes_path);
         });
         connect(reveal, &QPushButton::clicked, this, [this] {
+#ifdef Q_OS_WIN
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(artifact).absolutePath()));
+#else
             QProcess::startDetached(QStringLiteral("/usr/bin/open"), {QStringLiteral("-R"), artifact});
+#endif
         });
 
         log = new QPlainTextEdit(this);
@@ -143,8 +219,28 @@ public:
         layout->addLayout(actions);
 
         process.setProcessChannelMode(QProcess::MergedChannels);
+#ifdef Q_OS_WIN
+        connect(&process, &QProcess::started, this, [this] {
+            if (cancelled || !job.Attach(process.processId())) {
+                if (!cancelled) {
+                    log->appendPlainText(tr("Windows could not create an isolated build process."));
+                }
+                process.kill();
+                return;
+            }
+            process.write("start\n");
+        });
+#endif
         connect(&process, &QProcess::readyReadStandardOutput, this, [this] { ReadLines(false); });
         auto restore = [this, options] {
+#ifdef Q_OS_WIN
+            job.Reset();
+            if (scratch && !scratch->remove()) {
+                log->appendPlainText(tr("Temporary files could not be removed from %1.").arg(scratch->path()));
+            }
+            scratch.reset();
+            worker_script.reset();
+#endif
             options->setEnabled(true);
             stop->setEnabled(false);
             action->setText(tr("Check compatibility"));
@@ -190,13 +286,35 @@ public:
             settings.setValue("nxnative/checkout", checkout->text());
             settings.setValue("nxnative/python", python->text());
             settings.setValue("nxnative/keys", keys->text());
-            QStringList args{QStringLiteral("-u"), ResourcePath(QStringLiteral("export.py")), QStringLiteral("--checkout"), checkout->text(),
-                             QStringLiteral("--keys"), keys->text(), QStringLiteral("--output"), output->text(), QStringLiteral("--target"),
-                             target->currentData().toString()};
+            QString script = ResourcePath(QStringLiteral("export.py"));
+            const QString destination = QFileInfo(output->text()).absoluteFilePath();
+#ifdef Q_OS_WIN
+            if (!QDir().mkpath(destination)) {
+                status->setText(tr("Could not create the export folder."));
+                return;
+            }
+            scratch = std::make_unique<QTemporaryDir>(QDir(destination).filePath(QStringLiteral(".drippu-nx-XXXXXX")));
+            worker_script.reset(QTemporaryFile::createNativeFile(script));
+            if (!scratch->isValid() || !worker_script) {
+                scratch.reset();
+                worker_script.reset();
+                status->setText(tr("Could not create temporary build files."));
+                return;
+            }
+            script = worker_script->fileName();
+            worker_script->close();
+#endif
+            QStringList args{QStringLiteral("-u"), script, QStringLiteral("--checkout"),
+                             QFileInfo(checkout->text()).absoluteFilePath(), QStringLiteral("--keys"),
+                             QFileInfo(keys->text()).absoluteFilePath(), QStringLiteral("--output"),
+                             destination, QStringLiteral("--target"), target->currentData().toString()};
+#ifdef Q_OS_WIN
+            args << QStringLiteral("--staging") << scratch->path();
+#endif
             if (program_id) {
                 args << QStringLiteral("--title") << QString::number(program_id, 16);
             }
-            args << QStringLiteral("--") << base_path;
+            args << QStringLiteral("--") << QFileInfo(base_path).absoluteFilePath();
             for (int i = 0; i < addons->count(); ++i) {
                 args << addons->item(i)->text();
             }
@@ -209,7 +327,7 @@ public:
             artifact.clear();
             pending.clear();
             log->clear();
-            status->setText(tr("Checking packages and Apple build tools…"));
+            status->setText(tr("Checking packages and build tools…"));
             process.start(python->text(), args);
         });
     }
@@ -229,7 +347,12 @@ private:
         stop->setEnabled(false);
         action->setEnabled(false);
         status->setText(tr("Stopping…"));
+#ifdef Q_OS_WIN
+        job.Reset();
+        process.kill(); // Also covers cancellation before the startup handshake.
+#else
         process.terminate();
+#endif
     }
 
     void ShowDocument(const QString& title, const QString& path) {
@@ -239,7 +362,9 @@ private:
         auto* box = new QVBoxLayout(&dialog);
         auto* document = new QTextBrowser(&dialog);
         document->setOpenExternalLinks(true);
-        document->setSource(QUrl::fromLocalFile(path), QTextDocument::MarkdownResource);
+        const auto url = path.startsWith(QStringLiteral(":/")) ? QUrl(QStringLiteral("qrc") + path)
+                                                              : QUrl::fromLocalFile(path);
+        document->setSource(url, QTextDocument::MarkdownResource);
         box->addWidget(document);
         dialog.exec();
     }
@@ -288,6 +413,11 @@ private:
     QPushButton *action, *stop, *notes, *reveal;
     QPlainTextEdit* log;
     QLabel* status;
+#ifdef Q_OS_WIN
+    std::unique_ptr<QTemporaryDir> scratch;
+    std::unique_ptr<QTemporaryFile> worker_script;
+    BuildJob job;
+#endif
     QProcess process;
     QByteArray pending;
     bool ready = false;

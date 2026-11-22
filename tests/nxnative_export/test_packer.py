@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Run with the configured NxNative Python and DRIPPU_TEST_NXNATIVE set to its checkout."""
+"""Set DRIPPU_TEST_NXNATIVE (Mac checkout) or DRIPPU_TEST_NX2APPLE (Windows release)."""
 import hashlib
 import json
 import os
@@ -14,7 +14,10 @@ sys.path.insert(0, str(ROOT / "tests/export_integration"))
 import make_fixture
 
 
-@unittest.skipUnless(os.environ.get("DRIPPU_TEST_NXNATIVE"), "requires the pinned Mac toolchain")
+INSTALLATION = os.environ.get("DRIPPU_TEST_NX2APPLE" if sys.platform == "win32" else "DRIPPU_TEST_NXNATIVE")
+
+
+@unittest.skipUnless(INSTALLATION, "requires the configured export toolchain")
 class RealPackerTest(unittest.TestCase):
     def test_metadata_preflight_and_packer_failure(self):
         # A legitimate synthetic content meta, deliberately without a program.
@@ -29,11 +32,11 @@ class RealPackerTest(unittest.TestCase):
             keys = folder / "prod.keys"
             keys.write_text("key_area_key_application_00 = " + "7a" * 16 +
                             "\nheader_key = " + bytes(range(32)).hex() + "\n")
-            for target in ("mac-app", "ios"):
+            for target in (("ios",) if sys.platform == "win32" else ("mac-app", "ios")):
                 with self.subTest(target=target):
                     result = subprocess.run(
-                        [sys.executable, str(ROOT / "dist/macos/nxnative/export.py"),
-                         "--checkout", os.environ["DRIPPU_TEST_NXNATIVE"], "--keys", str(keys),
+                        [sys.executable, str(ROOT / "dist/nxnative/export.py"),
+                         "--checkout", INSTALLATION, "--keys", str(keys),
                          "--output", tmp, "--target", target, str(base)],
                         input="build\n", capture_output=True, text=True, timeout=90)
                     events = [json.loads(s) for s in result.stdout.splitlines() if s.startswith("{")]
