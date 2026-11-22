@@ -263,7 +263,7 @@ def build(args, nx, game, windows_driver=None, staging=None):
             return check_space(args.output, staged, extraction, cached)
         report = "\n" + storage_report() if windows_driver is None else ""
         event("drippu_ready", msg=f"{name} · {label}\n{status}\n{evidence}{report}",
-              notes=str(notes) if notes else "")
+              profile_id=profile.dir.name if profile else "")
         if sys.stdin.readline().strip() != "build":
             return 1
         work.mkdir(parents=True, exist_ok=True)
@@ -321,9 +321,16 @@ def windows_environment(installation):
 
     # shim.build_env also consults the process environment to locate the release's
     # bundled Windows binaries. The actual driver runs in a separate interpreter.
-    os.environ["NSPB_REPO"] = str(installation / "engine")
-    env = platform_util.child_env({"DM_FULL_ROMFS": "1"})
-    return shim.build_env(env, python_exe=sys.executable)
+    previous = os.environ.get("NSPB_REPO")
+    try:
+        os.environ["NSPB_REPO"] = str(installation / "engine")
+        env = platform_util.child_env({"DM_FULL_ROMFS": "1"})
+        return shim.build_env(env, python_exe=sys.executable)
+    finally:
+        if previous is None:
+            del os.environ["NSPB_REPO"]
+        else:
+            os.environ["NSPB_REPO"] = previous
 
 
 def windows_build(args):

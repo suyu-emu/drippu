@@ -18,6 +18,7 @@
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTextBrowser>
@@ -211,7 +212,10 @@ public:
             ShowDocument(tr("Build setup"), ResourcePath(QStringLiteral("setup.md")));
         });
         connect(notes, &QPushButton::clicked, this, [this] {
-            ShowDocument(tr("Upstream game notes"), notes_path);
+            const auto path = ProfileNotes();
+            if (!path.isEmpty()) {
+                ShowDocument(tr("Upstream game notes"), path);
+            }
         });
         connect(reveal, &QPushButton::clicked, this, [this] {
 #ifdef Q_OS_WIN
@@ -319,6 +323,15 @@ public:
                 status->setText(tr("Choose the build tools, console keys, and export folder."));
                 return;
             }
+            QDir engine(installation);
+#ifdef Q_OS_WIN
+            engine.setPath(engine.filePath(QStringLiteral("engine")));
+#else
+            if (using_release) {
+                engine.setPath(engine.filePath(QStringLiteral("Contents/Resources/engine")));
+            }
+#endif
+            profiles_root = QFileInfo(engine.filePath(QStringLiteral("dm/games"))).canonicalFilePath();
             settings.setValue("nxnative/checkout", checkout->text());
             settings.setValue("nxnative/python", python->text());
             settings.setValue("nxnative/keys", keys->text());
@@ -388,6 +401,18 @@ protected:
     }
 
 private:
+    QString ProfileNotes() const {
+        static const QRegularExpression title_pattern(QStringLiteral("\\A[0-9A-Fa-f]{16}\\z"));
+        if (profiles_root.isEmpty() || !title_pattern.match(profile_id).hasMatch()) {
+            return {};
+        }
+        const QDir root(profiles_root);
+        const auto relative = profile_id + QStringLiteral("/README.md");
+        const QFileInfo file(root.filePath(relative));
+        const auto canonical = file.canonicalFilePath();
+        return file.isFile() && root.relativeFilePath(canonical) == relative ? canonical : QString{};
+    }
+
     void Cancel() {
         cancelled = true;
         stop->setEnabled(false);
@@ -425,8 +450,8 @@ private:
             const auto ev = obj[QStringLiteral("ev")].toString();
             if (ev == QStringLiteral("drippu_ready") && !cancelled) {
                 log->appendPlainText(obj[QStringLiteral("msg")].toString());
-                notes_path = obj[QStringLiteral("notes")].toString();
-                notes->setEnabled(QFileInfo(notes_path).isFile());
+                profile_id = obj[QStringLiteral("profile_id")].toString();
+                notes->setEnabled(!ProfileNotes().isEmpty());
                 status->setText(tr("Review the selected version and platform evidence before building."));
                 ready = true;
                 action->setText(tr("Build"));
@@ -452,7 +477,7 @@ private:
         }
     }
 
-    QString base_path, notes_path, artifact, verification;
+    QString base_path, profiles_root, profile_id, artifact, verification;
     quint64 program_id;
     QComboBox* target;
     QListWidget* addons;
