@@ -131,16 +131,17 @@ public:
         });
         connect(remove, &QPushButton::clicked, this, [this] { qDeleteAll(addons->selectedItems()); });
 
-        const auto path_row = [this, form](const QString& label, const QString& initial, bool directory) {
+        const auto path_row = [this, form](const QString& label, const QString& initial, bool directory,
+                                           const QString& filter = {}) {
             auto* row = new QHBoxLayout;
             auto* edit = new QLineEdit(initial, this);
             auto* browse = new QPushButton(tr("Browse…"), this);
             row->addWidget(edit);
             row->addWidget(browse);
             form->addRow(label, row);
-            connect(browse, &QPushButton::clicked, this, [this, edit, label, directory] {
+            connect(browse, &QPushButton::clicked, this, [this, edit, label, directory, filter] {
                 const auto file = directory ? QFileDialog::getExistingDirectory(this, label, edit->text())
-                                            : QFileDialog::getOpenFileName(this, label, edit->text(), {}, nullptr,
+                                            : QFileDialog::getOpenFileName(this, label, edit->text(), filter, nullptr,
                                                                            QFileDialog::DontResolveSymlinks);
                 if (!file.isEmpty()) {
                     edit->setText(file);
@@ -157,6 +158,11 @@ public:
             : QStandardPaths::findExecutable(QStringLiteral("python.exe"));
         python = path_row(tr("Python executable"), previous.value("nxnative/python", default_python).toString(), false);
 #else
+        auto* toolchain = new QComboBox(this);
+        toolchain->addItem(tr("NxNative checkout"));
+        toolchain->addItem(tr("NX2Apple 1.5.0 for Mac"));
+        form->addRow(tr("Toolchain"), toolchain);
+        const auto checkout_row = form->rowCount();
         checkout = path_row(tr("NxNative checkout"), previous.value("nxnative/checkout").toString(), true);
         python = path_row(tr("Python executable"), previous.value("nxnative/python",
                           QStandardPaths::findExecutable(QStringLiteral("python3"))).toString(), false);
@@ -166,6 +172,22 @@ public:
                 python->setText(venv);
             }
         });
+        const auto app_row = form->rowCount();
+        const auto applications = tr("Mac applications (*.app)");
+        release_app = path_row(tr("NX2Apple app"), previous.value("nxnative/macRelease",
+                               QStringLiteral("/Applications/NX2Apple.app")).toString(), false, applications);
+        xcode = path_row(tr("Xcode app"), previous.value("nxnative/xcode").toString(), false, applications);
+        xcode->setPlaceholderText(tr("Use system Xcode"));
+        const auto select_mode = [this, form, checkout_row, app_row](int index) {
+            using_release = index == 1;
+            form->setRowVisible(checkout_row, !using_release);
+            form->setRowVisible(checkout_row + 1, !using_release);
+            form->setRowVisible(app_row, using_release);
+        };
+        toolchain->setCurrentIndex(previous.value("nxnative/useMacRelease",
+            checkout->text().isEmpty() && QFileInfo(release_app->text()).isDir()).toBool() ? 1 : 0);
+        select_mode(toolchain->currentIndex());
+        connect(toolchain, &QComboBox::currentIndexChanged, this, select_mode);
 #endif
         keys = path_row(tr("Console keys"), previous.value("nxnative/keys", keys_file).toString(), false);
         output = path_row(tr("Export folder"), output_dir, true);
@@ -261,7 +283,7 @@ public:
                 reveal->setEnabled(true);
                 status->setText(target->currentData().toString() == QStringLiteral("ios")
                         ? tr("IPA ready. Sign and install it with your sideloading tool.")
-                        : tr("Mac app ready."));
+                        : tr("Mac app ready. %1").arg(verification));
                 log->appendPlainText(artifact);
             } else {
                 status->setText(cancelled ? tr("Cancelled.") : tr("Export stopped. See the log above."));
@@ -277,12 +299,26 @@ public:
                 process.closeWriteChannel();
                 return;
             }
-            if (checkout->text().isEmpty() || python->text().isEmpty() || keys->text().isEmpty() ||
-                output->text().isEmpty()) {
-                status->setText(tr("Choose a checkout, Python executable, keys file, and export folder."));
+            QString installation = checkout->text();
+            QString interpreter = python->text();
+            QSettings settings;
+#ifdef Q_OS_MACOS
+            settings.setValue("nxnative/useMacRelease", using_release);
+            settings.setValue("nxnative/macRelease", release_app->text());
+            settings.setValue("nxnative/xcode", xcode->text());
+            if (using_release) {
+                installation = release_app->text();
+                interpreter = QDir(installation).filePath(QStringLiteral("Contents/Resources/python/bin/python3"));
+                if (!QFileInfo(interpreter).isExecutable()) {
+                    status->setText(tr("Choose the NX2Apple release app containing its bundled Python."));
+                    return;
+                }
+            }
+#endif
+            if (installation.isEmpty() || interpreter.isEmpty() || keys->text().isEmpty() || output->text().isEmpty()) {
+                status->setText(tr("Choose the build tools, console keys, and export folder."));
                 return;
             }
-            QSettings settings;
             settings.setValue("nxnative/checkout", checkout->text());
             settings.setValue("nxnative/python", python->text());
             settings.setValue("nxnative/keys", keys->text());
@@ -305,11 +341,20 @@ public:
             worker_script->close();
 #endif
             QStringList args{QStringLiteral("-u"), script, QStringLiteral("--checkout"),
-                             QFileInfo(checkout->text()).absoluteFilePath(), QStringLiteral("--keys"),
+                             QFileInfo(installation).absoluteFilePath(), QStringLiteral("--keys"),
                              QFileInfo(keys->text()).absoluteFilePath(), QStringLiteral("--output"),
                              destination, QStringLiteral("--target"), target->currentData().toString()};
 #ifdef Q_OS_WIN
             args << QStringLiteral("--staging") << scratch->path();
+#else
+            if (using_release) {
+                args.prepend(QStringLiteral("-B"));
+                args.prepend(QStringLiteral("-I"));
+                args << QStringLiteral("--nx2apple");
+            }
+            if (!xcode->text().isEmpty()) {
+                args << QStringLiteral("--xcode") << QFileInfo(xcode->text()).absoluteFilePath();
+            }
 #endif
             if (program_id) {
                 args << QStringLiteral("--title") << QString::number(program_id, 16);
@@ -325,10 +370,11 @@ public:
             notes->setEnabled(false);
             cancelled = false;
             artifact.clear();
+            verification.clear();
             pending.clear();
             log->clear();
             status->setText(tr("Checking packages and build tools…"));
-            process.start(python->text(), args);
+            process.start(interpreter, args);
         });
     }
 
@@ -387,6 +433,7 @@ private:
                 action->setEnabled(true);
             } else if (ev == QStringLiteral("drippu_product")) {
                 artifact = obj[QStringLiteral("path")].toString();
+                verification = obj[QStringLiteral("verification")].toString();
             } else if (ev == QStringLiteral("say")) {
                 log->appendPlainText(obj[QStringLiteral("msg")].toString());
             } else if (ev == QStringLiteral("stage") || ev == QStringLiteral("step") || ev == QStringLiteral("progress")) {
@@ -405,11 +452,15 @@ private:
         }
     }
 
-    QString base_path, notes_path, artifact;
+    QString base_path, notes_path, artifact, verification;
     quint64 program_id;
     QComboBox* target;
     QListWidget* addons;
     QLineEdit *checkout, *python, *keys, *output;
+#ifdef Q_OS_MACOS
+    QLineEdit *release_app, *xcode;
+    bool using_release = false;
+#endif
     QPushButton *action, *stop, *notes, *reveal;
     QPlainTextEdit* log;
     QLabel* status;

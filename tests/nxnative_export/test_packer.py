@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Set DRIPPU_TEST_NXNATIVE (Mac checkout) or DRIPPU_TEST_NX2APPLE (Windows release)."""
+"""Set DRIPPU_TEST_NXNATIVE for a Mac checkout or DRIPPU_TEST_NX2APPLE for a release."""
 import hashlib
 import json
 import os
@@ -14,7 +14,8 @@ sys.path.insert(0, str(ROOT / "tests/export_integration"))
 import make_fixture
 
 
-INSTALLATION = os.environ.get("DRIPPU_TEST_NX2APPLE" if sys.platform == "win32" else "DRIPPU_TEST_NXNATIVE")
+RELEASE = os.environ.get("DRIPPU_TEST_NX2APPLE")
+INSTALLATION = RELEASE or os.environ.get("DRIPPU_TEST_NXNATIVE")
 
 
 @unittest.skipUnless(INSTALLATION, "requires the configured export toolchain")
@@ -37,7 +38,8 @@ class RealPackerTest(unittest.TestCase):
                     result = subprocess.run(
                         [sys.executable, str(ROOT / "dist/nxnative/export.py"),
                          "--checkout", INSTALLATION, "--keys", str(keys),
-                         "--output", tmp, "--target", target, str(base)],
+                         "--output", tmp, "--target", target,
+                         *(["--nx2apple"] if RELEASE and sys.platform == "darwin" else []), str(base)],
                         input="build\n", capture_output=True, text=True, timeout=90)
                     events = [json.loads(s) for s in result.stdout.splitlines() if s.startswith("{")]
                     self.assertNotEqual(result.returncode, 0)

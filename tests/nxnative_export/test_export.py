@@ -113,6 +113,77 @@ class ExportTest(unittest.TestCase):
         self.nx.check_metal.assert_not_called()
         self.nx.cli.assert_not_called()
 
+    @unittest.skipUnless(sys.platform == "darwin", "Mac export checks")
+    def test_storage_checked_before_and_after_build_confirmation(self):
+        with mock.patch.object(worker.shutil, "disk_usage", return_value=SimpleNamespace(free=9)):
+            with self.assertRaisesRegex(ValueError, "10 bytes.*Choose an export folder"):
+                self.run_worker()
+        with mock.patch.object(worker.shutil, "disk_usage", side_effect=[
+                SimpleNamespace(free=10**12), SimpleNamespace(free=1)]):
+            with self.assertRaisesRegex(ValueError, "Choose an export folder"):
+                self.run_worker()
+        self.nx.cli.assert_not_called()
+
+    def test_compressed_space_and_matching_cache(self):
+        compressed = self.root / "fixture.XCZ"
+        compressed.write_bytes(b"1234")
+        extraction = self.root / "extract/v327680"
+        (extraction / "ExeFS").mkdir(parents=True)
+        (extraction / "ExeFS/main").write_bytes(b"program")
+        (extraction / "RomFS.img").write_bytes(b"image")
+        (extraction / "extract.key").write_text("stamp")
+        family = {"base": self.args.files[0]}
+        self.nx.nsp_versions.return_value = {"v327680": self.args.files[1]}
+        self.nx.reused.return_value = ""
+        def cached():
+            return worker.cached_extraction(self.nx, self.root, extraction, family, "v327680", self.args.title)
+        self.assertEqual(cached(), 5)
+        self.nx.extraction_key.assert_called_once_with(self.root, "program", tuple(self.args.files),
+                                                       self.nx.extract_flags.return_value)
+        with mock.patch.object(worker.shutil, "disk_usage", return_value=SimpleNamespace(free=13)):
+            msg = worker.check_space(self.root, [compressed, self.args.files[0]], extraction, cached())
+            self.assertIn("minimum: 13 bytes", msg)
+            self.assertIn("5 bytes of reusable", msg)
+            self.assertIn("Below the estimate", msg)
+        self.nx.reused.return_value = None
+        self.assertEqual(cached(), 0)
+        self.nx.reused.return_value = ""
+        (extraction / "ExeFS/main").unlink()
+        self.assertEqual(cached(), 0)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mac launcher")
+    def test_launcher_check_failure_prevents_publication(self):
+        self.args.target = "mac-app"
+        def pack_launcher(argv):
+            self.pack(argv)
+            binary = Path(argv[argv.index("--out") + 1]) / "Contents/MacOS/fixture"
+            binary.write_bytes(b"fixture with DM_PREFLIGHT\0")
+            return 0
+        self.nx.cli.side_effect = pack_launcher
+        with mock.patch.object(worker.subprocess, "run", return_value=SimpleNamespace(returncode=4)) as launch:
+            with self.assertRaisesRegex(ValueError, "verification failed"):
+                self.run_worker()
+            self.assertEqual(launch.call_args.kwargs["env"]["DM_PREFLIGHT"], "1")
+        self.assertFalse(list(self.args.output.glob("*.app")))
+        self.nx.cli.side_effect = self.pack
+        with mock.patch.object(worker.subprocess, "run") as launch:
+            _, events = self.run_worker()
+            self.assertIn("does not support", events[-1]["verification"])
+            launch.assert_not_called()
+
+    def test_mismatched_mac_engine_and_invalid_xcode(self):
+        app = self.root / "NX2Apple.app"
+        with self.assertRaisesRegex(ValueError, "NX2Apple 1.5.0"):
+            worker.mac_release(app, self.root)
+        contents = app / "Contents"
+        contents.mkdir(parents=True)
+        (contents / "Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "org.nxnative.NSPortBuilder", "CFBundleShortVersionString": "1.5.0"}))
+        with self.assertRaisesRegex(ValueError, "engine missing or mismatched"):
+            worker.mac_release(app, self.root)
+        with self.assertRaisesRegex(ValueError, "Xcode application"):
+            worker.select_xcode(app)
+
     def test_windows_rejects_slim_ipa(self):
         def slim(argv):
             product = Path(argv[argv.index("--out") + 1])
