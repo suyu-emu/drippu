@@ -54,6 +54,12 @@ static BOOL limit;
     assert([[r valueForHTTPHeaderField:@"X-Nextendo-Client-Id"] isEqual:client()]);
     NSInteger status = 200;
     NSDictionary *json = nil;
+    if ([r.URL.path isEqual:@"/offline-fixture"]) {
+        [self.client URLProtocol:self didFailWithError:[NSError errorWithDomain:NSURLErrorDomain
+                                                                          code:NSURLErrorNotConnectedToInternet
+                                                                      userInfo:nil]];
+        return;
+    }
     if ([r.URL.path isEqual:@"/api/oauth/token"]) {
         assert([r.HTTPMethod isEqual:@"POST"]);
         rotations++;
@@ -73,6 +79,10 @@ static BOOL limit;
         json = @{};
     } else {
         assert([r.URL.path isEqual:@"/api/oauth/revoke"]);
+        assert([sessionLock tryLock]);
+        assert(!stored && !gameToken && !pid);
+        [sessionLock unlock];
+        status = 429;
         revoked++;
         json = @{};
     }
@@ -98,6 +108,11 @@ int main(void) {
         stored = [@"first" dataUsingEncoding:NSUTF8StringEncoding];
         dispatch_group_t group = dispatch_group_create();
         dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+          NSInteger status;
+          [sessionLock lock];
+          assert(!api(@"/offline-fixture", @"GET", nil, nil, &status));
+          assert(status == -1 && [failure containsString:@"network connection"]);
+          [sessionLock unlock];
           assert(drippu_session_ensure(0) && drippu_session_pid() == 1234);
           assert([refreshToken() isEqual:@"rotate-1"] && rotations == 1);
           char token[4096];
@@ -125,7 +140,10 @@ int main(void) {
           limit = YES;
           assert(!drippu_session_ensure(0) && !drippu_session_ensure(0));
           assert(gameRequests == 3);
+          NSTimeInterval previousRetry = retryAfter;
+          NSString *previousError = failure;
           drippu_session_logout();
+          assert(retryAfter == previousRetry && failure == previousError);
           assert(!stored && revoked == 1 && drippu_session_pid() == 0);
         });
         assert(dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 15LL * NSEC_PER_SEC)) == 0);

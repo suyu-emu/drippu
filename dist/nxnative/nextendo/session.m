@@ -138,8 +138,8 @@ static BOOL storeRefresh(NSString *token) {
     [item addEntriesFromDictionary:attrs];
     return SecItemAdd((__bridge CFDictionaryRef)item, NULL) == errSecSuccess;
 }
-static NSDictionary *api(NSString *path, NSString *method, NSDictionary *fields, NSString *bearer,
-                         NSInteger *status) {
+static NSDictionary *sendRequest(NSString *path, NSString *method, NSDictionary *fields,
+                                 NSString *bearer, NSHTTPURLResponse **outResponse) {
     NSMutableURLRequest *req =
         [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[origin stringByAppendingString:path]]];
     req.HTTPMethod = method;
@@ -154,17 +154,40 @@ static NSDictionary *api(NSString *path, NSString *method, NSDictionary *fields,
     __block NSDictionary *json;
     __block NSHTTPURLResponse *response;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
-    [[http dataTaskWithRequest:req
+    NSURLSessionDataTask *task = [http dataTaskWithRequest:req
              completionHandler:^(NSData *data, NSURLResponse *reply, NSError *error) {
-               response = (NSHTTPURLResponse *)reply;
+               if (!error && [reply isKindOfClass:NSHTTPURLResponse.class])
+                   response = (NSHTTPURLResponse *)reply;
                id obj = data && !error
                             ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL]
                             : nil;
                if ([obj isKindOfClass:NSDictionary.class])
                    json = obj;
                dispatch_semaphore_signal(done);
-             }] resume];
-    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+             }];
+    [task resume];
+    // Allow the configured 30-second resource timeout to deliver its completion first.
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 35LL * NSEC_PER_SEC))) {
+        [task cancel];
+        if (outResponse)
+            *outResponse = nil;
+        return nil;
+    }
+    if (outResponse)
+        *outResponse = response;
+    return json;
+}
+
+// Called with sessionLock held. Only active-session requests update its error and retry state.
+static NSDictionary *api(NSString *path, NSString *method, NSDictionary *fields, NSString *bearer,
+                         NSInteger *status) {
+    NSHTTPURLResponse *response = nil;
+    NSDictionary *json = sendRequest(path, method, fields, bearer, &response);
+    if (!response) {
+        *status = -1;
+        failure = @"Could not reach Nextendo. Check your network connection and try again.";
+        return nil;
+    }
     *status = response.statusCode;
     if (*status == 429)
         retryAfter = now() + MAX(1, [[response valueForHTTPHeaderField:@"Retry-After"] integerValue]);
@@ -417,7 +440,9 @@ uint64_t drippu_session_pid(void) {
     [sessionLock unlock];
     return value;
 }
-static NSString *signedIdentity(void) {
+// sessionLock serializes key creation, gameToken access, and jwtUntil updates.
+// A transient key-generation failure can be retried on the next token request.
+static NSString *signedIdentityLocked(void) {
     static SecKeyRef key;
     if (!key)
         key = SecKeyCreateRandomKey((__bridge CFDictionaryRef) @{
@@ -425,8 +450,10 @@ static NSString *signedIdentity(void) {
             (__bridge id)kSecAttrKeySizeInBits : @2048
         },
                                     NULL);
-    if (!key)
+    if (!key) {
+        failure = @"Could not create the signing key for the Nextendo game identity.";
         return nil;
+    }
     NSTimeInterval issued = now();
     jwtUntil = MIN(issued + 10800, gameUntil);
     NSString *device = [NSUUID.UUID.UUIDString.lowercaseString stringByReplacingOccurrencesOfString:@"-"
@@ -497,7 +524,7 @@ int drippu_session_id_token(char *buffer, size_t capacity, uint64_t *length) {
     BOOL ok = ensure(NO);
     if (ok) {
         if (!jwt || jwtUntil <= now() + 60)
-            jwt = signedIdentity();
+            jwt = signedIdentityLocked();
         size_t size = [jwt lengthOfBytesUsingEncoding:NSASCIIStringEncoding];
         *length = size;
         ok = size && (!buffer || capacity >= size);
@@ -527,11 +554,9 @@ void drippu_session_logout(void) {
     accessToken = gameToken = jwt = nil;
     accessUntil = gameUntil = jwtUntil = heartbeatAfter = 0;
     pid = 0;
-    if (token) {
-        NSInteger status;
-        api(@"/api/oauth/revoke", @"POST", @{@"token" : token, @"client_id" : client()}, nil, &status);
-    }
     [sessionLock unlock];
+    if (token)
+        sendRequest(@"/api/oauth/revoke", @"POST", @{@"token" : token, @"client_id" : client()}, nil, NULL);
 }
 // The SDK owns the AsyncContext layout and its vtable. Track only contexts
 // completed by the token service, including move assignment and destruction.

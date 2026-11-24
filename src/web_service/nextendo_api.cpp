@@ -330,9 +330,9 @@ std::string BaseUrl() {
     return url;
 }
 
-static std::string_view GameClientId() {
+static std::string GameClientId() {
     if (const char* value = std::getenv("DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID")) {
-        const std::string_view id{value};
+        const std::string id{value};
         if (id.starts_with("nxc_") && id.size() <= 132 &&
             id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == id.npos) {
             return id;

@@ -202,6 +202,8 @@ public:
     }
 
     void SetVerifyOption(u32 option) override {
+        // Nextendo requires peer and hostname verification in either order of the guest's
+        // SetHostName and SetVerifyOption calls, including a later request for option zero.
         skip_cert_verification = option == 0 && !Settings::values.enable_nextendo.GetValue();
         LOG_WARNING(Service_SSL, "option={} skip_verification={}", option,
                     skip_cert_verification);
