@@ -33,7 +33,6 @@ namespace WebService::NextendoApi {
 namespace {
 
 constexpr const char* CanonicalUrl = "https://nextendo.network";
-constexpr const char* ClientId = "nextendo-citron";
 constexpr int TimeoutSeconds = 15;
 
 struct Callback {
@@ -41,7 +40,6 @@ struct Callback {
     std::condition_variable cv;
     bool received = false;
     std::string code;
-    std::string state;
     std::string error;
 };
 
@@ -171,9 +169,9 @@ std::string PercentEncode(std::string_view text) {
 
 std::string LoopbackPage(bool ok) {
     const std::string inner =
-        ok ? "<h1 style='color:#33e86b'>Signed in</h1><p>You can close this tab and go back to "
-             "citron.</p>"
-           : "<h1 style='color:#ff8a8a'>Sign-in cancelled</h1><p>Go back to citron and try "
+        ok ? "<h1 style='color:#33e86b'>Authorization received</h1><p>You can close this tab and go back to "
+             "Drippu.</p>"
+           : "<h1 style='color:#ff8a8a'>Sign-in cancelled</h1><p>Go back to Drippu and try "
              "again.</p>";
     return "<!doctype html><meta charset=utf-8><title>Nextendo</title>"
            "<body style='font-family:system-ui,sans-serif;background:#0f1115;color:#e7e9ee;"
@@ -256,7 +254,7 @@ httplib::Client& SharedClient() {
         httplib::Client c{BaseUrl()};
         c.set_connection_timeout(TimeoutSeconds);
         c.set_read_timeout(TimeoutSeconds);
-        c.set_follow_location(true);
+        c.set_follow_location(false);
         c.set_keep_alive(true);
         ApplyCaCertPath(c);
         return c;
@@ -270,7 +268,7 @@ httplib::Result Send(const std::string& method, const std::string& path, const s
     std::lock_guard lock{client_mutex};
     httplib::Client& client = SharedClient();
 
-    httplib::Headers headers{{"User-Agent", "citron"}};
+    httplib::Headers headers{{"User-Agent", "Drippu"}};
     if (!bearer.empty()) {
         headers.emplace("Authorization", "Bearer " + bearer);
     }
@@ -332,25 +330,55 @@ std::string BaseUrl() {
     return url;
 }
 
+static std::string GameClientId() {
+    if (const char* value = std::getenv("DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID")) {
+        const std::string id{value};
+        if (id.starts_with("nxc_") && id.size() <= 132 &&
+            id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == id.npos) {
+            return id;
+        }
+    }
+    return DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID;
+}
+
 LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& open_url) {
     LoginResult out;
+    const std::string client_id{GameClientId()};
+    if (client_id.empty()) {
+        out.error = "Configure DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID with a public client registered for a loopback callback.";
+        return out;
+    }
 
     const std::string verifier = RandomUrlSafe(32);
-    const std::string challenge = Base64Url(Sha256(verifier));
     const std::string state = RandomUrlSafe(24);
+    if (verifier.empty() || state.empty()) {
+        out.error = "Could not initialize secure browser sign-in.";
+        return out;
+    }
+    const std::string challenge = Base64Url(Sha256(verifier));
 
     Callback callback;
     httplib::Server server;
 
     server.Get("/callback", [&](const httplib::Request& request, httplib::Response& response) {
+        const auto received_state = request.get_param_value("state");
+        if (received_state != state) {
+            response.status = 400;
+            response.set_content(LoopbackPage(false), "text/html; charset=utf-8");
+            return;
+        }
+        bool ok;
         {
             std::lock_guard lock{callback.mutex};
+            if (callback.received) {
+                response.status = 409;
+                return;
+            }
             callback.code = request.get_param_value("code");
-            callback.state = request.get_param_value("state");
             callback.error = request.get_param_value("error");
             callback.received = true;
+            ok = callback.error.empty() && !callback.code.empty();
         }
-        const bool ok = callback.error.empty() && !callback.code.empty();
         response.set_content(LoopbackPage(ok), "text/html; charset=utf-8");
         callback.cv.notify_all();
     });
@@ -367,11 +395,11 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
 
     const std::string auth_url =
         fmt::format("{}/api/oauth/authorize?response_type=code&client_id={}"
-                    "&redirect_uri={}&scope=identity+friends+sauvegardes+history+presence"
-                    "&app=citron&state={}"
+                    "&redirect_uri={}&scope=game.matchmaking"
+                    "&app=drippu&state={}"
                     "&code_challenge={}&code_challenge_method=S256",
-                    BaseUrl(), ClientId, PercentEncode(redirect_uri), state, challenge);
-    LOG_INFO(WebService, "SignInWithBrowser: opening {}", auth_url);
+                    BaseUrl(), client_id, PercentEncode(redirect_uri), state, challenge);
+    LOG_INFO(WebService, "Opening the Nextendo sign-in page");
     open_url(auth_url);
 
     {
@@ -389,8 +417,7 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
         return out;
     }
     if (!callback.error.empty()) {
-        out.error = callback.error == "access_denied" ? "Sign-in was declined." : callback.error;
-        LOG_ERROR(WebService, "SignInWithBrowser: callback returned error={}", callback.error);
+        out.error = callback.error == "access_denied" ? "Sign-in was declined." : "Nextendo declined the sign-in request.";
         return out;
     }
     if (callback.code.empty()) {
@@ -398,27 +425,21 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
         LOG_ERROR(WebService, "SignInWithBrowser: callback had no code");
         return out;
     }
-    if (callback.state != state) {
-        out.error = "Anti-CSRF check failed; the sign-in was not completed.";
-        LOG_ERROR(WebService, "SignInWithBrowser: state mismatch, expected={} got={}", state,
-                  callback.state);
-        return out;
-    }
     LOG_INFO(WebService, "SignInWithBrowser: callback received, exchanging code for token");
 
     const httplib::Params form{
         {"grant_type", "authorization_code"}, {"code", callback.code},
-        {"client_id", ClientId},              {"redirect_uri", redirect_uri},
+        {"client_id", client_id},             {"redirect_uri", redirect_uri},
         {"code_verifier", verifier},
     };
 
     httplib::Client client{BaseUrl()};
     client.set_connection_timeout(TimeoutSeconds);
     client.set_read_timeout(TimeoutSeconds);
-    client.set_follow_location(true);
+    client.set_follow_location(false);
     ApplyCaCertPath(client);
 
-    const auto result = client.Post("/api/oauth/token", form);
+    const auto result = client.Post("/api/oauth/token", {{"X-Nextendo-Client-Id", client_id}}, form);
     if (!result) {
         out.error = "Could not reach the Nextendo account server.";
         LOG_ERROR(WebService,
@@ -428,19 +449,30 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
     }
     if (result->status != 200) {
         out.error = ErrorFrom(result->body, "Could not exchange the authorization code.");
-        LOG_ERROR(WebService, "SignInWithBrowser: token exchange failed (HTTP {}): {}",
-                  result->status, result->body);
+        LOG_ERROR(WebService, "Nextendo token exchange failed (HTTP {})", result->status);
         return out;
     }
 
     try {
         const auto json = nlohmann::json::parse(result->body);
-        const auto& account = json.at("account");
+        const auto access = json.at("access_token").get<std::string>();
+        if (access.empty()) {
+            out.error = "Nextendo returned no OAuth access token.";
+            return out;
+        }
+        const auto reply = client.Get("/api/nex-token", {{"X-Nextendo-Client-Id", client_id},
+                                                         {"Authorization", "Bearer " + access}});
+        if (!reply || reply->status != 200) {
+            out.error = reply && reply->status == 403 ? "Grant game.matchmaking to Drippu and sign in again."
+                                                      : "Could not obtain a Nextendo game session.";
+            return out;
+        }
+        const auto account = nlohmann::json::parse(reply->body);
 
         out.pid = account.at("pid").get<u64>();
         out.username = account.value("username", std::string{});
         out.friend_code = account.value("friend_code", std::string{});
-        out.token = json.value("nex_token", std::string{});
+        out.token = account.value("nex_token", std::string{});
 
         if (out.pid == 0 || out.token.empty()) {
             out.error = "The account server returned an incomplete sign-in.";
@@ -451,10 +483,8 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
         out.ok = true;
         LOG_INFO(WebService, "SignInWithBrowser: signed in as pid={} username={}", out.pid,
                  out.username);
-    } catch (const nlohmann::json::exception& e) {
-        out.error = fmt::format("Unexpected sign-in response: {}", e.what());
-        LOG_ERROR(WebService, "SignInWithBrowser: failed to parse token response: {} (body={})",
-                  e.what(), result->body);
+    } catch (const nlohmann::json::exception&) {
+        out.error = "Nextendo did not return a game account for Drippu.";
     }
 
     return out;
@@ -760,10 +790,10 @@ void SyncHistory(const std::vector<HistoryEntry>& entries) {
     httplib::Client client{BaseUrl()};
     client.set_connection_timeout(TimeoutSeconds);
     client.set_read_timeout(TimeoutSeconds);
-    client.set_follow_location(true);
+    client.set_follow_location(false);
     ApplyCaCertPath(client);
 
-    httplib::Headers headers{{"User-Agent", "citron"}, {"Authorization", "Bearer " + token}};
+    httplib::Headers headers{{"User-Agent", "Drippu"}, {"Authorization", "Bearer " + token}};
     const auto result = client.Put("/api/history", headers,
                                    nlohmann::json{{"history", history}}.dump(), "application/json");
 

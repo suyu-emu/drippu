@@ -1304,6 +1304,14 @@ if (SUYU_NO_JIT)
     target_compile_definitions(core PUBLIC SUYU_NO_JIT)
 endif()
 
+file(READ "${PROJECT_SOURCE_DIR}/dist/nxnative/nextendo/nextendo-network-ca.pem" NEXTENDO_NETWORK_PEM)
+configure_file(hle/service/ssl/nextendo_ca.h.in nextendo_ca.h @ONLY)
+set_property(SOURCE hle/service/ssl/ssl_backend_openssl.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}")
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set_property(SOURCE hle/service/acc/acc.cpp hle/service/ssl/ssl.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/dist/nxnative/nextendo")
+    set_property(SOURCE hle/service/acc/acc.cpp hle/service/ssl/ssl.cpp APPEND PROPERTY COMPILE_DEFINITIONS DRIPPU_APPLE_GAME_SESSION)
+endif()
+
 target_sources(core PRIVATE hle/service/ssl/ssl_backend_openssl.cpp)
 
 # OpenSSL's static libcrypto calls zlib's compress()/uncompress() for its

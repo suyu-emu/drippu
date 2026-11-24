@@ -1,0 +1,21 @@
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -1 +1,2 @@
++#include "session.h"
+ // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
+@@ -1638,2 +1639,3 @@
+         // Cheats (hle_cheats.c): the rows rebuild on every open through the delegate, the same rows the file reload changes
++        drippu_install_account_menu((__bridge void *)app);
+         g_cheats_menu = [DmCheatsMenuDelegate new];
+--- a/dm/ios/Sources/DmIOS-Bridging-Header.h
++++ b/dm/ios/Sources/DmIOS-Bridging-Header.h
+@@ -4,2 +4,3 @@
+ #include "save_sync.h"
++void drippu_manage_session(void);
+ int front_screen_max_fps(void);   // front.h, front_ios.m: the Frame rate row offers 120 only on a 120 Hz screen (LauncherSettings.swift offeredOptions)
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -124,2 +124,3 @@
+                 List {
++                    Button("Nextendo Account…") { drippu_manage_session() }
+                     ForEach(m.sections, id: \.self) { section in

@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+inline constexpr char NextendoNetworkRoot[] = R"PEM(@NEXTENDO_NETWORK_PEM@)PEM";

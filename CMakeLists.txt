@@ -238,6 +238,14 @@ cmake_dependent_option(ENABLE_LIBUSB "Enable the use of LibUSB" ON "WIN32 OR PLA
 cmake_dependent_option(ENABLE_OPENGL "Enable OpenGL" ON "NOT (WIN32 AND ARCHITECTURE_arm64) AND NOT APPLE" OFF)
 mark_as_advanced(FORCE ENABLE_OPENGL)
 
+set(DRIPPU_NEXTENDO_CLIENT_ID "nxc_evYdYRXj_MWa" CACHE STRING "Nextendo public client for the Apple callback")
+set(DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID "" CACHE STRING "Nextendo public client for the desktop loopback callback")
+foreach(client_id IN ITEMS DRIPPU_NEXTENDO_CLIENT_ID DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID)
+    if (${client_id} AND NOT "${${client_id}}" MATCHES "^nxc_[A-Za-z0-9_-]+$")
+        message(FATAL_ERROR "Invalid public client ID in ${client_id}")
+    endif()
+endforeach()
+
 option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
 # A build with no dynamic recompiler in it at all. The CPU then comes
 # entirely from statically recompiled images, and an address none of them
@@ -403,6 +411,9 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    enable_language(OBJC)
+endif()
 if(IOS)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 20)

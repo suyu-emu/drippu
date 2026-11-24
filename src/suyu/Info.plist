@@ -18,6 +18,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <string>suyu.icns</string>
     <key>CFBundleIdentifier</key>
     <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+    <key>CFBundleURLTypes</key>
+    <array><dict><key>CFBundleURLSchemes</key><array><string>drippu-nextendo</string></array></dict></array>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleLongVersionString</key>

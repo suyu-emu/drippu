@@ -3,6 +3,10 @@
 #include "suyu/nxnative_export.h"
 
 #include <QApplication>
+#ifdef Q_OS_MACOS
+#include <QCheckBox>
+
+#endif
 #include <QComboBox>
 #include <QDialog>
 #include <QDesktopServices>
@@ -110,6 +114,19 @@ public:
 #endif
         target->addItem(tr("iPhone / iPad app (.ipa, unsigned)"), QStringLiteral("ios"));
         form->addRow(tr("Build for"), target);
+#ifdef Q_OS_MACOS
+        if (!program_id || program_id == 0x0100152000022000ULL) {
+            nextendo = new QCheckBox(tr("Enable experimental Nextendo matchmaking"), this);
+            nextendo->setToolTip(tr("Requires Mario Kart 8 Deluxe 4.0.1 and a registered Drippu public client."));
+            form->addRow(nextendo);
+            client_id = new QLineEdit(qEnvironmentVariable("DRIPPU_NEXTENDO_CLIENT_ID",
+                                      QStringLiteral(DRIPPU_NEXTENDO_CLIENT_ID)), this);
+            client_id->setPlaceholderText(tr("Registered public client ID (nxc_…)"));
+            form->addRow(client_id);
+            client_id->hide();
+            connect(nextendo, &QCheckBox::toggled, client_id, &QWidget::setVisible);
+        }
+#endif
 
         auto* addon_row = new QHBoxLayout;
         addons = new QListWidget(this);
@@ -365,6 +382,9 @@ public:
                 args.prepend(QStringLiteral("-I"));
                 args << QStringLiteral("--nx2apple");
             }
+            if (nextendo && nextendo->isChecked()) {
+                args << QStringLiteral("--nextendo") << client_id->text().trimmed();
+            }
             if (!xcode->text().isEmpty()) {
                 args << QStringLiteral("--xcode") << QFileInfo(xcode->text()).absoluteFilePath();
             }
@@ -483,6 +503,8 @@ private:
     QListWidget* addons;
     QLineEdit *checkout, *python, *keys, *output;
 #ifdef Q_OS_MACOS
+    QCheckBox* nextendo = nullptr;
+    QLineEdit* client_id = nullptr;
     QLineEdit *release_app, *xcode;
     bool using_release = false;
 #endif

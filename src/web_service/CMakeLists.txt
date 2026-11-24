@@ -21,6 +21,7 @@ add_library(web_service STATIC
     mk8d_country_flags.cpp
     mk8d_country_flags.h
 )
+target_compile_definitions(web_service PRIVATE DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID="${DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID}")
 
 create_target_directory_groups(web_service)
 target_include_directories(web_service PUBLIC ${cpp-jwt_SOURCE_DIR}/include)
