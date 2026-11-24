@@ -1,0 +1,6 @@
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -447,2 +447,3 @@
+     for (int i = 0; i < EFD_MAX; i++) {
++        if (g_efd[i].host) { shutdown(g_efd[i].host-1,SHUT_RDWR); close(g_efd[i].host-1); }
+         sk_packet *p = g_efd[i].head;

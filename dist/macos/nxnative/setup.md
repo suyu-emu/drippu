@@ -55,3 +55,32 @@ Sign and install the IPA with your sideloading tool. Upstream's game notes
 describe the devices, versions, and parts of gameplay it has tested.
 
 [Upstream build and installation guide](https://github.com/seedds/nxnative/tree/692c8047a940c581d6dade58829a2a754f0ca00b#how-to-play)
+
+### Experimental Nextendo matchmaking
+
+The Mac exporter can build Mario Kart 8 Deluxe 4.0.1 (v1507328) with a
+Drippu-owned runtime patch for either target. Select **Enable experimental
+Nextendo matchmaking**. The public client ID is prefilled and can be edited. The exporter
+verifies the signed game catalog before building. Each player signs in on
+the device running their export.
+
+Drippu's bundled public client (`nxc_evYdYRXj_MWa`) is registered for
+`game.matchmaking` and the Apple callback `drippu-nextendo://oauth/callback`.
+Players can sign in with their Nextendo account. Only maintainers using the
+separate desktop loopback flow need to set `DRIPPU_NEXTENDO_LOOPBACK_CLIENT_ID`
+to a client registered with a loopback redirect.
+
+In the Mac emulator, use **Multiplayer > Nextendo** to sign in and enable
+game traffic routing before launch. Maintainers can set
+`-DDRIPPU_NEXTENDO_CLIENT_ID=nxc_…` when configuring Drippu, or set the
+environment variable of the same name when launching the Mac app.
+[Nextendo developer portal](https://nextendo.network/developers) ·
+[Integration guide](https://wiki.nextendo.network/integration)
+
+On iOS, open **Nextendo Account** in the exported game's launcher. On Mac,
+use **Nextendo Account** in the running game's application menu. The same
+control can revoke the session. Refresh tokens stay in the local Keychain.
+
+Online racing is unverified. The runtime checks the game server's TLS
+certificate and hostname. On November 22, 2026 the documented Mario Kart
+endpoint presented a self-signed certificate with a different hostname.

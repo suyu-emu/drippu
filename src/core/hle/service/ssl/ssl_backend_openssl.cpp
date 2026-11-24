@@ -7,6 +7,9 @@
 #include <mutex>
 
 #include <openssl/bio.h>
+#include <openssl/pem.h>
+#include "nextendo_ca.h"
+#include "common/settings.h"
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -167,6 +170,24 @@ public:
     }
 
     Result SetHostName(const std::string& hostname) override {
+        if (Settings::values.enable_nextendo.GetValue()) {
+            if (hostname.empty()) {
+                return ResultInternalError;
+            }
+            const auto name = Common::ToLower(hostname);
+            if (name.ends_with(".nintendo.net") || name.ends_with(".nintendo.com") ||
+                name.ends_with(".nintendowifi.net") || name.ends_with(".nintendo.co.jp")) {
+                BIO* pem = BIO_new_mem_buf(NextendoNetworkRoot, -1);
+                X509* root = pem ? PEM_read_bio_X509(pem, nullptr, nullptr, nullptr) : nullptr;
+                X509_STORE* store = X509_STORE_new();
+                const bool installed = root && store && X509_STORE_add_cert(store, root) == 1 &&
+                                       SSL_set1_verify_cert_store(ssl, store) == 1;
+                X509_STORE_free(store);
+                X509_free(root);
+                BIO_free(pem);
+                if (!installed) return ResultInternalError;
+            }
+        }
         if (!skip_cert_verification) {
             if (!SSL_set1_host(ssl, hostname.c_str())) {
                 LOG_ERROR(Service_SSL, "SSL_set1_host({}) failed", hostname);
@@ -181,7 +202,7 @@ public:
     }
 
     void SetVerifyOption(u32 option) override {
-        skip_cert_verification = (option == 0);
+        skip_cert_verification = option == 0 && !Settings::values.enable_nextendo.GetValue();
         LOG_WARNING(Service_SSL, "option={} skip_verification={}", option,
                     skip_cert_verification);
         if (skip_cert_verification) {
@@ -201,6 +222,9 @@ public:
         static constexpr unsigned char kHttp11Only[] = "\x08http/1.1";
         std::vector<unsigned char> alpn_wire;
         const char* servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+        if (Settings::values.enable_nextendo.GetValue() && (!servername || !*servername)) {
+            return ResultInternalError;
+        }
         if (servername && IsNplnHost(servername)) {
             for (const std::string& proto : requested_alpn_protos) {
                 if (proto != "h2" && proto != "http/1.1") {

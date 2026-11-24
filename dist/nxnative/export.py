@@ -257,6 +257,16 @@ def build(args, nx, game, windows_driver=None, staging=None):
         notes = profile.dir / "README.md" if profile else None
         evidence = platform_evidence(notes, version, builds.get(version, {}).get("display"), args.target)
         work = args.output / ".drippu-nxnative" / title_id / args.target
+        runtime = None
+        if getattr(args, "nextendo", None) is not None:
+            # NX2Apple starts this script with -I, so sibling module paths must be explicit.
+            spec = importlib.util.spec_from_file_location("drippu_nextendo", Path(__file__).parent / "nextendo/engine.py")
+            runtime = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(runtime)
+            runtime.preflight(title, version, builds.get(version, {}).get("display"), args.nextendo)
+            identity = MAC_ENGINE_ID if args.nx2apple else REVISION
+            work = work / "nextendo" / runtime.build_id(identity, args.nextendo, args.nx2apple)
+            status += " Experimental Nextendo matchmaking enabled."
         extraction = work / "extract" / version
         def storage_report():
             cached = cached_extraction(nx, repo, extraction, family, version, title)
@@ -284,7 +294,12 @@ def build(args, nx, game, windows_driver=None, staging=None):
                 survey = work / "survey"
                 survey.mkdir(exist_ok=True)
                 survey_path.symlink_to(survey, target_is_directory=True)
-                rc = nx.cli(command)
+                if runtime:
+                    patched = runtime.prepare(getattr(args, "release_source", repo), work,
+                        identity, args.nextendo, args.nx2apple)
+                    rc = runtime.run_cli(patched, command)
+                else:
+                    rc = nx.cli(command)
             else:
                 # NX2Apple's one-game IPA includes the RomFS in the application.
                 try:
@@ -394,6 +409,7 @@ def main():
     parser.add_argument("--staging", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--windows-prepared", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--nx2apple", action="store_true", help="use the installed NX2Apple macOS release")
+    parser.add_argument("--nextendo", metavar="PUBLIC_CLIENT_ID", help="export MK8 4.0.1 with Nextendo matchmaking")
     parser.add_argument("--xcode", type=Path, help="Xcode app to use for this export")
     parser.add_argument("--checkout", required=True, type=Path)
     parser.add_argument("--keys", required=True, type=Path)
@@ -406,6 +422,8 @@ def main():
     args.output = args.output.expanduser().resolve()
     args.keys = args.keys.expanduser().resolve()
     if os.name == "nt":
+        if args.nextendo is not None:
+            raise ValueError("Nextendo exports require an Apple build host.")
         if args.staging and not args.windows_prepared and sys.stdin.readline().strip() != "start":
             return 1
         return windows_build(args)
@@ -421,6 +439,7 @@ def main():
         os.environ["PATH"] = os.pathsep.join([str(tools), str(python.parent), os.environ.get("PATH", os.defpath)])
         if args.target == "ios":
             os.environ.update(DM_FULL_ROMFS="1", DM_COPY_ROMFS="YES")
+        args.release_source = args.checkout / "Contents/Resources/engine"
         args.checkout = engine  # Build tools write into this installed copy, outside the .app.
     if sys.version_info < (3, 12) or platform.machine() != "arm64":
         raise ValueError("Choose an arm64 Python 3.12 or later with the NxNative dependencies.")
@@ -448,6 +467,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         sys.exit(main())
-    except (OSError, ValueError, KeyError, ImportError, zipfile.BadZipFile, plistlib.InvalidFileException) as exc:
+    except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError, zipfile.BadZipFile, plistlib.InvalidFileException) as exc:
         event("say", msg=str(exc))
         sys.exit(1)

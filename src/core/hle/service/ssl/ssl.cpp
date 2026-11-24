@@ -16,6 +16,10 @@
 #include "core/hle/service/sockets/bsd.h"
 #include "core/hle/service/ssl/cert_store.h"
 #include "core/hle/service/ssl/nextendo_nat_rewrite.h"
+#ifdef DRIPPU_APPLE_GAME_SESSION
+#include "session.h"
+#endif
+#include "common/settings.h"
 #include "core/hle/service/ssl/ssl.h"
 #include "core/hle/service/ssl/ssl_backend.h"
 #include "core/internal_network/network.h"
@@ -191,9 +195,9 @@ private:
 
     Result SetVerifyOptionImpl(u32 option) {
         ASSERT(!did_handshake);
-        LOG_DEBUG(Service_SSL, "called. option={} (forcing 0)", option);
-        verify_option = 0;
-        backend->SetVerifyOption(0);
+        verify_option = Settings::values.enable_nextendo.GetValue() ? (option | 1u) : 0;
+        LOG_DEBUG(Service_SSL, "called. requested={}, effective={}", option, verify_option);
+        backend->SetVerifyOption(verify_option);
         return ResultSuccess;
     }
 
@@ -233,6 +237,10 @@ private:
         }
         Result res = backend->DoHandshake(requested_alpn_protos);
         did_handshake = res.IsSuccess();
+#ifdef DRIPPU_APPLE_GAME_SESSION
+        if (did_handshake && Settings::values.enable_nextendo.GetValue() &&
+            system.GetApplicationProcessProgramID() == 0x0100152000022000ULL) drippu_session_activity();
+#endif
         return res;
     }
 

@@ -4,6 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef DRIPPU_APPLE_GAME_SESSION
+#include "session.h"
+#include "common/settings.h"
+#endif
+
 #include <algorithm>
 #include <array>
 
@@ -711,22 +716,79 @@ public:
     }
 
 private:
+#ifdef DRIPPU_APPLE_GAME_SESSION
+    bool UsesNextendo() const {
+        return Settings::values.enable_nextendo.GetValue() &&
+               system.GetApplicationProcessProgramID() == 0x0100152000022000ULL &&
+               profile_manager->GetUser(0) == account_id;
+    }
+
+    bool NextendoVersionMatches() const {
+        const auto& override = system.GetApplicationDisplayVersionOverride();
+        if (!override.empty()) return override == "4.0.1" || override == "4.0.1.0";
+        const FileSys::PatchManager pm{system.GetApplicationProcessProgramID(),
+                                       system.GetFileSystemController(), system.GetContentProvider()};
+        const auto metadata = pm.GetControlMetadata();
+        if (!metadata.first) return false;
+        const auto version = metadata.first->GetVersionString();
+        return version == "4.0.1" || version == "4.0.1.0";
+    }
+
+    bool WriteNextendoToken(HLERequestContext& ctx) {
+        if (!UsesNextendo()) return false;
+        uint64_t size = 0;
+        std::vector<u8> data(std::min<std::size_t>(ctx.GetWriteBufferSize(), 65536));
+        const bool ok = NextendoVersionMatches() && !data.empty() &&
+            drippu_session_id_token(reinterpret_cast<char*>(data.data()), data.size(), &size);
+        if (ok) ctx.WriteBuffer(data.data(), size);
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ok ? ResultSuccess : ResultAccountUpdateFailed);
+        rb.Push(static_cast<u32>(ok ? size : 0));
+        return true;
+    }
+#endif
     void CheckAvailability(HLERequestContext& ctx) {
         LOG_DEBUG(Service_ACC, "(STUBBED) called");
         IPC::ResponseBuilder rb{ctx, 2};
+#ifdef DRIPPU_APPLE_GAME_SESSION
+        if (UsesNextendo()) {
+            rb.Push(NextendoVersionMatches() && drippu_session_ensure(0) ? ResultSuccess : ResultAccountUpdateFailed);
+            return;
+        }
+#endif
         rb.Push(ResultSuccess);
+    }
+
+    void WriteAccountId(HLERequestContext& ctx) {
+        u64 id = account_id.Hash();
+#ifdef DRIPPU_APPLE_GAME_SESSION
+        if (UsesNextendo()) {
+            id = NextendoVersionMatches() && drippu_session_ensure(0) ? drippu_session_pid() : 0;
+            if (!id) {
+                IPC::ResponseBuilder{ctx, 2}.Push(ResultAccountUpdateFailed);
+                return;
+            }
+        }
+#endif
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.PushRaw<u64>(id);
     }
 
     void GetAccountId(HLERequestContext& ctx) {
         LOG_DEBUG(Service_ACC, "called, uuid=0x{} id=0x{:016x}", account_id.RawString(),
                   account_id.Hash());
 
-        IPC::ResponseBuilder rb{ctx, 4};
-        rb.Push(ResultSuccess);
-        rb.PushRaw<u64>(account_id.Hash());
+        WriteAccountId(ctx);
     }
 
     void EnsureIdTokenCacheAsync(HLERequestContext& ctx) {
+#ifdef DRIPPU_APPLE_GAME_SESSION
+        if (UsesNextendo() && !(NextendoVersionMatches() && drippu_session_ensure(0))) {
+            IPC::ResponseBuilder{ctx, 2}.Push(ResultAccountUpdateFailed);
+            return;
+        }
+#endif
         LOG_WARNING(Service_ACC, "(STUBBED) called");
 
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
@@ -735,12 +797,18 @@ private:
     }
 
     void LoadIdTokenCacheDeprecated(HLERequestContext& ctx) {
+#ifdef DRIPPU_APPLE_GAME_SESSION
+        if (WriteNextendoToken(ctx)) return;
+#endif
         LOG_WARNING(Service_ACC, "(STUBBED) called");
 
         ensure_token_id->LoadIdTokenCache(ctx);
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
+#ifdef DRIPPU_APPLE_GAME_SESSION
+        if (WriteNextendoToken(ctx)) return;
+#endif
         LOG_WARNING(Service_ACC, "(STUBBED) called");
 
         std::vector<u8> token_data(0x100);
@@ -764,9 +832,7 @@ private:
             ctx.WriteBuffer(unknown_out_buffer, 1);
         }
 
-        IPC::ResponseBuilder rb{ctx, 4};
-        rb.Push(ResultSuccess);
-        rb.PushRaw<u64>(account_id.Hash());
+        WriteAccountId(ctx);
     }
 
     void StoreOpenContext(HLERequestContext& ctx) {

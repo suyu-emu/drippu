@@ -68,6 +68,9 @@
 #include "frontend_common/content_manager.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
+#ifdef Q_OS_MACOS
+#include "session.h"
+#endif
 #include "suyu/multiplayer/state.h"
 #include "suyu/util/controller_navigation.h"
 
@@ -1821,6 +1824,21 @@ void GMainWindow::ConnectMenuEvents() {
         connect_menu(load_recomp_action, &GMainWindow::OnLoadRecompiledImage);
     }
 
+#ifdef Q_OS_MACOS
+    auto* nextendo = ui->menu_Multiplayer->addMenu(tr("Nextendo"));
+    connect(nextendo->addAction(tr("Account…")), &QAction::triggered, this,
+            [] { drippu_manage_session(); });
+    auto* matchmaking = nextendo->addAction(tr("Route game traffic to Nextendo"));
+    matchmaking->setCheckable(true);
+    connect(nextendo, &QMenu::aboutToShow, this, [this, matchmaking] {
+        matchmaking->setChecked(Settings::values.enable_nextendo.GetValue());
+        matchmaking->setEnabled(!system->IsPoweredOn());
+    });
+    connect(matchmaking, &QAction::triggered, this, [this](bool checked) {
+        Settings::values.enable_nextendo.SetValue(checked);
+        OnSaveConfig();
+    });
+#endif
     // Emulation
     connect_menu(ui->action_Pause, &GMainWindow::OnPauseContinueGame);
     connect_menu(ui->action_Stop, &GMainWindow::OnStopGame);

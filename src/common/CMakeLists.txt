@@ -275,4 +275,12 @@ if(ANDROID)
     target_link_libraries(common PRIVATE android)
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(nextendo_apple "${PROJECT_SOURCE_DIR}/dist/nxnative/nextendo")
+    target_sources(common PRIVATE "${nextendo_apple}/session.m")
+    set_source_files_properties("${nextendo_apple}/session.m" PROPERTIES COMPILE_OPTIONS "-fobjc-arc" COMPILE_DEFINITIONS DRIPPU_DESKTOP_CRYPTO)
+    target_compile_definitions(common PRIVATE "$<$<COMPILE_LANGUAGE:OBJC>:DRIPPU_NEXTENDO_CLIENT_ID=\"${DRIPPU_NEXTENDO_CLIENT_ID}\">")
+    target_link_libraries(common PRIVATE "-framework AppKit" "-framework AuthenticationServices" "-framework Security")
+endif()
+
 create_target_directory_groups(common)

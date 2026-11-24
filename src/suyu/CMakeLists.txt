@@ -443,6 +443,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set_source_files_properties(${nxnative_resources} PROPERTIES
         MACOSX_PACKAGE_LOCATION Resources/nxnative)
     target_sources(suyu PRIVATE ${nxnative_resources})
+    file(GLOB nextendo_runtime LIST_DIRECTORIES false CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/dist/nxnative/nextendo/*")
+    set_source_files_properties(${nextendo_runtime} PROPERTIES
+        MACOSX_PACKAGE_LOCATION Resources/nxnative/nextendo HEADER_FILE_ONLY TRUE)
+    target_sources(suyu PRIVATE ${nextendo_runtime})
+    set_property(SOURCE main.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/dist/nxnative/nextendo")
+    set_property(SOURCE nxnative_export.cpp APPEND PROPERTY COMPILE_DEFINITIONS DRIPPU_NEXTENDO_CLIENT_ID="${DRIPPU_NEXTENDO_CLIENT_ID}")
 elseif (WIN32)
     target_sources(suyu PRIVATE "${PROJECT_SOURCE_DIR}/dist/nxnative/windows.qrc")
 endif()

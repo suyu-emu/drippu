@@ -1,0 +1,394 @@
+--- a/dm/host/hle_net.c
++++ b/dm/host/hle_net.c
+@@ -5,2 +5,10 @@
+ #include <stdatomic.h>
++#include <fcntl.h>
++#include <netinet/tcp.h>
++#include <errno.h>
++#include <poll.h>
++#include <unistd.h>
++#include "network.h"
++#include "session.h"
++#include "tls.h"
+ 
+@@ -27,6 +35,6 @@
+ }
+-HLE_FORCE("_ZN2nn4nifm18IsNetworkAvailableEv", "offline: the network is always unavailable", int, h_nifm_Available, void) { return 0; }
++HLE_FORCE("_ZN2nn4nifm18IsNetworkAvailableEv", "report host IPv4 availability", int, h_nifm_Available, void) { return drippu_ip(NULL,NULL,NULL); }
+ // Returns bool (`and w0, w0, #1`, Metroid Dread's sdk+0x336210): whether the system's network screen resolved the error
+ HLE_FORCE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", "offline: not resolved, shows no system network screen", unsigned, h_nifm_HandleErr, void) { return 0; }
+-HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "offline: no IP", Result, h_nifm_GetIp, uint32_t *a) { if (a) *a = 0; return RES_FAIL; }
++HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "return host IPv4 address", Result, h_nifm_GetIp, uint32_t *a) { return drippu_ip(a,NULL,NULL) ? RES_OK : RES_FAIL; }
+ HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: no proxy setting", Result, h_nifm_GetProxy, void *p) { (void)p; return RES_FAIL; }
+@@ -55,2 +63,3 @@
+ static struct {
++    int host;
+     uint64_t count, generation; int used, flags, fdflags;
+@@ -79,6 +88,2 @@
+ }
+-int dm_sk_socket(int family, int type, int protocol) {
+-    if (family != 2 || type != 2 || (protocol && protocol != 17)) return sk_fail();
+-    dm_host_mutex_lock(&g_efd_m); int fd = sk_new_locked(SK_UDP); pthread_mutex_unlock(&g_efd_m); return fd;
+-}
+ int dm_sk_close(int fd) {
+@@ -86,2 +91,3 @@
+     if (!sk_used(fd)) { pthread_mutex_unlock(&g_efd_m); return sk_fail(); }
++    if (g_efd[fd].host) { shutdown(g_efd[fd].host-1,SHUT_RDWR); close(g_efd[fd].host-1); }
+     sk_packet *p = g_efd[fd].head;
+@@ -108,67 +114,3 @@
+ }
+-// sockaddr_in is {u8 length, u8 family, u16 port, u32 address, padding}, port/address in network byte order. sin_len may be zero in hand-written game code.
+-static int sk_addr_read(const void *a, unsigned n, uint32_t *addr, uint16_t *port) {
+-    if (!a || n < 16) return sk_error(SK_EINVAL);
+-    const uint8_t *b = a;
+-    if (b[1] != 2 || (b[0] && b[0] != 16)) return sk_error(SK_EINVAL);
+-    *port = (uint16_t)((unsigned)b[2] << 8 | b[3]);
+-    *addr = (uint32_t)b[4] << 24 | (uint32_t)b[5] << 16 | (uint32_t)b[6] << 8 | b[7];
+-    if (*addr && (*addr >> 24) != 127) return sk_fail();
+-    return 0;
+-}
+-static int sk_addr_write(void *a, unsigned *n, uint32_t addr, uint16_t port) {
+-    if (!a) return 0;
+-    if (!n) return sk_error(SK_EINVAL);
+-    uint8_t b[16] = {16, 2, (uint8_t)(port >> 8), (uint8_t)port, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr};
+-    memcpy(a, b, *n < sizeof b ? *n : sizeof b); *n = sizeof b; return 0;
+-}
+-static int sk_port_free(int fd, uint32_t addr, uint16_t port) {
+-    for (int i = 0; i < EFD_MAX; i++) if (i != fd && sk_udp_locked(i) && g_efd[i].port == port && (!addr || !g_efd[i].addr || addr == g_efd[i].addr)) {
+-        int both = g_efd[i].reuse & g_efd[fd].reuse;
+-        if (!(both & 0x200) && !((both & 4) && addr != g_efd[i].addr)) return 0;
+-    }
+-    return 1;
+-}
+-static int sk_bind_locked(int fd, uint32_t addr, uint16_t port) {
+-    if (g_efd[fd].port) return sk_error(SK_EINVAL);
+-    if (!port) {
+-        for (unsigned i = 0; i < 16384; i++) {
+-            uint16_t candidate = g_sk_ephemeral; g_sk_ephemeral = candidate == 65535 ? 49152 : (uint16_t)(candidate + 1);
+-            if (sk_port_free(fd, addr, candidate)) { port = candidate; break; }
+-        }
+-        if (!port) return sk_error(SK_EADDRINUSE);
+-    } else if (!sk_port_free(fd, addr, port)) return sk_error(SK_EADDRINUSE);
+-    g_efd[fd].addr = addr; g_efd[fd].port = port; return 0;
+-}
+-int dm_sk_bind(int fd, const void *a, unsigned n) {
+-    uint32_t addr; uint16_t port; if (sk_addr_read(a, n, &addr, &port)) return -1;
+-    dm_host_mutex_lock(&g_efd_m); int r = sk_udp_locked(fd) ? sk_bind_locked(fd, addr, port) : sk_error(SK_EBADF); pthread_mutex_unlock(&g_efd_m); return r;
+-}
+-int dm_sk_connect(int fd, const void *a, unsigned n) {
+-    uint32_t addr = 0; uint16_t port = 0; int disconnect = a && n >= 2 && ((const uint8_t *)a)[1] == 0;
+-    if (!disconnect && sk_addr_read(a, n, &addr, &port)) return -1;
+-    if (!disconnect && !port) return sk_error(SK_EINVAL);
+-    dm_host_mutex_lock(&g_efd_m); int r = 0;
+-    if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+-    else if (!g_efd[fd].port && sk_bind_locked(fd, 0, 0)) r = -1;
+-    else { g_efd[fd].connected = !disconnect; g_efd[fd].peer_addr = addr ? addr : 0x7f000001; g_efd[fd].peer_port = port; }
+-    pthread_mutex_unlock(&g_efd_m); return r;
+-}
+-int dm_sk_name(int fd, void *a, unsigned *n, int peer) {
+-    if (!a || !n) return sk_error(SK_EINVAL);
+-    dm_host_mutex_lock(&g_efd_m); int r;
+-    if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+-    else if (peer && !g_efd[fd].connected) r = sk_error(SK_ENOTCONN);
+-    else r = sk_addr_write(a, n, peer ? g_efd[fd].peer_addr : g_efd[fd].addr, peer ? g_efd[fd].peer_port : g_efd[fd].port);
+-    pthread_mutex_unlock(&g_efd_m); return r;
+-}
+-int dm_sk_shutdown(int fd, int how) {
+-    dm_host_mutex_lock(&g_efd_m); int r = 0;
+-    if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+-    else if (how < 0 || how > 2) r = sk_error(SK_EINVAL);
+-    else if (!g_efd[fd].connected) r = sk_error(SK_ENOTCONN);
+-    else { if (how != 1) g_efd[fd].shut_read = 1; if (how != 0) g_efd[fd].shut_write = 1; pthread_cond_broadcast(&g_efd_c); }
+-    pthread_mutex_unlock(&g_efd_m); return r;
+-}
+-int dm_sk_fcntl(int fd, int cmd, int value) {
++static int local_fcntl(int fd, int cmd, int value) {
+     dm_host_mutex_lock(&g_efd_m); int r = 0;
+@@ -182,73 +124,3 @@
+ }
+-int dm_sk_setopt(int fd, int level, int option, const void *value, unsigned size) {
+-    if (!value) return sk_error(SK_EINVAL);
+-    dm_host_mutex_lock(&g_efd_m); int r = 0;
+-    if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+-    else if (level == 0xffff && (option == 0x1006 || option == 0x1005) && size >= 16) {
+-        int64_t tv[2]; memcpy(tv, value, sizeof tv);
+-        if (tv[0] < 0 || tv[0] > INT64_MAX / 1000000000 - 1 || tv[1] < 0 || tv[1] >= 1000000) r = sk_error(SK_EINVAL);
+-        else if (option == 0x1006) g_efd[fd].recv_timeout = tv[0] * 1000000000 + tv[1] * 1000;
+-        else g_efd[fd].send_timeout = tv[0] * 1000000000 + tv[1] * 1000;
+-    } else if (level == 0xffff && size >= sizeof(int)) {
+-        int v; memcpy(&v, value, sizeof v);
+-        if (option == 4 || option == 0x200) { g_efd[fd].reuse &= ~option; if (v) g_efd[fd].reuse |= option; }
+-        else if (option == 0x20) g_efd[fd].broadcast = !!v;
+-        else if (option == 0x1001 || option == 0x1002) {
+-            if (v <= 0) r = sk_error(SK_EINVAL);
+-            else { if (v > SK_QUEUE_MAX) v = SK_QUEUE_MAX; if (option == 0x1001) g_efd[fd].sndbuf = v; else g_efd[fd].rcvbuf = v; }
+-        } else r = sk_error(42);   // ENOPROTOOPT
+-    } else r = sk_error(42);
+-    pthread_mutex_unlock(&g_efd_m); return r;
+-}
+-int dm_sk_getopt(int fd, int level, int option, void *value, unsigned *size) {
+-    if (!value || !size) return sk_error(SK_EINVAL);
+-    dm_host_mutex_lock(&g_efd_m); int r = 0, v = 0;
+-    if (!sk_udp_locked(fd)) r = sk_error(SK_EBADF);
+-    else if (level != 0xffff) r = sk_error(42);
+-    else if ((option == 0x1006 || option == 0x1005) && *size >= 16) {
+-        int64_t ns = option == 0x1006 ? g_efd[fd].recv_timeout : g_efd[fd].send_timeout;
+-        int64_t tv[2] = {ns / 1000000000, ns % 1000000000 / 1000}; memcpy(value, tv, sizeof tv); *size = sizeof tv;
+-    } else if (*size < sizeof v) r = sk_error(SK_EINVAL);
+-    else {
+-        if (option == 0x1008) v = 2; else if (option == 0x1007) v = 0; else if (option == 0x1016) v = 17;
+-        else if (option == 4 || option == 0x200) v = !!(g_efd[fd].reuse & option);
+-        else if (option == 0x20) v = g_efd[fd].broadcast;
+-        else if (option == 0x1001) v = g_efd[fd].sndbuf; else if (option == 0x1002) v = g_efd[fd].rcvbuf;
+-        else r = sk_error(42);
+-        if (!r) { memcpy(value, &v, sizeof v); *size = sizeof v; }
+-    }
+-    pthread_mutex_unlock(&g_efd_m); return r;
+-}
+-long dm_sk_sendto(int fd, const void *data, unsigned long n, int flags, const void *a, unsigned al) {
+-    if ((!data && n) || n > SK_UDP_MAX) return sk_error(n > SK_UDP_MAX ? SK_EMSGSIZE : SK_EINVAL);
+-    if (flags & ~(SK_MSG_DONTWAIT | 4 | 0x20000)) return sk_error(SK_EOPNOTSUPP);
+-    uint32_t addr = 0; uint16_t port = 0; if (a && sk_addr_read(a, al, &addr, &port)) return -1;
+-    dm_host_mutex_lock(&g_efd_m); long r = -1;
+-    if (!sk_udp_locked(fd)) { t_skerr = SK_EBADF; goto done; }
+-    if (g_efd[fd].shut_write) { t_skerr = 32; goto done; }
+-    if (!a) { if (!g_efd[fd].connected) { t_skerr = 39; goto done; } addr = g_efd[fd].peer_addr; port = g_efd[fd].peer_port; }
+-    if (!port) { t_skerr = SK_EINVAL; goto done; }
+-    if (!addr) addr = 0x7f000001;
+-    if (!g_efd[fd].port && sk_bind_locked(fd, 0, 0)) goto done;
+-    uint32_t src = g_efd[fd].addr ? g_efd[fd].addr : 0x7f000001;
+-    int target = -1, specificity = -1;
+-    for (int i = 0; i < EFD_MAX; i++) if (sk_udp_locked(i) && !g_efd[i].shut_read && g_efd[i].port == port && (!g_efd[i].addr || g_efd[i].addr == addr)) {
+-        if (g_efd[i].connected && (g_efd[i].peer_addr != src || g_efd[i].peer_port != g_efd[fd].port)) continue;
+-        int score = (g_efd[i].addr != 0) + 2 * g_efd[i].connected;
+-        if (score > specificity) { target = i; specificity = score; }
+-    }
+-    if (target >= 0) { int i = target;
+-        // UDP drops a datagram when the receive queue is full; the sender still succeeds, as it has no delivery acknowledgement.
+-        if (g_efd[i].packets < SK_PACKET_MAX && n <= (size_t)g_efd[i].rcvbuf && g_efd[i].queued <= (size_t)g_efd[i].rcvbuf - n) {
+-            sk_packet *p = malloc(sizeof *p + n);
+-            if (!p) { t_skerr = 55; goto done; }   // ENOBUFS
+-            p->next = NULL; p->addr = src; p->port = g_efd[fd].port; p->size = n; if (n) memcpy(p->data, data, n);
+-            if (g_efd[i].tail) g_efd[i].tail->next = p; else g_efd[i].head = p;
+-            g_efd[i].tail = p; g_efd[i].queued += n; g_efd[i].packets++; pthread_cond_broadcast(&g_efd_c);
+-        }
+-    }
+-    r = (long)n;
+-done:
+-    pthread_mutex_unlock(&g_efd_m); return r;
+-}
++#include "sockets.inc"
+ long dm_sk_read(int fd, void *data, unsigned long size) {
+@@ -265,27 +137,2 @@
+ }
+-long dm_sk_recvfrom(int fd, void *data, unsigned long n, int flags, void *a, unsigned *al) {
+-    if ((!data && n) || (a && !al)) return sk_error(SK_EINVAL);
+-    if (flags & ~(SK_MSG_DONTWAIT | SK_MSG_PEEK)) return sk_error(SK_EOPNOTSUPP);
+-    dm_host_mutex_lock(&g_efd_m); long r = -1;
+-    if (!sk_udp_locked(fd)) { t_skerr = SK_EBADF; goto done; }
+-    uint64_t gen = g_efd[fd].generation, start = guest_ns();
+-    for (;;) {
+-        if (!sk_udp_locked(fd) || g_efd[fd].generation != gen) { t_skerr = SK_EBADF; break; }
+-        sk_packet *p = g_efd[fd].head;
+-        if (p) {
+-            size_t copied = n < p->size ? n : p->size; if (copied) memcpy(data, p->data, copied); sk_addr_write(a, al, p->addr, p->port); r = (long)copied;
+-            if (!(flags & SK_MSG_PEEK)) { g_efd[fd].head = p->next; if (!p->next) g_efd[fd].tail = NULL; g_efd[fd].queued -= p->size; g_efd[fd].packets--; free(p); }
+-            break;
+-        }
+-        if (g_efd[fd].shut_read) { r = 0; break; }
+-        if (flags & SK_MSG_DONTWAIT || g_efd[fd].flags & SK_NONBLOCK) { t_skerr = SK_EAGAIN; break; }
+-        int64_t left = g_efd[fd].recv_timeout ? g_efd[fd].recv_timeout - (int64_t)(guest_ns() - start) : 100000000;
+-        if (left <= 0) { t_skerr = SK_EAGAIN; break; }
+-        if (dm_detclock_enabled() && left > 1000000) left = 1000000;
+-        dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, left);
+-    }
+-done:
+-    pthread_mutex_unlock(&g_efd_m); return r;
+-}
+-// Closed/reused descriptors from this wait report POLLNVAL. Descriptors the host never made retain the prior offline behavior: nothing ready at the timeout.
+ static int efd_ready(sk_pollfd *p, uint64_t n, uint64_t open, const uint64_t generation[EFD_MAX]) {
+@@ -296,2 +143,7 @@
+         if (!sk_used(fd) || g_efd[fd].generation != generation[fd]) { p[i].revents = SK_POLLNVAL; ready++; continue; }
++        if (g_efd[fd].host) {
++            struct pollfd native = {g_efd[fd].host-1,p[i].events,0};
++            if (poll(&native,1,0) > 0) { p[i].revents = native.revents; ready++; }
++            continue;
++        }
+         if (g_efd[fd].used == SK_EFD ? g_efd[fd].count != 0 : (g_efd[fd].head != NULL || g_efd[fd].shut_read)) p[i].revents |= p[i].events & (SK_POLLIN | SK_POLLRDNORM);
+@@ -313,2 +165,3 @@
+         int64_t left = limit - (int64_t)(guest_ns() - start); if (left <= 0) break;
++        if (left > 5000000) left = 5000000;
+         dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, dm_detclock_enabled() && left > 1000000 ? 1000000 : left);
+@@ -354,3 +207,3 @@
+ HLE_FORCE("_ZN2nn6socket5WriteEiPKvm", "local UDP/EventFd (offline BSD service)", long, h_sk_Write, int s, const void *b, unsigned long n) { return dm_sk_write(s, b, n); }
+-HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKc", "name resolution (cut): NULL", void *, h_sk_GetHostEnt21, const char *n) { (void)n; t_skerr = SK_ENETDOWN; return NULL; }
++HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKc", "resolve game service", void *, h_sk_GetHostEnt21, const char *n) { return drippu_host(n); }
+ HLE_FORCE("_ZN2nn6socket12SetAllocatorEPNS_14MemoryResourceE", "socket library allocator; no session is created, ignored", void, h_sk_SetAlloc, void *r) { (void)r; }
+@@ -369,7 +222,5 @@
+ HLE_FORCE("_ZN2nn6socket4SendEiPKvmNS0_7MsgFlagE", "local UDP (offline BSD service)", long, h_sk_Send, int s, const void *b, unsigned long n, int f) { return dm_sk_sendto(s, b, n, f, NULL, 0); }
+-HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "name resolution (cut): EAI_FAIL", int, h_sk_GetAddrInfo, const char *h, const char *s, const void *hint, void **res) {
+-    (void)h; (void)s; (void)hint; if (res) *res = NULL; return 4;   // EAI_FAIL
+-}
+-HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "pairs with GetAddrInfo (cut)", void, h_sk_FreeAddrInfo, void *ai) { (void)ai; }
+-HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "name resolution (cut): NULL", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) { (void)n; (void)o; (void)c; t_skerr = SK_ENETDOWN; return NULL; }
++HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PKNS0_8AddrInfoEPPS3_", "resolve game service", int, h_sk_GetAddrInfo, const char *h, const char *s, const void *hint, void **res) { return drippu_addrinfo(h,s,hint,res); }
++HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEPNS0_8AddrInfoE", "release resolved addresses", void, h_sk_FreeAddrInfo, void *ai) { drippu_freeaddrinfo(ai); }
++HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKcPKNS0_14ResolverOptionEm", "resolve game service", void *, h_sk_GetHostEnt, const char *n, const void *o, unsigned long c) { return drippu_host(n); }
+ HLE_FORCE("_ZN2nn6socket12GetLastErrorEv", "socket error code kept by the host", int, h_sk_GetLastError, void) { return t_skerr; }
+@@ -394,3 +245,3 @@
+ HLE_FORCE("nnsocketWrite", "local UDP/EventFd (offline BSD service)", long, h_nsk_Write, int s, const void *b, unsigned long n) { return dm_sk_write(s, b, n); }
+-HLE_FORCE("nnsocketGetHostByNameWithOptions", "name resolution (cut): NULL", void *, h_nsk_GetHost, const char *n, const void *o, unsigned long c) { (void)n; (void)o; (void)c; t_skerr = SK_ENETDOWN; return NULL; }
++HLE_FORCE("nnsocketGetHostByNameWithOptions", "resolve game service", void *, h_nsk_GetHost, const char *n, const void *o, unsigned long c) { return drippu_host(n); }
+ HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host", int, h_nsk_GetErrno, void) { return t_skerr; }
+@@ -406,19 +257,19 @@
+ HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create (cut)", Result, h_ssl_CtxDestroy, void *self) { (void)self; return RES_OK; }
+-SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
+-SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
++SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { if (id) *id = 1; return RES_OK; }
++SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { return RES_OK; }
+ SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
+ SSF("_ZN2nn3ssl14BuiltInManager22GetBuiltInCertificatesEPPNS1_22BuiltInCertificateInfoEPhjPNS0_15CaCertificateIdEj", h_ssl_BiCerts, void **o, uint8_t *b, unsigned bs, void *ids, unsigned n) { (void)o; (void)b; (void)bs; (void)ids; (void)n; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) { (void)self; (void)ctx; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection7DestroyEv", h_ssl_CnDestroy, void *self) { (void)self; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) { (void)self; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection11SetHostNameEPKcj", h_ssl_CnHost, void *self, const char *h, unsigned n) { (void)self; (void)h; (void)n; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection9SetIoModeENS1_6IoModeE", h_ssl_CnIoMode, void *self, int m) { (void)self; (void)m; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection19SetSessionCacheModeENS1_16SessionCacheModeE", h_ssl_CnCache, void *self, int m) { (void)self; (void)m; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection19SetSocketDescriptorEi", h_ssl_CnSock, void *self, int s) { (void)self; (void)s; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection12GetLastErrorEPNS_6ResultE", h_ssl_CnLastErr, void *self, uint32_t *r) { (void)self; if (r) *r = RES_FAIL; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr, void *self, uint32_t *r) { (void)self; if (r) *r = RES_FAIL; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) { (void)self; (void)b; (void)n; if (o) *o = 0; return RES_FAIL; }
+-SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self, void *o, void *i, unsigned t) { (void)self; (void)o; (void)i; (void)t; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "ssl service (cut): read returns -1", int, h_ssl_CnRead, void *self, char *b, unsigned n) { (void)self; (void)b; (void)n; return -1; }
+-HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "ssl service (cut): write returns -1", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) { (void)self; (void)b; (void)n; return -1; }
++SSF("_ZN2nn3ssl10Connection6CreateEPNS0_7ContextE", h_ssl_CnCreate, void *self, void *ctx) { return drippu_tls_create(self); }
++SSF("_ZN2nn3ssl10Connection7DestroyEv", h_ssl_CnDestroy, void *self) { drippu_tls_destroy(self); return RES_OK; }
++SSF("_ZN2nn3ssl10Connection11DoHandshakeEv", h_ssl_CnHandshake, void *self) { return drippu_tls_handshake(self); }
++SSF("_ZN2nn3ssl10Connection11SetHostNameEPKcj", h_ssl_CnHost, void *self, const char *h, unsigned n) { return drippu_tls_host(self,h,n); }
++SSF("_ZN2nn3ssl10Connection9SetIoModeENS1_6IoModeE", h_ssl_CnIoMode, void *self, int m) { return drippu_tls_mode(self,m); }
++SSF("_ZN2nn3ssl10Connection19SetSessionCacheModeENS1_16SessionCacheModeE", h_ssl_CnCache, void *self, int m) { return RES_OK; }
++SSF("_ZN2nn3ssl10Connection19SetSocketDescriptorEi", h_ssl_CnSock, void *self, int s) { return drippu_tls_socket(self,s); }
++SSF("_ZN2nn3ssl10Connection12GetLastErrorEPNS_6ResultE", h_ssl_CnLastErr, void *self, uint32_t *r) { if (!r) return RES_FAIL; *r = drippu_tls_last(self); return RES_OK; }
++SSF("_ZN2nn3ssl10Connection18GetVerifyCertErrorEPNS_6ResultE", h_ssl_CnVerifyErr, void *self, uint32_t *r) { if (!r) return RES_FAIL; *r = drippu_tls_last(self); return RES_OK; }
++SSF("_ZN2nn3ssl10Connection4PeekEPcPij", h_ssl_CnPeek, void *self, char *b, int *o, unsigned n) { return drippu_tls_peek(self,b,o,n); }
++SSF("_ZN2nn3ssl10Connection4PollEPNS1_9PollEventES3_j", h_ssl_CnPoll, void *self, void *o, void *i, unsigned t) { return drippu_tls_poll(self,o,i,t); }
++HLE_FORCE("_ZN2nn3ssl10Connection4ReadEPcj", "read from the verified TLS session", int, h_ssl_CnRead, void *self, char *b, unsigned n) { return drippu_tls_io(self,b,n,0); }
++HLE_FORCE("_ZN2nn3ssl10Connection5WriteEPKcj", "write to the verified TLS session", int, h_ssl_CnWrite, void *self, const char *b, unsigned n) { return drippu_tls_io(self,(void *)b,n,1); }
+ // C interface: all return nnResult
+--- a/dm/host/hle_offline.c
++++ b/dm/host/hle_offline.c
+@@ -4,2 +4,3 @@
+ #include "hle.h"
++#include "network.h"
+ #include "hle_net.h"
+@@ -83,4 +84,4 @@
+ HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "local UDP (offline BSD service)", long, h_sk_RecvFrom2, int s, void *b, unsigned long n, int f, void *a, unsigned *al) { return dm_sk_recvfrom(s, b, n, f, a, al); }
+-HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "name resolution (cut): EAI_FAIL", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { (void)h; (void)s; (void)hint; if (res) *res = NULL; return SK_EAI_FAIL; }
+-HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "pairs with GetAddrInfo (cut)", void, h_sk_FreeAi2, void *ai) { (void)ai; }
++HLE_FORCE("_ZN2nn6socket11GetAddrInfoEPKcS2_PK8addrinfoPPS3_", "resolve game service", int, h_sk_Gai2, const char *h, const char *s, const void *hint, void **res) { return drippu_addrinfo(h,s,hint,res); }
++HLE_FORCE("_ZN2nn6socket12FreeAddrInfoEP8addrinfo", "release resolved addresses", void, h_sk_FreeAi2, void *ai) { drippu_freeaddrinfo(ai); }
+ HLE_FORCE("_ZN2nn6socket11GAIStrErrorENS0_7AiErrnoE", "resolver error text", const char *, h_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+@@ -133,3 +134,3 @@
+ HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", "offline: no IP configuration", Result, h_nifm_IpCfg, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, uint32_t *e) {
+-    uint32_t *p[5] = {a, b, c, d, e}; for (int i = 0; i < 5; i++) if (p[i]) *p[i] = 0; return RES_FAIL;
++    if (c) *c = 0; if (d) *d = 0; if (e) *e = 0; return drippu_ip(a,b,NULL) ? RES_OK : RES_FAIL;
+ }
+@@ -137,5 +138,5 @@
+ HLE_FORCE("_ZN2nn4nifm22GetCurrentIpConfigInfoEPNS_6socket6InAddrES3_S3_S3_S3_", "offline: no IP configuration (SDK 10 overload)", Result, h_nifm_IpCfg10, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d, uint32_t *e) {
+-    uint32_t *p[5] = {a, b, c, d, e}; for (int i = 0; i < 5; i++) if (p[i]) *p[i] = 0; return RES_FAIL;
+-}
+-HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "offline: no IP (SDK 10 overload)", Result, h_nifm_GetIp10, uint32_t *a) { if (a) *a = 0; return RES_FAIL; }
++    if (c) *c = 0; if (d) *d = 0; if (e) *e = 0; return drippu_ip(a,b,NULL) ? RES_OK : RES_FAIL;
++}
++HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEP7in_addr", "return host IPv4 address", Result, h_nifm_GetIp10, uint32_t *a) { return drippu_ip(a,NULL,NULL) ? RES_OK : RES_FAIL; }
+ // SDK 21 (Star Fox): the IPv4 and IPv6 configurations at once, with their counts
+@@ -224,5 +225,5 @@
+ HLE_FORCE("nnsocketShutdown", "local UDP (offline BSD service)", int, h_c_sk_Shutdown, int s, int h) { return dm_sk_shutdown(s, h); }
+-HLE_FORCE("nnsocketGetAddrInfoWithOptions", "name resolution with resolver options (cut): EAI_FAIL", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { (void)h; (void)s; (void)hint; (void)o; (void)n; if (res) *res = NULL; return SK_EAI_FAIL; }
+-HLE_FORCE("nnsocketGetAddrInfo", "name resolution (cut): EAI_FAIL", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { (void)h; (void)s; (void)hint; if (res) *res = NULL; return SK_EAI_FAIL; }
+-HLE_FORCE("nnsocketFreeAddrInfo", "pairs with GetAddrInfo (cut)", void, h_c_sk_FreeAi, void *ai) { (void)ai; }
++HLE_FORCE("nnsocketGetAddrInfoWithOptions", "resolve game service", int, h_c_sk_GaiOpt, const char *h, const char *s, const void *hint, void **res, const void *o, unsigned long n) { return drippu_addrinfo(h,s,hint,res); }
++HLE_FORCE("nnsocketGetAddrInfo", "resolve game service", int, h_c_sk_Gai, const char *h, const char *s, const void *hint, void **res) { return drippu_addrinfo(h,s,hint,res); }
++HLE_FORCE("nnsocketFreeAddrInfo", "release resolved addresses", void, h_c_sk_FreeAi, void *ai) { drippu_freeaddrinfo(ai); }
+ HLE_FORCE("nnsocketGAIStrError", "resolver error text", const char *, h_c_sk_GaiStr, int e) { (void)e; return "network unavailable"; }
+--- a/dm/host/hle_account.c
++++ b/dm/host/hle_account.c
+@@ -5,2 +5,3 @@
+ #include "account_users.h"
++#include "session.h"
+ 
+@@ -117,10 +118,15 @@
+ 
+-// ---------- Online accounts: cut ----------
++// This export binds online play to the primary local profile.
++static int nextendo_account(const UserHandle *h, int interactive) {
++    if (!h || dm_uid_user(h) != 0) return 0;
++    dm_thread_native_wait(1);
++    int ready = drippu_session_ensure(interactive);
++    dm_thread_native_wait(0);
++    return ready;
++}
+ // The host has only local accounts. Return the result of cancelling the SDK account applet,
+ // ResultCancelledByUser (2124-0001). See "The network account check is cancelled offline" in docs/reference/services.md.
+-HLE_FORCE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", "offline network account check returns applet cancellation", Result, h_acc_EnsureNsa, const UserHandle *h) { (void)h; return RES_ACC_CANCELED; }
+-HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", "network service account, out of scope; cut", Result, h_acc_GetNsaId, void *id, const UserHandle *h) { (void)id; (void)h; return RES_FAIL; }
+-HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", "network service account token, out of scope; cut", Result, h_acc_LoadTok, uint64_t *n, char *buf, uint64_t sz, const UserHandle *h) {
+-    (void)buf; (void)sz; (void)h; if (n) *n = 0; return RES_FAIL;
+-}
++HLE_FORCE("_ZN2nn7account36EnsureNetworkServiceAccountAvailableERKNS0_10UserHandleE", "offline network account check returns applet cancellation", Result, h_acc_EnsureNsa, const UserHandle *h) { return nextendo_account(h,1) ? RES_OK : RES_ACC_CANCELED; }
++HLE_FORCE("_ZN2nn7account26GetNetworkServiceAccountIdEPNS0_23NetworkServiceAccountIdERKNS0_10UserHandleE", "Nextendo account", Result, h_acc_GetNsaId, void *id, const UserHandle *h) { if (!id || !nextendo_account(h,0)) return RES_FAIL; *(uint64_t *)id = drippu_session_pid(); return RES_OK; }
++HLE_FORCE("_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10UserHandleE", "Nextendo game-session identity", Result, h_acc_LoadTok, uint64_t *n, char *buf, uint64_t sz, const UserHandle *h) { return nextendo_account(h,0) && drippu_session_id_token(buf,sz,n) ? RES_OK : RES_FAIL; }
+ HLE_FORCE("_ZN2nn7account40ShowLicenseRequirementsForNetworkServiceERKNS0_10UserHandleE", "online membership notice applet, out of scope; cut", Result, h_acc_ShowLic, const UserHandle *h) { (void)h; return RES_FAIL; }
+@@ -137,5 +143,5 @@
+ // NintendoAccountAuthorizationRequestContext has no vtable: its constructor writes no memory, and its contents are read and written only by the interfaces below.
+-HLE_FORCE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", "network service account token, out of scope; cut", Result, h_acc_EnsureTokAsync, void *ctx, const UserHandle *h) { (void)ctx; (void)h; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7account44EnsureNetworkServiceAccountIdTokenCacheAsyncEPNS0_12AsyncContextERKNS0_10UserHandleE", "Nextendo game-session identity", Result, h_acc_EnsureTokAsync, void *ctx, const UserHandle *h) { if (!ctx) return RES_FAIL; drippu_async_mark(ctx,0); if (!nextendo_account(h,1)) return RES_FAIL; drippu_async_mark(ctx,1); return RES_OK; }
+ HLE_FORCE("_ZN2nn7account12AsyncContext14GetSystemEventEPNS_2os11SystemEventE", "async completion event; fires immediately", Result, h_acc_AcGetEv, void *self, void *ev) { (void)self; hle_signal_system_event(ev); return RES_OK; }
+-HLE_FORCE("_ZN2nn7account12AsyncContext9GetResultEv", "async result; networking is cut, always fails", Result, h_acc_AcGetRes, void *self) { (void)self; return RES_FAIL; }
++HLE_FORCE("_ZN2nn7account12AsyncContext9GetResultEv", "read Nextendo async completion", Result, h_acc_AcGetRes, void *self) { return drippu_async_mark(self,-1) ? RES_OK : RES_FAIL; }
+ HLE_FORCE("_ZN2nn7account42NintendoAccountAuthorizationRequestContextC1Ev", "Nintendo Account authorization, out of scope; the constructor writes no memory", void, h_acc_NaCtor, void *self) { (void)self; }
+@@ -195,3 +201,3 @@
+ HLE_FORCE("_ZN2nn7account28DeleteSaveDataThumbnailImageERKNS0_3UidE", "save-data thumbnail; the host keeps none", Result, h_acc_DeleteThumb, const Uid *uid) { (void)uid; return RES_OK; }
+-HLE_FORCE("_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE", "network service account, out of scope; always unavailable", Result, h_acc_NsaAvail, uint8_t *out, const UserHandle *h) { (void)h; *out = 0; return RES_OK; }
++HLE_FORCE("_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE", "network service account, out of scope; always unavailable", Result, h_acc_NsaAvail, uint8_t *out, const UserHandle *h) { if (!out) return RES_FAIL; *out = nextendo_account(h,0); return RES_OK; }
+ HLE_FORCE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", "close exactly this session; other opens remain live", void, h_acc_CloseUser, const UserHandle *h) {
+@@ -207,3 +213,3 @@
+ HLE_FORCE("_ZN2nn7account12AsyncContext7HasDoneEPb", "async context: always done", Result, h_acc_AcHasDone, void *self, uint8_t *done) { (void)self; *done = 1; return RES_OK; }
+-HLE_FORCE("_ZN2nn7account12AsyncContextD1Ev", "async context destructor; no session to close", void, h_acc_AcDtor, void *self) { (void)self; }
+-HLE_FORCE("_ZN2nn7account12AsyncContextaSEOS1_", "async context move assignment; the object holds no host state", void *, h_acc_AcMove, void *self, void *other) { (void)other; return self; }
++HLE_FORCE("_ZN2nn7account12AsyncContextD1Ev", "async context destructor; no session to close", void, h_acc_AcDtor, void *self) { drippu_async_mark(self,0); }
++HLE_FORCE("_ZN2nn7account12AsyncContextaSEOS1_", "async context move assignment; the object holds no host state", void *, h_acc_AcMove, void *self, void *other) { if (self != other) drippu_async_mark(self,drippu_async_mark(other,0)); return self; }
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -77,4 +77,4 @@
+ HOST_CFLAGS = $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc
+-HOST_FRAMEWORKS = -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework CoreAudio -framework AVFAudio -framework CoreFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
+-HOST_SRC = $(SRC) $(GFX)
++HOST_FRAMEWORKS = -framework AuthenticationServices -framework Security -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework CoreAudio -framework AVFAudio -framework CoreFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
++HOST_SRC = $(SRC) network.c tls.m session.m $(GFX)
+ ifneq ($(filter ../%,$(filter-out ../gfx/%,$(HOST_SRC))),)
+@@ -91,4 +91,8 @@
+ 	clang $(HOST_CFLAGS) -MMD -MP -c $< -o $@
+-$(HOST_BIN): $(HOST_OBJ) $(VPX_LIB) $(DAV1D_LIB) Makefile ../mac/min_os.mk
+-	clang $(HOST_CFLAGS) -o $@ $(HOST_OBJ) $(VPX_LIB) $(DAV1D_LIB) $(HOST_FRAMEWORKS)
++CATALOG_OBJ = $(OBJ_DIR)/CatalogSignature.o
++$(CATALOG_OBJ): ../ios/Sources/CatalogSignature.swift
++	@mkdir -p $(dir $@)
++	xcrun --sdk macosx swiftc -target arm64-apple-macos$(MACOS_MIN) -parse-as-library -O -emit-object $< -o $@
++$(HOST_BIN): $(CATALOG_OBJ) $(HOST_OBJ) $(VPX_LIB) $(DAV1D_LIB) Makefile ../mac/min_os.mk
++	clang $(HOST_CFLAGS) -o $@ $(CATALOG_OBJ) -L$(shell xcrun --sdk macosx --show-sdk-path)/usr/lib/swift -Wl,-rpath,/usr/lib/swift $(HOST_OBJ) $(VPX_LIB) $(DAV1D_LIB) $(HOST_FRAMEWORKS)
+ 	dsymutil $@
+--- a/dm/ios/project.yml
++++ b/dm/ios/project.yml
+@@ -34,2 +34,4 @@
+         CFBundleShortVersionString: $(MARKETING_VERSION)
++        CFBundleURLTypes:
++          - CFBundleURLSchemes: [drippu-nextendo]
+         UILaunchScreen: {}
+--- a/dm/mac/pack_app.py
++++ b/dm/mac/pack_app.py
+@@ -127,3 +127,3 @@
+     # LSSupportsGameMode off: macOS's Game Mode holds the GPU at its lowest clock while it is busy (docs/reference/frame-rate.md, macOS Game Mode holds the GPU at its lowest clock)
+-    p = {'CFBundleName': a.name, 'CFBundleDisplayName': a.name, 'CFBundleIdentifier': a.bundle_id or f'org.nxnative.{a.title_id.lower()}',
++    p = {'CFBundleURLTypes': [{'CFBundleURLSchemes':['drippu-nextendo']}], 'CFBundleName': a.name, 'CFBundleDisplayName': a.name, 'CFBundleIdentifier': a.bundle_id or f'org.nxnative.{a.title_id.lower()}',
+          'CFBundleVersion': a.version or '1.0', 'CFBundleShortVersionString': a.version or '1.0', 'CFBundlePackageType': 'APPL', 'CFBundleExecutable': EXE,
