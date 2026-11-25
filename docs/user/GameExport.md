@@ -1,5 +1,27 @@
 # Exporting a Game
 
+Drippu offers standalone Apple builds through NxNative or NX2Apple and
+artifact bundles through the built-in exporter.
+
+## Standalone Mac apps and iPhone or iPad IPAs
+
+Open **File > Export Game...** and select the game with **From Library**.
+
+- **On an Apple silicon Mac**, choose **Build with NxNative…**. The dialog
+  accepts a pinned NxNative checkout or the NX2Apple Mac release and can build
+  either a Mac app or an iPhone or iPad IPA. See the
+  [Mac toolchain setup](../../dist/macos/nxnative/setup.md).
+- **On Windows x64**, choose **Build iPhone/iPad IPA with NX2Apple…** and select
+  the extracted NX2Apple Windows release. See the
+  [Windows toolchain setup](../../dist/nxnative/windows.md).
+
+Select your console's `prod.keys`, the base game package, and any matching
+update or DLC package files. Choose an output folder and run **Check
+compatibility** before building. Launch a Mac app from Finder. An IPA is
+unsigned and must be signed and sideloaded onto a supported device.
+
+## Built-in artifact bundles
+
 Use **File > Export Game...** to turn a game into its own package. On Windows the
 package is a program you can double-click or launch from Steam, without opening suyu's
 window. The default **Reference** package reads **your own game file**, which suyu decrypts with
@@ -37,9 +59,9 @@ suyu. Without that file and those keys an export does not run.
 
 ## Choose the target and backend
 
-The dialog can make Windows, Linux and macOS packages. Only a Windows export can
-produce a ready-to-run program. Linux and macOS exports are **Source** only: they
-contain generated code to compile yourself and no bundled runtime.
+The built-in exporter can make Windows, Linux and macOS artifact bundles.
+Windows supports ready-to-run builds. Linux and macOS artifact bundles use
+**Source** format, with generated code to compile yourself.
 
 The CPU backends, in the order the dialog lists them:
 
@@ -104,7 +126,7 @@ run a game.
 - **Source (developers)** writes the generated C project, its `CMakeLists.txt` and a
   build script, and stops there. It does not include a compiled program, so the result
   is not playable; it is for compiling elsewhere or inspecting the generated code. This
-  is the only format for Linux and macOS. The generated C is translated from the game's
+  is the only format for Linux and macOS artifact bundles. The generated C is translated from the game's
   code, so a Source export is game-derived, but it carries none of the game's own files
   (no modules, data segments, ExeFS or RomFS). It builds only libraries that suyu loads
   alongside your game file; there is no standalone program to build from it.

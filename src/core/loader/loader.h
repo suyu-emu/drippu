@@ -46,6 +46,7 @@ enum class FileType {
     NAX,
     KIP,
     DeconstructedRomDirectory,
+    NUP,
 };
 
 /**
@@ -155,6 +156,8 @@ enum class ResultStatus : u16 {
     ErrorINITooManyKIPs,
     ErrorIntegrityVerificationNotImplemented,
     ErrorIntegrityVerificationFailed,
+    ErrorBadNUPHeader,
+    ErrorNUPMissingProgram,
 };
 
 std::string GetResultStatusString(ResultStatus status);
@@ -290,6 +293,11 @@ public:
      */
     virtual ResultStatus ReadUpdateRaw(FileSys::VirtualFile& out_file) {
         return ResultStatus::ErrorNotImplemented;
+    }
+
+    /// Version carried by a loader whose content is outside the NCA provider.
+    virtual std::optional<u32> GetApplicationVersion() const {
+        return std::nullopt;
     }
 
     /**

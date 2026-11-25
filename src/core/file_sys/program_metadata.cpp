@@ -120,10 +120,15 @@ Loader::ResultStatus ProgramMetadata::Load(VirtualFile file) {
         return Loader::ResultStatus::ErrorBadFileAccessHeader;
     }
 
-    aci_kernel_capabilities.resize(aci_header.kac_size / sizeof(u32));
     const u64 read_size = aci_header.kac_size;
-    const u64 read_offset = npdm_header.aci_offset + aci_header.kac_offset;
-    if (file->ReadBytes(aci_kernel_capabilities.data(), read_size, read_offset) != read_size) {
+    const u64 read_offset = u64{npdm_header.aci_offset} + aci_header.kac_offset;
+    if (read_size % sizeof(u32) != 0 || read_offset > total_size ||
+        read_size > total_size - read_offset) {
+        return Loader::ResultStatus::ErrorBadKernelCapabilityDescriptors;
+    }
+    aci_kernel_capabilities.resize(read_size / sizeof(u32));
+    if (read_size != 0 &&
+        file->ReadBytes(aci_kernel_capabilities.data(), read_size, read_offset) != read_size) {
         return Loader::ResultStatus::ErrorBadKernelCapabilityDescriptors;
     }
 

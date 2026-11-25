@@ -111,11 +111,15 @@ NACP::NACP(VirtualFile file)
     file->ReadObject(&raw);
     if (raw.titles_data_format == TitleDataFormat::Compressed) {
         const u16 compressed_size = raw.language_entries.compressed_data.buffer_size;
+        if (compressed_size > sizeof(raw.language_entries.compressed_data.buffer)) {
+            return;
+        }
         std::span<const u8> compressed_payload{raw.language_entries.compressed_data.buffer,
                                                compressed_size};
 
         std::vector<u8> decompressed;
-        if (InflateRawDeflate(compressed_payload, decompressed)) {
+        if (InflateRawDeflate(compressed_payload, decompressed) &&
+            decompressed.size() % sizeof(LanguageEntry) == 0) {
             const size_t entry_count = decompressed.size() / sizeof(LanguageEntry);
             language_entries.resize(entry_count);
             std::memcpy(language_entries.data(), decompressed.data(), decompressed.size());

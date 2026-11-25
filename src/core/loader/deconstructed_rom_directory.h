@@ -26,8 +26,12 @@ namespace Loader {
 class AppLoader_DeconstructedRomDirectory final : public AppLoader {
 public:
     explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile main_file, bool override_update_ = false);
-    // Overload to accept exefs directory. Must contain 'main' and 'main.npdm'
-    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory, bool override_update_ = false);
+    // An ExeFS directory must contain 'main' and 'main.npdm'.
+    explicit AppLoader_DeconstructedRomDirectory(
+        FileSys::VirtualDir directory, bool override_update_ = false,
+        FileSys::VirtualFile romfs_ = {},
+        std::vector<std::pair<u64, FileSys::VirtualFile>> baked_aoc_ = {},
+        FileSys::VirtualFile base_npdm_ = {});
 
     /**
      * Identifies whether or not the given file is a deconstructed ROM directory.
@@ -57,6 +61,8 @@ private:
     FileSys::ProgramMetadata metadata;
     FileSys::VirtualFile romfs;
     FileSys::VirtualDir dir;
+    FileSys::VirtualFile base_npdm;
+    std::vector<std::pair<u64, FileSys::VirtualFile>> baked_aoc;
 
     std::vector<u8> icon_data;
     std::string name;

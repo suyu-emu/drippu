@@ -24,6 +24,7 @@
 #include "core/hle/service/am/applet_manager.h"
 #include "core/loader/nca.h"
 #include "core/loader/nro.h"
+#include "core/loader/nup.h"
 #include "core/tools/renderdoc.h"
 
 #ifdef __APPLE__
@@ -2363,9 +2364,9 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
 
     // Check for keys and firmware before the loader opens the file, so a
     // missing key is reported to the player before any decryption is attempted.
-    if (Loader::AppLoader_NRO::IdentifyType(
-            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
-        if (!ContentManager::AreKeysPresent()) {
+    const auto boot_file = Core::GetGameFileFromPath(vfs, filename.toStdString());
+    if (Loader::AppLoader_NRO::IdentifyType(boot_file) != Loader::FileType::NRO) {
+        if (!Loader::HasNupSignature(boot_file) && !ContentManager::AreKeysPresent()) {
             QMessageBox box(QMessageBox::Warning, tr("Decryption Keys Missing"),
                             tr("suyu has no decryption keys installed.\n\n"
                                "Games need the keys dumped from your own Switch. suyu does not "
