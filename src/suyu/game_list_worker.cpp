@@ -401,6 +401,10 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::string& dir_pa
                 return true;
             }
 
+            if (file_type == Loader::FileType::NUP &&
+                target == ScanTarget::FillManualContentProvider) {
+                return true;
+            }
             if (file_type == Loader::FileType::NCA) {
                 const auto nca_type = FileSys::NCA{file}.GetType();
                 if (nca_type != FileSys::NCAContentType::Program) {
@@ -433,8 +437,12 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::string& dir_pa
                 std::vector<u64> program_ids;
                 loader->ReadProgramIds(program_ids);
 
+                if (file_type == Loader::FileType::NUP && res2 != Loader::ResultStatus::Success) {
+                    return true;
+                }
                 if (res2 == Loader::ResultStatus::Success && program_ids.size() > 1 &&
-                    (file_type == Loader::FileType::XCI || file_type == Loader::FileType::NSP)) {
+                    (file_type == Loader::FileType::XCI || file_type == Loader::FileType::NSP ||
+                     file_type == Loader::FileType::NUP)) {
                     for (const auto id : program_ids) {
                         loader = Loader::GetLoader(system, file, id);
                         if (!loader) {

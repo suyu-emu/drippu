@@ -77,3 +77,11 @@ Use this guide to get starting using the Eden emulator.
 8. Double-Click the main window to add the folder containing your games.
 9. Go to *Emulation > Configure > Input* and set up your controller. Click **OK** to close the dialog window.
 10. Double-Click a game to run it.
+
+## Opening NUP packages
+
+Drippu can open v1 `.nup` packages containing a decrypted Switch game.
+Open one with **File > Load File** or put it in a game library folder.
+Drippu reads ExeFS and RomFS from the package, applies the newest matching
+bundled update, and exposes bundled add-on content for the selected game.
+Firmware requirements depend on the game.

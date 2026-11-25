@@ -1154,7 +1154,7 @@ void GameList::LoadInterfaceLayout() {
 
 const QStringList GameList::supported_file_extensions = {
     QStringLiteral("nso"), QStringLiteral("nro"), QStringLiteral("nca"),
-    QStringLiteral("xci"), QStringLiteral("nsp"), QStringLiteral("kip")};
+    QStringLiteral("xci"), QStringLiteral("nsp"), QStringLiteral("kip"), QStringLiteral("nup")};
 
 void GameList::RefreshGameDirectory() {
     if (!UISettings::values.game_dirs.empty()) {

@@ -900,6 +900,11 @@ void EmuWindow_SDL2::EnableTasPlayback() {
     tas_playback = true;
 }
 
+void EmuWindow_SDL2::SetTasBaselineCheckpoint(size_t frame, std::function<void()> capture) {
+    tas_checkpoint = frame;
+    tas_capture = std::move(capture);
+}
+
 void EmuWindow_SDL2::OnFrameDisplayed() {
     if (!tas_playback) {
         return;
@@ -918,11 +923,20 @@ void EmuWindow_SDL2::OnFrameDisplayed() {
         tas->Reset();
         tas->StartStop();
         tas_started = true;
+        tas_start_time = std::chrono::steady_clock::now();
         LOG_INFO(Frontend, "TAS playback started, {} frames queued", lengths[0]);
         return;
     }
     if (state != InputCommon::TasInput::TasState::Stopped) {
         tas_progress = progress;
+        if (tas_capture && tas_progress == tas_checkpoint) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - tas_start_time);
+            LOG_INFO(Frontend, "TAS baseline checkpoint frame={} elapsed_us={}", tas_progress,
+                     elapsed.count());
+            // The renderer services the request on its next frame.
+            std::exchange(tas_capture, {})();
+        }
         return;
     }
     // Playback ran off the end of the script and tas_loop is off. Quitting here

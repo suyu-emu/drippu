@@ -46,3 +46,12 @@ if (NOT MSVC)
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>)
 endif()
+
+find_package(Python3 3.10 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+    add_executable(nup_loader_probe core/nup_probe.cpp)
+    target_link_libraries(nup_loader_probe PRIVATE core)
+    add_dependencies(tests nup_loader_probe)
+    add_test(NAME nup_loader_roundtrip COMMAND "${Python3_EXECUTABLE}" -B
+        "${PROJECT_SOURCE_DIR}/tests/nup/roundtrip.py" "$<TARGET_FILE:nup_loader_probe>")
+endif()

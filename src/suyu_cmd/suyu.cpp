@@ -5,12 +5,14 @@
 #include <atomic>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <regex>
@@ -67,6 +69,7 @@
 #include "core/file_sys/program_metadata.h"
 #include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/service/library_applet_creator.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -293,6 +296,36 @@ static void PrintHelp(const char* argv0) {
                  "                      Numerical parameters for launching an applet. If no\n"
                  "                      game is provided, then the applet will launch off of\n"
                  "                      the applet_id.\n";
+}
+
+static void CaptureFrame(VideoCore::RendererBase& renderer, std::string output,
+                         std::function<void(bool)> complete = {}) {
+    constexpr int width = 1280;
+    constexpr int height = 720;
+    auto pixels = std::make_shared<std::vector<u8>>(width * height * 4);
+    renderer.RequestScreenshot(
+        pixels->data(),
+        [pixels, output = std::move(output), complete = std::move(complete)](bool invert_y) {
+            std::vector<u8> rgba(pixels->size());
+            for (int y = 0; y < height; ++y) {
+                const int source_y = invert_y ? height - 1 - y : y;
+                for (int x = 0; x < width; ++x) {
+                    const size_t src = (static_cast<size_t>(source_y) * width + x) * 4;
+                    const size_t dst = (static_cast<size_t>(y) * width + x) * 4;
+                    rgba[dst] = (*pixels)[src + 2];
+                    rgba[dst + 1] = (*pixels)[src + 1];
+                    rgba[dst + 2] = (*pixels)[src];
+                    rgba[dst + 3] = (*pixels)[src + 3];
+                }
+            }
+            const bool success = stbi_write_png(output.c_str(), width, height, 4, rgba.data(),
+                                                width * 4) != 0;
+            LOG_INFO(Frontend, "CAPTURE {} success={}", output, success);
+            if (complete) {
+                complete(success);
+            }
+        },
+        Layout::DefaultFrameLayout(width, height));
 }
 
 static void PrintVersion() {
@@ -1415,6 +1448,21 @@ int main(int argc, char** argv) {
     std::filesystem::path installed_nand;
     std::filesystem::path installed_load;
     std::filesystem::path export_user_root;
+    const char* baseline_frame_env = std::getenv("SUYU_CMD_TAS_BASELINE_FRAME");
+    std::string baseline_capture;
+    size_t baseline_frame = 0;
+    if (baseline_frame_env) {
+        const char* capture = std::getenv("SUYU_CMD_TAS_BASELINE_CAPTURE");
+        const std::string_view value{baseline_frame_env};
+        const auto end = value.data() + value.size();
+        const auto result = std::from_chars(value.data(), end, baseline_frame);
+        if (result.ec != std::errc{} || result.ptr != end || baseline_frame == 0 ||
+            !capture || !*capture) {
+            std::fprintf(stderr, "Invalid TAS baseline frame or capture path\n");
+            return EXIT_FAILURE;
+        }
+        baseline_capture = capture;
+    }
     // Logged once logging is up: which recorded locations led back into the package.
     bool ignored_package_suyu = false;
     bool ignored_package_nand = false;
@@ -1449,7 +1497,8 @@ int main(int argc, char** argv) {
         std::error_code readme_ec;
         const bool portable_export =
             !exe_dir.empty() &&
-            std::filesystem::is_regular_file(exe_dir / "README_NATIVE_EXPORT.txt", readme_ec);
+            (baseline_frame != 0 ||
+             std::filesystem::is_regular_file(exe_dir / "README_NATIVE_EXPORT.txt", readme_ec));
 #endif
         if (portable_export) {
             std::filesystem::create_directories(user_root);
@@ -1480,56 +1529,65 @@ int main(int argc, char** argv) {
             FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
             FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
             FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
-            // Named outright rather than read back from the FS layer, which
-            // may already have derived its defaults from this user/ folder.
-            // The suyu that made the export decides where that is: a portable
-            // install keeps its data in a user/ folder beside its executable,
-            // as path_util does for it; otherwise it is the usual location.
-            const std::filesystem::path recorded_suyu = RecordedSuyuExecutable(user_root);
-            std::error_code portable_ec;
+            if (baseline_frame != 0) {
+                // The benchmark runner supplies a private copy of the same profile for
+                // every backend, including firmware, keys, saves, and shader cache.
+                std::filesystem::create_directories(user_root / "keys");
+                FS::SetSuyuPath(FS::SuyuPath::KeysDir, user_root / "keys");
+                installed_load = user_root / "load";
+                Core::RecompGaps::SetSharedStoreDir({});
+            } else {
+                // Named outright rather than read back from the FS layer, which
+                // may already have derived its defaults from this user/ folder.
+                // The suyu that made the export decides where that is: a portable
+                // install keeps its data in a user/ folder beside its executable,
+                // as path_util does for it; otherwise it is the usual location.
+                const std::filesystem::path recorded_suyu = RecordedSuyuExecutable(user_root);
+                std::error_code portable_ec;
 #ifdef _WIN32
-            const std::filesystem::path default_root = FS::GetAppDataRoamingDirectory() / "suyu";
-            const std::filesystem::path default_config = default_root / "config";
+                const std::filesystem::path default_root = FS::GetAppDataRoamingDirectory() / "suyu";
+                const std::filesystem::path default_config = default_root / "config";
 #else
-            const std::filesystem::path default_root =
-                FS::GetDataDirectory("XDG_DATA_HOME") / "suyu";
-            const std::filesystem::path default_config =
-                FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
+                const std::filesystem::path default_root =
+                    FS::GetDataDirectory("XDG_DATA_HOME") / "suyu";
+                const std::filesystem::path default_config =
+                    FS::GetDataDirectory("XDG_CONFIG_HOME") / "suyu";
 #endif
-            std::filesystem::path installed_root = default_root;
-            std::filesystem::path installed_config = default_config;
-            if (!recorded_suyu.empty() &&
-                std::filesystem::is_directory(recorded_suyu.parent_path() / "user", portable_ec)) {
-                // Keys and firmware must come from an installation outside this
-                // package. A record leading back into it - a copy of suyu placed
-                // inside, or an edited path - is ignored rather than letting the
-                // package supply its own.
-                if (Common::PackagePolicy::AcceptInstalledRoot(
-                        exe_dir, recorded_suyu.parent_path() / "user")) {
-                    installed_root = recorded_suyu.parent_path() / "user";
-                    installed_config = installed_root / "config";
-                } else {
-                    ignored_package_suyu = true;
+                std::filesystem::path installed_root = default_root;
+                std::filesystem::path installed_config = default_config;
+                if (!recorded_suyu.empty() &&
+                    std::filesystem::is_directory(recorded_suyu.parent_path() / "user", portable_ec)) {
+                    // Keys and firmware must come from an installation outside this
+                    // package. A record leading back into it - a copy of suyu placed
+                    // inside, or an edited path - is ignored rather than letting the
+                    // package supply its own.
+                    if (Common::PackagePolicy::AcceptInstalledRoot(
+                            exe_dir, recorded_suyu.parent_path() / "user")) {
+                        installed_root = recorded_suyu.parent_path() / "user";
+                        installed_config = installed_root / "config";
+                    } else {
+                        ignored_package_suyu = true;
+                    }
                 }
-            }
-            // Coverage gaps are pooled in the installed suyu's user folder, which
-            // its exporter reads; with no installed suyu there is nowhere to pool.
-            const bool installed_found = std::filesystem::is_directory(installed_root, portable_ec);
-            Core::RecompGaps::SetSharedStoreDir(installed_found
-                                                    ? installed_root / "recomp" / "gaps"
-                                                    : std::filesystem::path{});
-            // SetSuyuPath ignores a folder that does not exist, which would
-            // leave keys pointing into this package; suyu creates it anyway.
-            std::filesystem::create_directories(installed_root / "keys", portable_ec);
-            FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_root / "keys");
-            installed_load = InstalledDataDirectory(installed_root, installed_config,
-                                                     "load_directory", "load");
-            installed_nand = InstalledDataDirectory(installed_root, installed_config,
-                                                     "nand_directory", "nand");
-            // The installed suyu's own NAND setting may not point back in here either.
-            if (!Common::PackagePolicy::AcceptInstalledRoot(exe_dir, installed_nand)) {
-                ignored_package_nand = true;
-                installed_nand = installed_root / "nand";
+                // Coverage gaps are pooled in the installed suyu's user folder, which
+                // its exporter reads; with no installed suyu there is nowhere to pool.
+                const bool installed_found = std::filesystem::is_directory(installed_root, portable_ec);
+                Core::RecompGaps::SetSharedStoreDir(installed_found
+                                                        ? installed_root / "recomp" / "gaps"
+                                                        : std::filesystem::path{});
+                // SetSuyuPath ignores a folder that does not exist, which would
+                // leave keys pointing into this package; suyu creates it anyway.
+                std::filesystem::create_directories(installed_root / "keys", portable_ec);
+                FS::SetSuyuPath(FS::SuyuPath::KeysDir, installed_root / "keys");
+                installed_load = InstalledDataDirectory(installed_root, installed_config,
+                                                         "load_directory", "load");
+                installed_nand = InstalledDataDirectory(installed_root, installed_config,
+                                                         "nand_directory", "nand");
+                // The installed suyu's own NAND setting may not point back in here either.
+                if (!Common::PackagePolicy::AcceptInstalledRoot(exe_dir, installed_nand)) {
+                    ignored_package_nand = true;
+                    installed_nand = installed_root / "nand";
+                }
             }
             export_user_root = user_root;
             g_export_package = true;
@@ -1786,6 +1844,20 @@ int main(int argc, char** argv) {
 #endif
     SdlConfig config{config_path};
     g_sdl_config = &config;
+    if (baseline_frame != 0) {
+        // Ignore custom directories in the seed config, which may refer to
+        // a live installation instead of this private profile.
+        Settings::values.cpu_backend.SetValue(Settings::CpuBackend::Dynarmic);
+        Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
+        using Common::FS::SuyuPath;
+        for (const auto& [kind, directory] :
+             {std::pair{SuyuPath::NANDDir, "nand"}, std::pair{SuyuPath::SaveDir, "nand"},
+              std::pair{SuyuPath::SDMCDir, "sdmc"}, std::pair{SuyuPath::LoadDir, "load"},
+              std::pair{SuyuPath::DumpDir, "dump"}, std::pair{SuyuPath::TASDir, "tas"},
+              std::pair{SuyuPath::ScreenshotsDir, "screenshots"}}) {
+            Common::FS::SetSuyuPath(kind, export_user_root / directory);
+        }
+    }
 
     // apply the log_filter setting
     // the logger was initialized before and doesn't pick up the filter on its own
@@ -1801,6 +1873,10 @@ int main(int argc, char** argv) {
         Settings::values.current_user = std::clamp(*selected_user, 0, 7);
     }
 
+    if (baseline_frame != 0 && (!tas_playback || filepath.empty() || explicit_content_base)) {
+        LOG_ERROR(Frontend, "TAS baseline requires --tas and a game path");
+        return EXIT_FAILURE;
+    }
     if (tas_playback) {
         const auto script_path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::TASDir) /
                                  "script0-1.txt";
@@ -1816,6 +1892,9 @@ int main(int argc, char** argv) {
         // only reads the scripts out of the TAS directory when it sees this
         // enabled, and it is applied here so the config file cannot clear it.
         Settings::values.tas_enable.SetValue(true);
+        if (baseline_frame != 0) {
+            Settings::values.tas_loop.SetValue(false);
+        }
     }
 
 #ifdef _WIN32
@@ -2911,7 +2990,8 @@ int main(int argc, char** argv) {
 
     // Ordinary Vulkan CLI games can reuse recorded pipelines just like game exports.
     // Keep the old guard for other backends until their plain-CLI startup is tested.
-    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan &&
+    if (baseline_frame == 0 &&
+        Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan &&
         !g_native_export_mode && installed_nand.empty() &&
         Settings::values.use_disk_shader_cache.GetValue()) {
         LOG_WARNING(Frontend,
@@ -2972,6 +3052,34 @@ int main(int argc, char** argv) {
 #ifdef __linux__
     Common::Linux::StartGamemode();
 #endif
+
+    std::future<bool> baseline_result;
+    if (baseline_frame != 0) {
+        const auto* process = system.ApplicationProcess();
+        const auto* arm = process ? process->GetArmInterface(0) : nullptr;
+        const bool aot = arm && arm->IsRecompBackend();
+#ifdef SUYU_NO_JIT
+        constexpr bool has_jit = false;
+#else
+        constexpr bool has_jit = true;
+#endif
+        const char* backend = "unavailable";
+        if (aot) {
+            backend = has_jit ? "hybrid" : "static";
+        } else if (arm && Settings::IsNceEnabled()) {
+            backend = "nce";
+        } else if (arm && has_jit) {
+            backend = "jit";
+        }
+        LOG_INFO(Frontend, "TAS baseline backend={} revision={} program_id={:016x}",
+                 backend, Common::g_scm_rev, process ? process->GetProgramId() : 0);
+        auto saved = std::make_shared<std::promise<bool>>();
+        baseline_result = saved->get_future();
+        emu_window->SetTasBaselineCheckpoint(baseline_frame, [&, saved] {
+            CaptureFrame(system.Renderer(), baseline_capture,
+                         [saved](bool success) { saved->set_value(success); });
+        });
+    }
 
     void(system.Run());
     if (system.DebuggerEnabled()) {
@@ -3051,31 +3159,9 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now() - capture_start < next_capture) {
             continue;
         }
-        constexpr int width = 1280;
-        constexpr int height = 720;
-        auto pixels = std::make_shared<std::vector<u8>>(width * height * 4);
-        const std::string output =
-            (capture_dir / ("frame-" + std::to_string(++capture_index) + ".png")).string();
-        system.Renderer().RequestScreenshot(
-            pixels->data(),
-            [pixels, output](bool invert_y) {
-                std::vector<u8> rgba(pixels->size());
-                for (int y = 0; y < height; ++y) {
-                    const int source_y = invert_y ? height - 1 - y : y;
-                    for (int x = 0; x < width; ++x) {
-                        const size_t src = (static_cast<size_t>(source_y) * width + x) * 4;
-                        const size_t dst = (static_cast<size_t>(y) * width + x) * 4;
-                        rgba[dst] = (*pixels)[src + 2];
-                        rgba[dst + 1] = (*pixels)[src + 1];
-                        rgba[dst + 2] = (*pixels)[src];
-                        rgba[dst + 3] = (*pixels)[src + 3];
-                    }
-                }
-                LOG_INFO(Frontend, "CAPTURE {} success={}", output,
-                         stbi_write_png(output.c_str(), width, height, 4, rgba.data(),
-                                        width * 4) != 0);
-            },
-            Layout::DefaultFrameLayout(width, height));
+        CaptureFrame(
+            system.Renderer(),
+            (capture_dir / ("frame-" + std::to_string(++capture_index) + ".png")).string());
         next_capture += capture_interval;
     }
 
@@ -3093,6 +3179,12 @@ int main(int argc, char** argv) {
 #endif
 
     detached_tasks.WaitForAllTasks();
+    if (baseline_result.valid() &&
+        (baseline_result.wait_for(std::chrono::seconds{5}) != std::future_status::ready ||
+         !baseline_result.get())) {
+        LOG_ERROR(Frontend, "TAS baseline checkpoint image was not saved");
+        return EXIT_FAILURE;
+    }
     return 0;
     } catch (const std::exception& e) {
         LOG_CRITICAL(Frontend, "Unhandled fatal exception in suyu-cmd: {}", e.what());

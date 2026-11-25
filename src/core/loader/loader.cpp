@@ -27,6 +27,7 @@
 #include "core/loader/nro.h"
 #include "core/loader/nso.h"
 #include "core/loader/nsp.h"
+#include "core/loader/nup_app.h"
 #include "core/loader/xci.h"
 
 namespace Loader {
@@ -88,6 +89,13 @@ bool HasApplicationProgramContent(const std::shared_ptr<FileSys::NSP>& nsp) {
 } // namespace
 
 FileType IdentifyFile(FileSys::VirtualFile file) {
+    if (!file) {
+        return FileType::Unknown;
+    }
+    if (HasNupSignature(file)) {
+        return FileType::NUP;
+    }
+
     // A plaintext NSO (including an exported ExeFS/main) needs no keys. Check
     // its unambiguous magic before any encrypted-container probe: probing it
     // as an NCA first unnecessarily initializes header decryption and can fail
@@ -153,6 +161,8 @@ FileType GuessFromFilename(const std::string& name) {
         return FileType::XCI;
     else if (extension == "nsp")
         return FileType::NSP;
+    else if (extension == "nup")
+        return FileType::NUP;
     else if (extension == "kip")
         return FileType::KIP;
     return FileType::Unknown;
@@ -174,6 +184,8 @@ std::string GetFileTypeString(FileType type) {
         return "NSP";
     case FileType::KIP:
         return "KIP";
+    case FileType::NUP:
+        return "NUP";
     case FileType::DeconstructedRomDirectory:
         return "Directory";
     case FileType::Error:
@@ -184,7 +196,7 @@ std::string GetFileTypeString(FileType type) {
     return "unknown";
 }
 
-constexpr std::array<const char*, 68> RESULT_MESSAGES{
+constexpr std::array<const char*, 70> RESULT_MESSAGES{
     "The operation completed successfully.",
     "The loader requested to load is already loaded.",
     "The operation is not implemented.",
@@ -253,6 +265,8 @@ constexpr std::array<const char*, 68> RESULT_MESSAGES{
     "The INI file contains more than the maximum allowable number of KIP files.",
     "Integrity verification could not be performed for this file.",
     "Integrity verification failed.",
+    "The NUP package is malformed or uses an unsupported format version.",
+    "The NUP package does not contain the requested bootable program.",
 };
 
 std::string GetResultStatusString(ResultStatus status) {
@@ -306,6 +320,9 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileSys::V
         return std::make_unique<AppLoader_NSP>(std::move(file), system.GetFileSystemController(),
                                                system.GetContentProvider(), program_id,
                                                program_index);
+
+    case FileType::NUP:
+        return std::make_unique<AppLoader_NUP>(std::move(file), program_id, program_index);
 
     // NX KIP (Kernel Internal Process) file format
     case FileType::KIP:

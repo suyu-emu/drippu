@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <functional>
 #include <set>
 #include <string>
 #include <utility>
@@ -52,6 +54,7 @@ public:
     /// Replay the TAS script from the user TAS directory instead of waiting for
     /// a hotkey, and quit once it runs out. Call before the system is run.
     void EnableTasPlayback();
+    void SetTasBaselineCheckpoint(size_t frame, std::function<void()> capture);
 
     // Sets the window icon from suyu.bmp
     void SetWindowIcon();
@@ -117,6 +120,9 @@ protected:
     /// Last progress seen while running. The driver rewinds its counter to zero
     /// when the script ends, so the final status cannot report how far it got.
     std::size_t tas_progress = 0;
+    std::size_t tas_checkpoint = 0;
+    std::chrono::steady_clock::time_point tas_start_time;
+    std::function<void()> tas_capture;
 
     /// Is the window still open?
     bool is_open = true;

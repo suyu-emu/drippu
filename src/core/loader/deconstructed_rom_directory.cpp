@@ -126,10 +126,11 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
 }
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
-    FileSys::VirtualDir directory, bool override_update_)
-    : AppLoader(directory->GetFile("main"))
-    , dir(std::move(directory))
-    , override_update(override_update_)
+    FileSys::VirtualDir directory, bool override_update_, FileSys::VirtualFile romfs_,
+    std::vector<std::pair<u64, FileSys::VirtualFile>> baked_aoc_, FileSys::VirtualFile base_npdm_)
+    : AppLoader(directory->GetFile("main")), romfs(std::move(romfs_)), dir(std::move(directory)),
+      base_npdm(std::move(base_npdm_)), baked_aoc(std::move(baked_aoc_)),
+      override_update(override_update_)
 {}
 
 FileType AppLoader_DeconstructedRomDirectory::IdentifyType(const FileSys::VirtualFile& dir_file) {
@@ -162,7 +163,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         return {ResultStatus::ErrorMissingNPDM, {}};
     }
 
-    const ResultStatus result = metadata.Load(npdm);
+    const ResultStatus result = metadata.Load(base_npdm ? base_npdm : npdm);
     if (result != ResultStatus::Success) {
         return {result, {}};
     }
@@ -281,9 +282,11 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     // ErrorNoRomFS cleanly when `romfs` is still null, so a title with no
     // bundled RomFS gets a real (if empty) answer instead of a crash.
     if (dir != nullptr) {
-        romfs = dir->GetFile("romfs.bin");
-        if (romfs == nullptr) {
-            romfs = dir->GetFile("romfs");
+        if (!romfs) {
+            romfs = dir->GetFile("romfs.bin");
+            if (!romfs) {
+                romfs = dir->GetFile("romfs");
+            }
         }
 
         // Standalone exports dump decrypted AOC next to exefs/ as aoc/<tid>/romfs.bin
@@ -304,6 +307,9 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
                 }
             }
         }
+    }
+    for (const auto& [id, data] : baked_aoc) {
+        system.GetFileSystemController().RegisterBakedAoc(id, data);
     }
     LOG_DEBUG(Loader, "registering romfs factory for pid={} title={:016X} romfs_present={}",
               process.GetProcessId(), metadata.GetTitleID(), romfs != nullptr);
