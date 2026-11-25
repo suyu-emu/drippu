@@ -298,14 +298,14 @@ static void PrintHelp(const char* argv0) {
                  "                      the applet_id.\n";
 }
 
-static void CaptureFrame(VideoCore::RendererBase& renderer, std::string output,
-                         std::function<void(bool)> complete = {}) {
+static void CaptureFrame(VideoCore::RendererBase& renderer, std::string output_path,
+                         std::function<void(bool)> on_complete = {}) {
     constexpr int width = 1280;
     constexpr int height = 720;
     auto pixels = std::make_shared<std::vector<u8>>(width * height * 4);
     renderer.RequestScreenshot(
         pixels->data(),
-        [pixels, output = std::move(output), complete = std::move(complete)](bool invert_y) {
+        [pixels, output = std::move(output_path), complete = std::move(on_complete)](bool invert_y) {
             std::vector<u8> rgba(pixels->size());
             for (int y = 0; y < height; ++y) {
                 const int source_y = invert_y ? height - 1 - y : y;
