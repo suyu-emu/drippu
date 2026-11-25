@@ -11,6 +11,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 
 MODES = ("jit", "hybrid", "static")
@@ -313,7 +314,8 @@ def main():
     try:
         return run(args) if args.command == "run" else review(args)
     except (OSError, ValueError, KeyError) as error:
-        parser.exit(2, f"{error}\n")
+        print(error, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
