@@ -50,7 +50,8 @@ endif()
 find_package(Python3 3.10 QUIET COMPONENTS Interpreter)
 if (Python3_Interpreter_FOUND)
     add_executable(nup_loader_probe core/nup_probe.cpp)
-    target_link_libraries(nup_loader_probe PRIVATE core)
+    target_link_libraries(nup_loader_probe PRIVATE core frontend_common
+        ${PLATFORM_LIBRARIES} Threads::Threads)
     add_dependencies(tests nup_loader_probe)
     add_test(NAME nup_loader_roundtrip COMMAND "${Python3_EXECUTABLE}" -B
         "${PROJECT_SOURCE_DIR}/tests/nup/roundtrip.py" "$<TARGET_FILE:nup_loader_probe>")
