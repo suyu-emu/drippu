@@ -3,12 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 #include <openssl/evp.h>
 #include <zstd.h>
@@ -269,7 +269,7 @@ bool NupTree::ReadFiles(Bytes table) {
         const u64 stored = LittleEndian<u64>(record, 24);
         const u8 codec = record[64];
         if (!name || name->empty() || codec > 1 || !AllZero(record.subspan(65)) ||
-            (codec == 0 && size != stored) || size > std::numeric_limits<size_t>::max()) {
+            (codec == 0 && size != stored) || !std::in_range<size_t>(size)) {
             return false;
         }
         if (size == 0 ? (offset != 0 || stored != 0 || codec != 0)
